@@ -1,0 +1,32 @@
+# Noth アーキテクチャ: 信頼境界と tool-shell の運用
+
+本書は信頼境界の外の文字列がプロセスに入る経路と、それぞれへの対策、tool の承認ポリシー、`tool-shell` の運用上の注意を定義します。`Channel` / `Tool` trait は [traits.md](traits.md)、`allowed_users` などの設定項目は [cli.md §4.2](../cli.md#42-configtoml) を参照してください。
+
+## 1. 信頼境界
+
+信頼境界の外の文字列がプロセスに入る経路は2つあります。
+
+| 経路 | 入ってくるもの | 到達範囲 |
+|---|---|---|
+| Discord | `allowed_users` 以外のユーザや他 Bot の発言、引用・転送・埋め込み・添付 | Channel の時点で捨てる。SQLite にも残さない |
+| Web | `tool-web-*` が取得したページ本文 | Worker のコンテキストにだけ入る。本線には結論メモを通じてしか届かない |
+
+## 2. Discord 側の対策
+
+- `allowed_users` にないユーザと Bot(Noth 自身を除く)の発言は Channel の時点で捨て、SQLite にも残しません
+- メッセージの `content` だけを読みます。`referenced_message`(リプライ引用)、`message_snapshots`(転送)、`embeds`(URL プレビュー)、添付は非リストユーザや外部サイトの文字列が入る経路なので読みません
+- `content` 内のユーザーメンションは `allowed_users` なら表示名に解決し、それ以外は `<user>` に置き換えます
+- 全チャンネルの本文を読むには Discord Developer Portal で `MESSAGE_CONTENT` 特権インテントを有効にする必要があります(100 サーバー未満なら審査不要)
+
+## 3. Web 側の対策と承認ポリシー
+
+worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。MVP の実装は `auto` で、次の1つだけを固定の規則として持ちます。
+
+- `tool-shell` は `task_category == code_or_tool` の run でだけ許可する。`web_research` / `fact_check` の run は Web から取得した文字列を読むので、そこに書かれた指示でシェルを実行させない(間接プロンプトインジェクション → RCE の経路を断つ)。tool 定義自体は全 run で同一のまま([caching.md §2](caching.md#2-本線と-worker-のキャッシュ共有))なので、拒否は `tool_result` のエラーとして Worker に返る
+
+tool の出力は worker のコンテキストにだけ入り、本線には届きません。将来 Discord のボタン承認などを足せるよう、差し込み点は Core に置きます。tool のサンドボックスと対話的な承認は MVP に含めません([overview.md §5](overview.md#5-mvp-に含めないもの))。
+
+## 4. tool-shell の運用
+
+- `tool-shell` はサンドボックスなしで動きます。Discord の発言が起点で任意のコマンドが走るため、Noth は専用の VM か専用ユーザで動かし、`allowed_users` に信頼できるメンバーだけを入れてください
+- `cwd` は run ごとの `$NOTH_HOME/work/<run_id>/` で、run 終了時に残します(複数 Worker の同時実行でファイルが衝突しないため)

@@ -1,6 +1,6 @@
 # Noth コンテキスト仕様: Layer 構造と System One ルーティング
 
-本書は Main Profile Engine(System 2 の本線 LLM)に渡すプロンプトの層構造、System One(router)による判定スキーマ、発言からの応答・自律タスク・圧縮に至るライフサイクルを定義します。module の分割と trait は [architecture.md](architecture.md)、設定項目は [cli.md](cli.md) を参照してください。
+本書は Main Profile Engine(System 2 の本線 LLM)に渡すプロンプトの層構造、System One(router)による判定スキーマ、発言からの応答・自律タスク・圧縮に至るライフサイクルを定義します。module の分割は [architecture/modules.md](architecture/modules.md)、trait は [architecture/traits.md](architecture/traits.md)、設定項目は [cli.md](cli.md) を参照してください。文書全体の入口は [index.md](index.md) です。
 
 ## 1. 目的と設計原則
 
@@ -197,7 +197,7 @@ sequenceDiagram
    - 本線の応答がテキストの Ack ではなく `tool_calls` だった場合: Core は Layer 0 の定型文から Ack を作って投稿し、tool 呼び出しの内容から Goal を組み立て、「定型 Ack + Goal」をテキストの assistant メッセージとして Layer 3 に記録する。元の `tool_calls` は履歴に残さない(残すと `tool_result` が必須になり、消すと assistant が空になるため)。`task_category` は tool 名から決める(`web_search` / `web_fetch` / `web_agent` → `web_research`、`shell` → `code_or_tool`)
    - Worker の同時実行数が `max_concurrent` に達していたら run を FIFO で待たせる。Ack は投稿済みなので、待ち時間も `timeout_secs` に含める
 2. **Fork**
-   - 本線の Layer 0〜3 と tool 定義をそのまま引き継いで、バックグラウンドで Worker を起動する。本線と Worker は同一 provider・同一モデル・同一 tool 定義・同一 `tool_choice`(未指定)なので、Worker の初回呼び出しは本線の KV キャッシュに当たる([architecture.md §5.3.1](architecture.md#531-本線と-worker-のキャッシュ共有))
+   - 本線の Layer 0〜3 と tool 定義をそのまま引き継いで、バックグラウンドで Worker を起動する。本線と Worker は同一 provider・同一モデル・同一 tool 定義・同一 `tool_choice`(未指定)なので、Worker の初回呼び出しは本線の KV キャッシュに当たる([architecture/caching.md §2](architecture/caching.md#2-本線と-worker-のキャッシュ共有))
    - Worker 固有の指示(「これはバックグラウンド作業である」「結論メモの書式」「Goal」)は **最初の user メッセージ** に置く。`system` には1文字も足さない(足すと Layer 3 のキャッシュが全部外れる)
    - Worker は隔離された自分のコンテキストで tool を追記式に実行する。反復は `max_iterations` 回まで、各 tool の出力は `tool_output_max_chars` で切り詰める。`tool-shell` は `task_category == code_or_tool` の run でだけ承認され、`cwd` は run ごとの `$NOTH_HOME/work/<run_id>/`
    - この間、本線は空いているので、別の雑談が進めばパターン B で通常どおり応答できる

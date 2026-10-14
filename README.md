@@ -24,3 +24,7 @@ cargo build            # デバッグビルド
 cargo build --release  # リリースビルド
 cargo run              # ビルドして実行
 ```
+
+## ドキュメント
+
+設計書は [docs/index.md](docs/index.md) から辿れます。
