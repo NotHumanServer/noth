@@ -11,3 +11,8 @@ devenv.local.yaml
 
 # Rust
 target/
+
+# Claude Code (devenv generated / personal)
+.mcp.json
+.claude/settings.json
+.claude/settings.local.json
