@@ -1,8 +1,8 @@
 # Noth アーキテクチャ: Core の公開 trait
 
-本書は `noth-core` が定義し、module が実装する拡張点(`Channel` / `Router` / `Provider` / `Tool` / `Compactor`)を定義します。シグネチャは意図を示すための骨子で、実装時にエラー型の詳細を詰めます。どの module がどの trait を実装するかは [modules.md](modules.md)、Provider のキャッシュ戦略は [caching.md](caching.md)、Tool の承認ポリシーは [security.md](security.md) を参照してください。
+本書は、module が実装する拡張点として `noth-core` が公開する trait(`Channel` / `Router` / `Provider` / `Tool` / `Compactor`)を定義します。シグネチャは意図を示すための骨子で、実装時にエラー型の詳細を詰めます。どの module がどの trait を実装するかは [modules.md](modules.md)、Provider のキャッシュ戦略は [caching.md](caching.md)、Tool の承認ポリシーは [security.md](security.md) を参照してください。
 
-trait は `Box<dyn Trait>` で Module Registry に登録するため、非同期メソッドは `async-trait` クレートで定義します(素の `async fn in trait` は `dyn` にできず、`Send` も保証されないため)。
+trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`async-trait` を使わずに `async fn` を定義した trait は trait オブジェクト(`dyn Trait`)として扱えず、返される Future の `Send` も保証されないため、非同期メソッドは `async-trait` クレートで定義します。
 
 ## 1. 共通型
 
@@ -32,7 +32,7 @@ pub trait Channel: Send + Sync {
 }
 ```
 
-`channel-discord` が読むのはメッセージの `content` だけです。`referenced_message`(リプライ引用)、`message_snapshots`(転送)、`embeds`(URL プレビュー)、添付は読みません。これらは非リストユーザや外部サイトの文字列が入る経路だからです([security.md §2](security.md#2-discord-側の対策))。`content` 内のユーザーメンションは `allowed_users` なら表示名に解決し、それ以外は `<user>` に置き換えます。メッセージの編集・削除イベントは MVP では無視します(SQLite の記録は投稿時のまま)。
+`channel-discord` が読むのはメッセージの `content` だけです。読まないフィールドとユーザーメンションの扱いは [security.md §2](security.md#2-discord-側の対策) で定義します。メッセージの編集・削除イベントは MVP では無視し、SQLite の記録は投稿時のままにします。
 
 ## 3. `Router`(System One)
 
@@ -44,7 +44,7 @@ pub enum Question {
     Noul { instructions: String },
     /// 選択肢から1つ。回答は各選択肢の確率と confidence。選択肢は最大 255
     Choice { instructions: String, criteria: Vec<(String, String)> },
-    /// 順序付きルーブリックで評価。レベルは 2〜10。回答は確率加重スコアと各レベルの確率
+    /// 段階別の評価基準で評価。レベルは 2〜10。回答は確率加重スコアと各レベルの確率
     Score { instructions: String, levels: Vec<String> },
 }
 
@@ -69,11 +69,11 @@ pub trait Router: Send + Sync {
 
 確率を閾値で二値化するのは Core の責務です。`router-mention` は `decide` の中で API を呼ばずにルールで `Decision` を組み立て、確率は 0.0 / 1.0 の二値になります。
 
-Core は **provider(System 2 の LLM)に JSON を吐かせる汎用 router を提供しません。** 文字列生成を伴うため遅く、コストが高く、判定のためだけに生ログを LLM に入れることが [設計原則2](../context-layers.md#1-目的と設計原則)(本線の無菌化)に反するからです。
+Core は **provider(LLM)に JSON を生成させる汎用 router を提供しません。** 文字列生成を伴うので遅くコストも高いうえ、判定のためだけに生ログを LLM に入れることになり、[設計原則2](../context-layers.md#1-目的と設計原則)(本線にノイズと生ログを入れない)に反するからです。
 
-## 4. `Provider`(System 2)
+## 4. `Provider`(LLM)
 
-Provider は Layer を区別したまま受け取ります。各 provider module は自分のキャッシュ方式に合わせて Layer を API の `system` / `messages` に載せます([caching.md §1](caching.md#1-provider-ごとの-layer-の載せ方))。Core は Layer の内容と境界だけを保証し、キャッシュ戦略には関与しません。
+Provider は Layer を区別したまま受け取ります。各 provider module は自分のキャッシュ方式に合わせて Layer を API の `system` / `messages` に配置します([caching.md §1](caching.md#1-provider-ごとの-layer-の載せ方))。Core は Layer の内容と境界だけを保証し、キャッシュ戦略には関与しません。
 
 ```rust
 pub struct LayeredPrompt {
@@ -94,12 +94,12 @@ pub struct Completion {
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn complete(&self, prompt: &LayeredPrompt, params: &CompletionParams) -> Result<Completion>;
-    /// Layer 0〜3 のキャッシュ期限を延ばす keep-alive。既定は何もしない。MVP では呼び出し元も無効
+    /// Layer 0〜3 のキャッシュ期限を延ばす keep-alive。既定は何もしない。MVP では呼び出し処理も無効
     async fn keep_alive(&self, _prefix: &LayeredPrompt) -> Result<()> { Ok(()) }
 }
 ```
 
-provider のエラー(429 / 5xx)は `retry_max` 回まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。本線はそのターンを無言で終え、トリガー発言をバッファに戻します。
+provider のエラー(429 / 5xx)は `retry_max` 回まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。本線は応答を投稿せずにそのターンを終了し、トリガー発言をバッファに戻します。
 
 ## 5. `Tool`
 
@@ -113,9 +113,9 @@ pub trait Tool: Send + Sync {
 }
 ```
 
-tool の出力は worker のコンテキストにだけ入り、本線には届きません。出力は `tool_output_max_chars` で切り詰めてから Worker に返します。
+tool の出力は Worker のコンテキストにだけ入り、本線には届きません。出力は `tool_output_max_chars` で切り詰めてから Worker に返します。
 
-worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。承認ポリシーの内容と `tool-shell` の作業ディレクトリは [security.md §3](security.md#3-web-側の対策と承認ポリシー) と [§4](security.md#4-tool-shell-の運用) で定義します。
+Worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。承認ポリシーの内容と `tool-shell` の作業ディレクトリは [security.md §3](security.md#3-web-側の対策と承認ポリシー) と [§4](security.md#4-tool-shell-の運用) で定義します。
 
 ## 6. `Compactor`
 

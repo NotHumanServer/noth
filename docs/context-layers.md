@@ -1,25 +1,27 @@
 # Noth コンテキスト仕様: Layer 構造と System One ルーティング
 
-本書は Main Profile Engine(System 2 の本線 LLM)に渡すプロンプトの層構造、System One(router)による判定スキーマ、発言からの応答・自律タスク・圧縮に至るライフサイクルを定義します。module の分割は [architecture/modules.md](architecture/modules.md)、trait は [architecture/traits.md](architecture/traits.md)、設定項目は [cli.md](cli.md) を参照してください。文書全体の入口は [index.md](index.md) です。
+本書は Main Profile Engine(本線 LLM)に渡すプロンプトの層構造、System One(router)による判定スキーマ、発言からの応答・自律タスク・圧縮に至るライフサイクルを定義します。module の分割は [architecture/modules.md](architecture/modules.md)、trait は [architecture/traits.md](architecture/traits.md)、設定項目は [cli.md](cli.md) を参照してください。文書全体の入口は [index.md](index.md) で、本書に出てくる用語の意味も[用語表](index.md#用語)にまとめています。
 
 ## 1. 目的と設計原則
 
 Noth はサーバーの全チャンネルを常時観測し、「同じ空間にいる仲間」として文脈を共有しながら、自然な雑談への介入と自律的な調査・作業を行います。
 
-1. **生ログの全把握は System One に委ねる。** 大量の生ログを常時走査する役割は、入力コストが小さく文字列を生成しない System One モデル(router)に担わせる
-2. **本線 LLM を無菌に保つ。** 本線には「router がノイズと判定した発言」と「tool 実行の生ログ(検索結果など)」を一切入れない
+1. **生ログの確認は System One に委ねる。** 大量の生ログを常時走査する役割は、入力コストが低く文字列を生成しない System One モデル(router)に担わせる
+2. **本線 LLM にノイズと生ログを入れない。** 本線には「router がノイズと判定した発言」と「tool 実行の生ログ(検索結果など)」を一切入れない
 3. **プレフィックスを不変に保ち KV キャッシュを維持する。** 本線のコンテキストは先頭から Layer 3 までを厳格な追記専用(Append-only)とし、動的な要素はすべて末尾の Layer 4 に置く
-4. **本線への書き込みは1本に直列化する。** router 判定、本線の生成、Layer 3 への昇格、Compactor の置換はすべて1つの actor が順番に処理する。並行に走るのは Worker だけで、その結果の合流も actor のキューに積む
+4. **本線への書き込みは直列に処理する。** router 判定、本線の生成、Layer 3 への昇格、Compactor による要約への置換はすべて1つの actor が順番に処理する。並行に実行するのは Worker だけで、その結果の合流も actor のキューに積む
 
 ## 2. システムコンポーネント
 
 | # | コンポーネント | 担当 module | 役割 |
 |---|---|---|---|
-| ① | Ingest & Debouncer | `channel-discord` + Core | Bot 以外かつ `allowed_users` の発言を受信し SQLite に保存。チャンネル単位でデバウンス(最終発言から既定 2.0 秒待機、短文連投は結合)してから actor のキューに積む。Noth 自身の投稿も `is_self` 付きで SQLite に保存する(router が「直前に自分が答えた」ことを見られるようにするため) |
+| ① | Ingest & Debouncer | `channel-discord` + Core | Bot 以外の `allowed_users` の発言を受信して SQLite に保存し、チャンネル単位でデバウンスしてから actor のキューに積む |
 | ② | Gatekeeper & Attention Router(System One) | `router-*` | 文字列を生成せず、確率付きの構造化判定を1クエリで並列に返す。介入判定、ノイズ判定、話題の区切り、過去チャンクの関連度選択、Worker 合流判定 |
-| ③ | Main Profile Engine(System 2 本線) | `provider-*` + Core | サーバーの仲間としての対話生成と、自律タスクの起動宣言(Ack)。tool 定義は受け取るが **実行は常に Worker** |
-| ④ | Ephemeral Task Worker(System 2 作業用) | `worker` + `tool-*` | 本線から Fork した使い捨てのワーカー。tool を使って調査・作業し、完了後に結論メモだけを本線に返して消える |
+| ③ | Main Profile Engine(本線) | `provider-*` + Core | サーバーの仲間としての対話生成と、自律タスクの起動宣言(Ack)。tool 定義は受け取るが **実行は常に Worker** |
+| ④ | Ephemeral Task Worker(作業用 LLM) | `worker` + `tool-*` | 本線から Fork した使い捨てのワーカー。tool を使って調査・作業し、完了後に結論メモだけを本線に返して終了する |
 | ⑤ | Idle Compactor | `compactor` | サーバー全体がアイドルになったとき Layer 3 を三人称のエピソード記憶に圧縮して Layer 2 へ統合する |
+
+デバウンスでは、チャンネルの最終発言から既定で 2.0 秒待ち、短文の連投は1つに結合します。Noth 自身の投稿も `is_self` 付きで SQLite に保存します。router が「直前に自分が答えた」ことを判断できるようにするためです。
 
 ### 2.1 本線 actor と処理単位
 
@@ -31,7 +33,7 @@ Context Layer Manager は本線の状態(Layer 2〜4、未昇格バッファ)を
 | `Join(run_id)` | Worker 完了の合流判定 → 本線の報告 → 昇格 |
 | `Compact` | Layer 3 の指定範囲を Layer 2 へ置換 |
 
-本線の生成中(数秒〜数十秒)に届いた発言はキューで待ち、生成完了後に判定します。デバウンスはチャンネル単位ですが、キューに積まれる順は到着順なので、複数チャンネルの発言が交錯しても Layer 3 への追記順は一意です。
+本線の生成中(数秒〜数十秒)に届いた発言はキューで待ち、生成完了後に判定します。デバウンスはチャンネル単位ですが、キューに積まれる順は到着順なので、複数チャンネルの発言が交錯しても Layer 3 への追記順は一意に定まります。
 
 ## 3. 本線プロンプトの層構造(KV キャッシュ保護規約)
 
@@ -51,9 +53,9 @@ Context Layer Manager は本線の状態(Layer 2〜4、未昇格バッファ)を
 
 | 層 | 内容 | 変化 | API 上の置き場所 |
 |---|---|---|---|
-| Layer 0 | 出力形式(Ack の書き方、Worker への Goal の構造、結論メモの読み方)、Discord 上の振る舞いの原則、やってはいけないこと、本線は tool を直接呼ばないという規約、要約を三人称で書く規約。キャラクターに依存しない | 有効な module 構成に対して固定(worker 無効なら Ack と Goal の節を含めない) | `system` |
+| Layer 0 | 出力形式(Ack の書き方、Worker への Goal の構造、結論メモの読み方)、Discord 上の振る舞いの原則、やってはいけないこと、本線は tool を直接呼ばないという規約、要約を三人称で書く規約。キャラクターに依存しない | 有効な module 構成ごとに固定(worker 無効なら Ack と Goal の節を含めない) | `system` |
 | Layer 1 | `~/.noth/profiles/<name>.md` の内容(口調・一人称・性格・口癖・模倣元の特徴)+ `allowed_users` のメンバー情報(表示名、ロール) | 起動時のみ | `system` |
-| Layer 2 | 三人称の事実記述によるエピソード要約。「A が○○について質問し、B が△△と回答した」の形。`digest_max_chars` を超えたら古いエピソードから落とす(SQLite には残る) | Compactor 実行時のみ | `system` |
+| Layer 2 | 三人称の事実記述によるエピソード要約。「A が○○について質問し、B が△△と回答した」の形。`digest_max_chars` を超えたら古いエピソードから削除する(SQLite には残る) | Compactor 実行時のみ | `system` |
 | Layer 3 | 昇格済みのクリーンな発言、本線の応答(Ack と Goal を含む)、`[内部調査完了 <run_id>: <結論メモ>]` ブロック。各ターンは所属 TopicChunk の ID を持つ | ターン終了時に末尾へ追記のみ | `messages` |
 | Layer 4 | router が選んだ過去 TopicChunk の本文 + 今回のトリガー発言群 | 毎ターン差し替え | `messages` 末尾 |
 
@@ -66,28 +68,25 @@ Layer 0 を先頭に置くのは、Profile 側の記述で Harness Rules を上�
 1. Layer 4 に一時挿入した「過去の関連チャンク」を破棄する
 2. `[今回のトリガー発言群]`(Layer 4 に入れたときと同じブロック構造の user メッセージ)と `[本線の応答]`(assistant メッセージ)を Layer 3 の末尾へ確定追記する
 
-トリガー発言群のブロックは Layer 4 でも Layer 3 でも同じ内容・同じ形で、関連チャンクはその **前** に置きます。こうすると「関連チャンクを剥がす」操作は末尾2ブロックより前の挿入ブロックを消すだけになり、次ターンの Layer 0〜3 は前ターンの Layer 0〜3 + 2ブロックのまま一致します。
+トリガー発言群のブロックは Layer 4 でも Layer 3 でも同じ内容・同じ形で、関連チャンクはその **前** に置きます。こうすると「関連チャンクを取り除く」操作では、末尾の2ブロックより前に挿入した関連チャンクだけを削除します。次ターンの Layer 0〜3 は、前ターンの Layer 0〜3 にトリガー発言群と応答の2ブロックを追記した形になります。
 
 ### 3.3 未昇格クリーンバッファ
 
-router が `silent` と判定した発言のうち `is_noise_or_meme == false` のものは、Layer 3 にすぐ追記せず「未昇格クリーンバッファ」に溜めます。次に本線が発言するターンの冒頭で **TopicChunk ごとに1ブロックにまとめて** Layer 3 へ追記します。本線が起動しない間はプレフィックスを一切変えないためと、Anthropic のキャッシュ探索(lookback)が 20 ブロックまでなので、追記を細かいブロックに分けないためです。
+router が `silent` と判定した発言のうち `is_noise_or_meme == false` のものは、Layer 3 にすぐ追記せず「未昇格クリーンバッファ」に溜めます。次に本線が発言するターンの冒頭で **TopicChunk ごとに1ブロックにまとめて** Layer 3 へ追記します。こうするのは、本線が起動しない間はプレフィックスを一切変えないためと、Anthropic のキャッシュ探索(lookback)が 20 ブロックまでなので追記を細かいブロックに分けないためです。
 
-### 3.4 キャッシュの実際の挙動
+### 3.4 キャッシュの扱い
 
-- Anthropic: Layer 1 末尾、Layer 2 末尾、Layer 3 末尾の3か所に `cache_control` を置く(明示ブレークポイントは最大4。トップレベルの自動キャッシュ指定は使わない)。TTL は既定5分。サーバーが5分以上静かになると次のターンで Layer 0〜3 を書き直す(書き込みは入力価格の 1.25 倍)。`cache_ttl = "1h"` にすると書き込みが2倍になる代わりに1時間保つ。Layer 0+1 がモデルの最小キャッシュ長(Opus 5.5 で 512 トークン)未満なら1つ目のブレークポイントは効かないが、害はない
-- Worker は Layer 0〜2 のブレークポイントをそのまま使い、「Layer 3 末尾」のブレークポイントを自分のコンテキスト末尾に移す。合計3のまま
-- OpenAI 互換・Google: 自動(implicit)キャッシュに任せる。Noth 側で制御するものはない
-- 期限切れ直前にダミーリクエストで延命する keep-alive は MVP では行わない
+provider ごとのブレークポイントの置き方と TTL、本線と Worker のキャッシュ共有、keep-alive は [architecture/caching.md](architecture/caching.md) で定義します。
 
 ## 4. System One 判定スキーマ
 
-Core は以下の質問セットを定義し、router module に渡します。質問型は System One API と同じ `noul`(yes/no の確率)/ `choice`(単一選択、各選択肢の確率と confidence)/ `score`(順序付きルーブリック)の3種類だけです。`router-systemone` はこれをそのまま API の `questions` に写像し、`router-mention` はルールで同じ形の回答(確率は 0.0 / 1.0、confidence は 1.0)を返します。
+Core は以下の質問セットを定義し、router module に渡します。質問型は System One API と同じ `noul`(yes/no の確率)/ `choice`(単一選択、各選択肢の確率と confidence)/ `score`(段階別の評価基準)の3種類だけです。`router-systemone` はこれをそのまま API の `questions` に変換し、`router-mention` はルールで同じ形の回答(確率は 0.0 / 1.0、confidence は 1.0)を返します。
 
-二値化は Core が行います。`noul` は `[router.thresholds]` の閾値以上なら true、`choice` は最大確率の選択肢を採り、`confidence` が `min_confidence` 未満なら安全側の値(介入判定なら `silent`、合流判定なら `abort`)に倒します。確率そのものも SQLite に保存し、閾値の調整や後の分析に使えるようにします。
+二値化は Core が行います。`noul` は `[router.thresholds]` の閾値以上なら true、`choice` は最大確率の選択肢を採り、`confidence` が `min_confidence` 未満なら安全側の値を採ります(介入判定なら `silent`、合流判定なら `abort`)。確率そのものも SQLite に保存し、閾値の調整や後の分析に使えるようにします。
 
 ### 4.1 `state` の組み立て
 
-`state` は次の JSON オブジェクトで、全体を `state_max_chars`(既定 24,000 文字)に収めます。超える場合は `recent` の古いものから落とします。トークンは数えないので、Clef-flash(24,576 トークン)を使うときは文字数上限を保守的に取ってください。
+`state` は次の JSON オブジェクトで、全体を `state_max_chars`(既定 24,000 文字)に収めます。超える場合は `recent` の古い発言から除外します。ローカルではトークン数を計算しないため、Clef-flash(24,576 トークン)を使うときは文字数上限を余裕のある小さめの値に設定してください。
 
 | フィールド | 内容 |
 |---|---|
@@ -101,14 +100,14 @@ Core は以下の質問セットを定義し、router module に渡します。�
 |---|---|---|
 | `is_noise_or_meme` | noul | スタンプ連打・コピペ連投など文脈価値のないノイズか |
 | `is_topic_shift` | noul | そのチャンネルの直前の会話から話題が切り替わったか |
-| `intervention_action` | choice: `silent` / `reply_only` / `spawn_task` | 本線を起動するか、起動して Worker も立てるか |
+| `intervention_action` | choice: `silent` / `reply_only` / `spawn_task` | 静観するか、本線だけを起動するか、本線と Worker を起動するか |
 | `task_category` | choice: `none` / `web_research` / `fact_check` / `code_or_tool` | Worker に渡す作業の種類 |
 | `relevant_chunk_<id>` | noul × 候補数 | 候補 TopicChunk `<id>` が今回の発言に関連するか。候補ごとに1問 |
 
-- TopicChunk は **チャンネルごと** に管理する。`is_topic_shift == true` ならそのチャンネルで新しい TopicChunk の ID を切る。チャンネルが違えば別のチャンクなので、2チャンネルの交互発言で毎回 topic shift になることはない
+- TopicChunk は **チャンネルごと** に管理する。`is_topic_shift == true` ならそのチャンネルで新しい TopicChunk の ID を割り当てる。チャンネルが違えば別のチャンクなので、2チャンネルの交互発言で毎回 topic shift になることはない
 - `is_noise_or_meme == true` なら SQLite には記録するが、Layer 3 への昇格対象から外す
 - `intervention_action == spawn_task` かつ `task_category == none` は `reply_only` として扱う
-- 候補 TopicChunk は直近のものから `candidate_chunks` 個(既定 32)。上限は `Router::max_questions() - 4`(Clef なら 60)。Layer 3 のターンが属しているチャンクは候補から外す。候補の要約は TopicChunk 作成時に先頭数発言から機械的に作る(LLM は使わない)
+- 候補 TopicChunk は直近のものから `candidate_chunks` 個(既定 32)。上限は `Router::max_questions() - 4`(Clef なら 60)。Layer 3 のターンが属しているチャンクは候補から外す。候補の要約は TopicChunk 作成時に冒頭の数件の発言から機械的に作成する(LLM は使わない)
 - System One API に複数選択型は無いため、関連チャンクは候補ごとの `noul` で表現する。`choice` の選択肢上限 255 は本設計では使わない
 
 ### 4.3 Worker 合流判定(Worker 完了時)
@@ -167,7 +166,7 @@ sequenceDiagram
         A->>M: 結論メモを Layer 3 に追記
         M->>D: 報告
     end
-    Note over A: 人間の発言が N 分なし、Worker なし
+    Note over A: 人間の発言が N 分間なく、実行中の Worker もいない
     A->>C: Compact(ターン範囲)
     C-->>A: 要約を Layer 2 へ、範囲を置換
 ```
@@ -182,8 +181,8 @@ sequenceDiagram
 1. 未昇格クリーンバッファの発言を TopicChunk ごとに1ブロックにまとめて Layer 3 に追記する
 2. router が true と判定した `relevant_chunk_<id>` のチャンク本文と今回のトリガー発言を Layer 4 にセットする
 3. 本線が推論し、Channel 経由で発言する。生成中は typing インジケータを出す。Channel は 2,000 文字を超える応答を分割投稿し、`allowed_mentions` を空にして `@everyone` やロールメンションを抑止する
-4. provider のエラー(429 / 5xx)は `retry_max` 回まで再試行し、それでも失敗したら typing を止めて無言で終わる。トリガー発言は昇格せずバッファに戻す
-5. Layer 4 の過去チャンクを剥がし、トリガー発言と本線の応答を Layer 3 末尾へ確定追記する
+4. provider のエラー(429 / 5xx)は `retry_max` 回まで再試行し、それでも失敗したら typing を止め、応答を投稿せずにターンを終了する。トリガー発言は昇格せずバッファに戻す
+5. Layer 4 の過去チャンクを取り除き、トリガー発言と本線の応答を Layer 3 末尾へ確定追記する
 
 ### パターン C: 自律タスク起動(`intervention_action == spawn_task`)
 
@@ -191,21 +190,29 @@ sequenceDiagram
 
 1. **Ack と昇格**
    - パターン B の 1〜2 と同じ手順で Layer 3 / 4 を準備する
-   - 本線が「それ、ちょっと調べてみますね」などの宣言(Ack)を発言し、同時に Worker への指示(Goal)を生成する。Ack と Goal の書式は Layer 0 で規定する。Goal は Discord には出さない
+   - 本線が「それ、ちょっと調べてみますね」などの宣言(Ack)を投稿し、同時に Worker への指示(Goal)を生成する。Ack と Goal の書式は Layer 0 で規定する。Goal は Discord には出さない
    - Ack はトリガー発言のチャンネルへ新規メッセージとして投稿する
    - トリガー発言と本線の応答(Ack + Goal)を Layer 3 に昇格する。**Fork より前に昇格する**ことで、Worker の文脈にもトリガーと Goal が含まれる
-   - 本線の応答がテキストの Ack ではなく `tool_calls` だった場合: Core は Layer 0 の定型文から Ack を作って投稿し、tool 呼び出しの内容から Goal を組み立て、「定型 Ack + Goal」をテキストの assistant メッセージとして Layer 3 に記録する。元の `tool_calls` は履歴に残さない(残すと `tool_result` が必須になり、消すと assistant が空になるため)。`task_category` は tool 名から決める(`web_search` / `web_fetch` / `web_agent` → `web_research`、`shell` → `code_or_tool`)
-   - Worker の同時実行数が `max_concurrent` に達していたら run を FIFO で待たせる。Ack は投稿済みなので、待ち時間も `timeout_secs` に含める
+   - 本線の応答がテキストの Ack ではなく `tool_calls` だった場合は、Core が次のように処理する
+     - Layer 0 の定型文から Ack を作って投稿する
+     - tool 呼び出しの内容から Goal を組み立て、「定型 Ack + Goal」をテキストの assistant メッセージとして Layer 3 に記録する
+     - 元の `tool_calls` は履歴に残さない。残すと `tool_result` が必須になり、消すと assistant が空になるため
+     - `task_category` は tool 名から決める(`web_search` / `web_fetch` / `web_agent` → `web_research`、`shell` → `code_or_tool`)
+   - Worker の同時実行数が `max_concurrent` に達していたら run をキューに入れ、先に入ったものから順に実行する(FIFO)。Ack は投稿済みなので、待ち時間も `timeout_secs` に含める
 2. **Fork**
    - 本線の Layer 0〜3 と tool 定義をそのまま引き継いで、バックグラウンドで Worker を起動する。本線と Worker は同一 provider・同一モデル・同一 tool 定義・同一 `tool_choice`(未指定)なので、Worker の初回呼び出しは本線の KV キャッシュに当たる([architecture/caching.md §2](architecture/caching.md#2-本線と-worker-のキャッシュ共有))
-   - Worker 固有の指示(「これはバックグラウンド作業である」「結論メモの書式」「Goal」)は **最初の user メッセージ** に置く。`system` には1文字も足さない(足すと Layer 3 のキャッシュが全部外れる)
-   - Worker は隔離された自分のコンテキストで tool を追記式に実行する。反復は `max_iterations` 回まで、各 tool の出力は `tool_output_max_chars` で切り詰める。`tool-shell` は `task_category == code_or_tool` の run でだけ承認され、`cwd` は run ごとの `$NOTH_HOME/work/<run_id>/`
-   - この間、本線は空いているので、別の雑談が進めばパターン B で通常どおり応答できる
+   - Worker 固有の指示(「これはバックグラウンド作業である」「結論メモの書式」「Goal」)は **最初の user メッセージ** に置く。`system` には1文字も足さない。理由は [architecture/caching.md §3](architecture/caching.md#3-worker-固有の指示の置き場) を参照
+   - Worker は隔離された自分のコンテキストで tool を実行し、呼び出しと結果をコンテキストの末尾に追記する。反復は `max_iterations` 回まで、各 tool の出力は `tool_output_max_chars` で切り詰める。`tool-shell` は `task_category == code_or_tool` の run でだけ承認され、`cwd` は run ごとの `$NOTH_HOME/work/<run_id>/`
+   - Worker の実行中も本線は別の会話を処理できるため、雑談が進めばパターン B で通常どおり応答できる
 3. **Join と報告**
-   - Worker は完了時に途中の tool 出力をすべて捨て、構造化された結論メモ(数百トークン)だけを出力して消える。timeout・API エラー・反復上限で失敗したときは Core が `[内部調査失敗 <run_id>: <理由>]` を結論メモの代わりにする
-   - actor が `Join(run_id)` を処理する。router の合流判定(§4.3)を実行する
+   - Worker は完了時に途中の tool 出力をすべて捨て、構造化された結論メモ(数百トークン)だけを出力して終了する。timeout・API エラー・反復上限で失敗したときは Core が `[内部調査失敗 <run_id>: <理由>]` を結論メモの代わりにする
+   - actor が `Join(run_id)` を処理し、router の合流判定(§4.3)を実行する
    - `abort` なら結論メモは SQLite に残すだけで Layer 3 には入れず、Ack はそのままにする
-   - `abort` 以外なら: 未昇格バッファを昇格し、Layer 3 に `[内部調査完了 <run_id>: <結論メモ>]` を user メッセージとして1ブロック追記し、Layer 4 には `delivery_style` の指示だけを入れて本線が発言する。`reply_anchor` のときだけ `worker_runs.trigger_message_id` への Discord リプライとして投稿する。Ack メッセージの編集はしない。応答を Layer 3 に昇格する(Layer 4 の指示は残さない)
+   - `abort` 以外なら、次の順に報告する
+     1. 未昇格バッファを昇格する
+     2. Layer 3 に `[内部調査完了 <run_id>: <結論メモ>]` を user メッセージとして1ブロック追記する
+     3. Layer 4 には `delivery_style` の指示だけを入れ、本線が発言する。`reply_anchor` のときだけ `worker_runs.trigger_message_id` への Discord リプライとして投稿する。Ack メッセージは編集しない
+     4. 応答を Layer 3 に昇格する。Layer 4 の指示は残さない
 
 ### パターン D: アイドル時コンパクション
 
@@ -214,13 +221,13 @@ sequenceDiagram
 **通常トリガー**: 人間の最終発言から N 分(既定 10 分)経過。Noth 自身の投稿はアイドルを解除しない。Worker が実行中なら完了を待ってから始める。
 
 1. actor が `Compact(ターン ID 範囲)` を処理する。対象は Layer 3 のうち「残す直近ターン」(`keep_recent_turns`、既定 6)を除いた範囲。要約生成中に届いた発言はキューで待つ
-2. 対象範囲を三人称の客観的なエピソード要約に変換し、Layer 2 に統合する。要約の生成には Layer 1(Profile)を入れず、Layer 0 の規約だけを与える。キャラクターの口調が要約に混ざり、本線の文体を汚染するのを防ぐため
-3. Layer 3 から対象範囲を取り除く。新しい Layer 2 を SQLite に保存する。Layer 2 が `digest_max_chars` を超えたら古いエピソードから落とす
+2. 対象範囲を三人称の客観的なエピソード要約に変換し、Layer 2 に統合する。要約の生成には Layer 1(Profile)を入れず、Layer 0 の規約だけを与える。キャラクターの口調が要約に混ざり、本線の文体を乱すのを防ぐため
+3. Layer 3 から対象範囲を取り除く。新しい Layer 2 を SQLite に保存する。Layer 2 が `digest_max_chars` を超えたら古いエピソードから削除する
 
 **緊急トリガー**: アイドルにならないまま直近のレスポンスの `usage.input_tokens`(tools + Layer 0〜4 の合計)が `[context] prompt_hard_limit_tokens` を超えた場合。
 
 1. 古い TopicChunk から順に、そのチャンクに属する Layer 3 のターンを要約して Layer 2 へ退避する。チャンク境界(`is_topic_shift` で切った位置)で切るため話題の分断は起きない
-2. このときのキャッシュ無効化は許容する。上限超過のほうが害が大きい
+2. このときのキャッシュ無効化は許容する。キャッシュの維持より、上限超過の回避を優先するため
 
 ## 6. SQLite に持つデータ
 
@@ -229,18 +236,18 @@ sequenceDiagram
 | テーブル | 内容 |
 |---|---|
 | `messages` | `allowed_users` と Noth 自身の発言の生ログ。チャンネル、投稿者、`is_self`、本文、時刻、所属 TopicChunk、`is_noise_or_meme`、`decision_id`(NULL なら未判定)、`promoted_turn_id`(NULL なら未昇格) |
-| `topic_chunks` | TopicChunk の ID、チャンネル、開始・終了時刻、候補用の機械要約、Compactor 済みか |
+| `topic_chunks` | TopicChunk の ID、チャンネル、開始・終了時刻、候補用の機械要約、Compactor による要約が済んでいるか |
 | `decisions` | router の判定結果と各回答の確率・confidence、レイテンシ |
 | `active_log` | Layer 3 のターン列。各ターンの種別(バッファ / トリガー / 応答 / 結論メモ)、`chunk_id`、その時点の `usage` |
 | `digests` | Layer 2 の履歴 |
 | `worker_runs` | `run_id`、Goal、`task_category`、`trigger_message_id`、`channel_id`、状態(queued / running / finished / failed / aborted)、開始・終了時刻、結論メモ、`delivery_style` |
 | `heartbeat` | 常駐プロセスの最終更新時刻と接続状態。`noth status` がプロセス外から読む |
 
-`allowed_users` 以外と Bot(Noth 自身を除く)の発言は Channel で捨てるため、どのテーブルにも入りません。
+`allowed_users` 以外のユーザーと Bot(Noth 自身を除く)の発言は Channel で捨てるため、どのテーブルにも入りません。
 
 ### 6.1 再起動時の復元
 
-1. `worker_runs` の queued / running を aborted にする。Ack は投稿済みだが報告はしない
+1. `worker_runs` で queued / running 状態の run を aborted にする。Ack は投稿済みだが報告はしない
 2. `active_log` から Layer 3 を復元し、`digests` の最新から Layer 2 を復元する
 3. `messages` のうち `promoted_turn_id` が NULL で `decision_id` があるものを未昇格バッファに戻す
 4. `decision_id` が NULL の発言(判定前に落ちたもの)はまとめて1つの `Judge` としてキューに積む

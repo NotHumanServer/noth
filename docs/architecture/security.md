@@ -8,25 +8,26 @@
 
 | 経路 | 入ってくるもの | 到達範囲 |
 |---|---|---|
-| Discord | `allowed_users` 以外のユーザや他 Bot の発言、引用・転送・埋め込み・添付 | Channel の時点で捨てる。SQLite にも残さない |
+| Discord | `allowed_users` 以外のユーザーや他 Bot の発言、引用・転送・埋め込み・添付 | Channel の時点で捨てる。SQLite にも残さない |
 | Web | `tool-web-*` が取得したページ本文 | Worker のコンテキストにだけ入る。本線には結論メモを通じてしか届かない |
 
 ## 2. Discord 側の対策
 
-- `allowed_users` にないユーザと Bot(Noth 自身を除く)の発言は Channel の時点で捨て、SQLite にも残しません
-- メッセージの `content` だけを読みます。`referenced_message`(リプライ引用)、`message_snapshots`(転送)、`embeds`(URL プレビュー)、添付は非リストユーザや外部サイトの文字列が入る経路なので読みません
-- `content` 内のユーザーメンションは `allowed_users` なら表示名に解決し、それ以外は `<user>` に置き換えます
-- 全チャンネルの本文を読むには Discord Developer Portal で `MESSAGE_CONTENT` 特権インテントを有効にする必要があります(100 サーバー未満なら審査不要)
+- `allowed_users` にないユーザーと Bot(Noth 自身を除く)の発言は Channel の時点で捨て、SQLite にも残さない
+- メッセージの `content` だけを読む。`referenced_message`(リプライ引用)、`message_snapshots`(転送)、`embeds`(URL プレビュー)、添付には `allowed_users` に含まれないユーザーや外部サイトの文字列が入り得るため、読まない
+- `content` 内のユーザーメンションは `allowed_users` なら表示名に解決し、それ以外は `<user>` に置き換える
+- 全チャンネルの本文を読むには Discord Developer Portal で `MESSAGE_CONTENT` 特権インテントを有効にする必要がある(100 サーバー未満なら審査不要)
 
 ## 3. Web 側の対策と承認ポリシー
 
-worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。MVP の実装は `auto` で、次の1つだけを固定の規則として持ちます。
+Worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。MVP の実装は `auto` で、次の1つだけを固定の規則として持ちます。
 
 - `tool-shell` は `task_category == code_or_tool` の run でだけ許可する。`web_research` / `fact_check` の run は Web から取得した文字列を読むので、そこに書かれた指示でシェルを実行させない(間接プロンプトインジェクション → RCE の経路を断つ)。tool 定義自体は全 run で同一のまま([caching.md §2](caching.md#2-本線と-worker-のキャッシュ共有))なので、拒否は `tool_result` のエラーとして Worker に返る
 
-tool の出力は worker のコンテキストにだけ入り、本線には届きません。将来 Discord のボタン承認などを足せるよう、差し込み点は Core に置きます。tool のサンドボックスと対話的な承認は MVP に含めません([overview.md §5](overview.md#5-mvp-に含めないもの))。
+tool の出力は Worker のコンテキストにだけ入り、本線には届きません。将来 Discord のボタン承認などを追加できるよう、拡張点は Core に置きます。tool のサンドボックスと対話的な承認は MVP に含めません([overview.md §5](overview.md#5-mvp-に含めないもの))。
 
 ## 4. tool-shell の運用
 
-- `tool-shell` はサンドボックスなしで動きます。Discord の発言が起点で任意のコマンドが走るため、Noth は専用の VM か専用ユーザで動かし、`allowed_users` に信頼できるメンバーだけを入れてください
-- `cwd` は run ごとの `$NOTH_HOME/work/<run_id>/` で、run 終了時に残します(複数 Worker の同時実行でファイルが衝突しないため)
+`tool-shell` はサンドボックスなしで動きます。Discord の発言が起点で任意のコマンドが走るため、Noth は専用の VM か専用ユーザーで動かし、`allowed_users` には信頼できるメンバーだけを入れてください。
+
+`cwd` は run ごとに分けた `$NOTH_HOME/work/<run_id>/` です。run ごとに分けるのは、複数の Worker を同時に実行してもファイルが衝突しないようにするためです。このディレクトリは run の終了後も残します。
