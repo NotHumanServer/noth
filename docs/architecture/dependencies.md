@@ -19,7 +19,9 @@
 | Google 認証 | `gcp_auth` | 0.12 | `agent-platform` preset のみ。サービスアカウント JSON のファイルパスを渡す |
 | umask 設定 | `libc` | 0.2 | unix のみ。ログファイルを 0600 で作るため、`noth run` が `umask(0o077)` を呼ぶ |
 | OS サービス | `service-manager` | 0.11 | launchd / systemd(user level)を同一 API で扱う。実機確認が必要 |
+| 設定ファイルの編集 | `toml_edit` | 0.25 | `noth config set/unset`、`noth module enable/disable`。コメントと書式を保ったまま書き換えるため。読み込みは `toml` のまま |
+| 対話入力 | `inquire` | 0.9 | `noth init` の対話モード(パスワード入力・選択・複数選択) |
 
 **ローカルでトークン数を計算しません。** `tiktoken-rs` は OpenAI のトークナイザ専用で Claude / Gemini には合わないため使いません。Layer 3 の上限判定には各 API のレスポンスに含まれる `usage` を保存して使います。
 
-出典: [serenity](https://crates.io/crates/serenity)、[sqlx](https://crates.io/crates/sqlx)、[libc](https://crates.io/crates/libc)、[service-manager](https://github.com/chipsenkbeil/service-manager-rs)、[gcp_auth](https://crates.io/crates/gcp_auth)、[Anthropic SDK 一覧](https://platform.claude.com/docs/en/cli-sdks-libraries/overview)、[tiktoken-rs README](https://github.com/zurawiki/tiktoken-rs)
+出典: [serenity](https://crates.io/crates/serenity)、[toml_edit](https://docs.rs/toml_edit/latest/toml_edit/struct.DocumentMut.html)、[inquire](https://docs.rs/inquire/latest/inquire/)、[sqlx](https://crates.io/crates/sqlx)、[libc](https://crates.io/crates/libc)、[service-manager](https://github.com/chipsenkbeil/service-manager-rs)、[gcp_auth](https://crates.io/crates/gcp_auth)、[Anthropic SDK 一覧](https://platform.claude.com/docs/en/cli-sdks-libraries/overview)、[tiktoken-rs README](https://github.com/zurawiki/tiktoken-rs)

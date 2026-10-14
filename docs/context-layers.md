@@ -192,26 +192,29 @@ sequenceDiagram
    - パターン B の 1〜2 と同じ手順で Layer 3 / 4 を準備する
    - 本線が「それ、ちょっと調べてみますね」などの宣言(Ack)を投稿し、同時に Worker への指示(Goal)を生成する。Ack と Goal の書式は Layer 0 で規定する。Goal は Discord には出さない
    - Ack はトリガー発言のチャンネルへ新規メッセージとして投稿する
+   - Worker に回すかどうかは、最終的には本線の応答の形で決める。router が `reply_only` と判定していても、本線が `[Goal]` 行を書くか tool を呼べば Worker に回す(そのまま投稿すると Goal が Discord に漏れるため)。逆に `spawn_task` 判定でも `[Goal]` 行が無ければ通常の応答として投稿する。`[Goal]` の前が空なら Ack は Layer 0 の定型文にする
    - トリガー発言と本線の応答(Ack + Goal)を Layer 3 に昇格する。**Fork より前に昇格する**ことで、Worker の文脈にもトリガーと Goal が含まれる
    - 本線の応答がテキストの Ack ではなく `tool_calls` だった場合は、Core が次のように処理する
      - Layer 0 の定型文から Ack を作って投稿する
      - tool 呼び出しの内容から Goal を組み立て、「定型 Ack + Goal」をテキストの assistant メッセージとして Layer 3 に記録する
      - 元の `tool_calls` は履歴に残さない。残すと `tool_result` が必須になり、消すと assistant が空になるため
-     - `task_category` は tool 名から決める(`web_search` / `web_fetch` / `web_agent` → `web_research`、`shell` → `code_or_tool`)
+     - `task_category` は tool 名から決める(`web_search` / `web_fetch` / `web_agent` → `web_research`、`shell` → `code_or_tool`)。web 系と shell が混ざっていれば `web_research` にする。Web から取った文字列で shell を動かさないため([security.md §3](architecture/security.md#3-web-側の対策と承認ポリシー))
    - Worker の同時実行数が `max_concurrent` に達していたら run をキューに入れ、先に入ったものから順に実行する(FIFO)。Ack は投稿済みなので、待ち時間も `timeout_secs` に含める
 2. **Fork**
    - 本線の Layer 0〜3 と tool 定義をそのまま引き継いで、バックグラウンドで Worker を起動する。本線と Worker は同一 provider・同一モデル・同一 tool 定義・同一 `tool_choice`(未指定)なので、Worker の初回呼び出しは本線の KV キャッシュに当たる([architecture/caching.md §2](architecture/caching.md#2-本線と-worker-のキャッシュ共有))
    - Worker 固有の指示(「これはバックグラウンド作業である」「結論メモの書式」「Goal」)は **最初の user メッセージ** に置く。`system` には1文字も足さない。理由は [architecture/caching.md §3](architecture/caching.md#3-worker-固有の指示の置き場) を参照
    - Worker は隔離された自分のコンテキストで tool を実行し、呼び出しと結果をコンテキストの末尾に追記する。反復は `max_iterations` 回まで、各 tool の出力は `tool_output_max_chars` で切り詰める。`tool-shell` は `task_category == code_or_tool` の run でだけ承認され、`cwd` は run ごとの `$NOTH_HOME/work/<run_id>/`
    - Worker の実行中も本線は別の会話を処理できるため、雑談が進めばパターン B で通常どおり応答できる
+   - Worker の実行中(キュー待ちを含む)はトリガーのチャンネルに入力中表示を出し続ける。`[worker] show_progress`(既定 true)なら、Worker が tool を呼ぶたびに Ack のメッセージを編集し、`-# 🔍 web_search「検索語」` のような行を末尾に足していく。編集は 1.5 秒に 1 回までにまとめ、終了時に完了か失敗の行を足す。この進捗は Discord にだけ出し、Layer 3 には Ack と Goal の本文だけを残す。tool の出力は進捗にも含めない
 3. **Join と報告**
    - Worker は完了時に途中の tool 出力をすべて捨て、構造化された結論メモ(数百トークン)だけを出力して終了する。timeout・API エラー・反復上限で失敗したときは Core が `[内部調査失敗 <run_id>: <理由>]` を結論メモの代わりにする
    - actor が `Join(run_id)` を処理し、router の合流判定(§4.3)を実行する
-   - `abort` なら結論メモは SQLite に残すだけで Layer 3 には入れず、Ack はそのままにする
+   - `abort` なら結論メモは SQLite に残すだけで Layer 3 には入れず、Ack はそのままにする。router のエラーと `min_confidence` 未満も `abort` として扱い、判定は `decisions` に kind `join` / `join_error` で記録する
+   - 報告の生成・投稿に失敗したときは、結論メモのブロックだけを Layer 3 に残す。Ack で待たせているので、次に本線が話すときに調査結果を踏まえられるようにするため
    - `abort` 以外なら、次の順に報告する
      1. 未昇格バッファを昇格する
      2. Layer 3 に `[内部調査完了 <run_id>: <結論メモ>]` を user メッセージとして1ブロック追記する
-     3. Layer 4 には `delivery_style` の指示だけを入れ、本線が発言する。`reply_anchor` のときだけ `worker_runs.trigger_message_id` への Discord リプライとして投稿する。Ack メッセージは編集しない
+     3. Layer 4 には `delivery_style` の指示だけを入れ、本線が発言する。`reply_anchor` のときだけ `worker_runs.trigger_message_id` への Discord リプライとして投稿する
      4. 応答を Layer 3 に昇格する。Layer 4 の指示は残さない
 
 ### パターン D: アイドル時コンパクション
@@ -221,7 +224,7 @@ sequenceDiagram
 **通常トリガー**: 人間の最終発言から N 分(既定 10 分)経過。Noth 自身の投稿はアイドルを解除しない。Worker が実行中なら完了を待ってから始める。
 
 1. actor が `Compact(ターン ID 範囲)` を処理する。対象は Layer 3 のうち「残す直近ターン」(`keep_recent_turns`、既定 6)を除いた範囲。要約生成中に届いた発言はキューで待つ
-2. 対象範囲を三人称の客観的なエピソード要約に変換し、Layer 2 に統合する。要約の生成には Layer 1(Profile)を入れず、Layer 0 の規約だけを与える。キャラクターの口調が要約に混ざり、本線の文体を乱すのを防ぐため
+2. 対象範囲を三人称の客観的なエピソード要約に変換し、Layer 2 に統合する。各エピソードの先頭には `[エピソード MM/DD HH:MM]` の見出しを付け、上限を超えたときに古いものから削る単位にする。残す側の先頭が assistant のターンになる場合は、切る位置を後ろへずらす。要約の生成には Layer 1(Profile)を入れず、Layer 0 の規約だけを与える。キャラクターの口調が要約に混ざり、本線の文体を乱すのを防ぐため
 3. Layer 3 から対象範囲を取り除く。新しい Layer 2 を SQLite に保存する。Layer 2 が `digest_max_chars` を超えたら古いエピソードから削除する
 
 **緊急トリガー**: アイドルにならないまま直近のレスポンスの `usage.input_tokens`(tools + Layer 0〜4 の合計)が `[context] prompt_hard_limit_tokens` を超えた場合。

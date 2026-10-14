@@ -29,6 +29,8 @@ pub trait Channel: Send + Sync {
     async fn send(&self, channel_id: ChannelId, text: &str, reply_to: Option<MessageId>) -> Result<MessageId>;
     /// 生成中の typing インジケータ
     async fn typing(&self, channel_id: ChannelId) -> Result<()>;
+    /// 投稿済みの発言を書き換える。Worker の進捗を Ack に追記するのに使う。既定は未対応(Err)
+    async fn edit(&self, channel_id: ChannelId, message_id: MessageId, text: &str) -> Result<()>;
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
     /// `noth doctor` の疎通確認。成功時は表示用の短い説明を返す

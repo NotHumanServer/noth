@@ -30,7 +30,7 @@ noth init [--non-interactive]
 対話モードでは次の順に進みます。
 
 1. Discord Bot トークンを入力。`.env` に `DISCORD_BOT_TOKEN` として保存する。`MESSAGE_CONTENT` 特権インテントを Developer Portal で有効にするよう案内する(メンバー一覧の取得に `GUILD_MEMBERS` 特権インテントも必要になる可能性があり、実装時に確認する)
-2. トークンで接続し、Bot が参加している guild の一覧から1つ選ぶ。メンバー一覧を取得して `allowed_users` に入れるメンバーを選ぶ。一覧を取得できない場合はユーザー ID の手入力も受け付ける
+2. guild ID と `allowed_users` のユーザー ID を手入力する(Discord の開発者モードで ID をコピーする)。トークンが有効か、Bot が guild に参加しているかは最後の `noth doctor` で確かめる。バイナリが Discord の REST クライアントを直接持たないため、一覧からの選択は行わない
 3. router を選ぶ(`router-systemone` の preset `jev`(既定)/ `clef`、または `router-mention`)。必要なキー(`TYPESAFE_API_KEY`、または `CF_API_TOKEN` と `CF_ACCOUNT_ID`)を `.env` に保存する
 4. ビルドに含まれる module から provider を選び、preset・モデル名・API キーを設定する
 5. ビルドに `tool-web-*` が含まれていれば `TINYFISH_API_KEY` を入力する
@@ -94,6 +94,14 @@ noth service status
 - `PATH` の明示(launchd の既定 PATH は最小限で、`tool-shell` の動作に影響する)
 - 停止タイムアウトを `worker.timeout_secs` + 余裕に合わせる(systemd `TimeoutStopSec`、launchd `ExitTimeOut`)
 - Linux ではログアウト後も動かすために `loginctl enable-linger` が必要なことを `install` の出力で案内する
+
+### `noth auth`
+
+```text
+noth auth codex                       # ChatGPT のサブスクリプションで OpenAI Codex にログインする
+```
+
+`provider-openai` の `preset = "codex"` 用です。device code ログイン(表示された URL を開いてコードを入力する)を行い、トークンを `$NOTH_HOME/data/codex-auth.json` に保存します。トークンは期限の前に自動で更新されます。保存場所が `.env` でない理由は [security.md §5](architecture/security.md#5-openai-codex-のトークン) を参照してください。
 
 ### `noth status`
 
@@ -221,6 +229,8 @@ model    = "..."
 format   = "chat"                # chat | responses
 # base_url = "..."               # 互換サーバー
 # preset   = "opencode-go"       # このとき api_key は ${OPENCODE_GO_API_KEY}
+# preset   = "codex"             # ChatGPT のサブスクリプションで Codex を使う。api_key は不要で、先に `noth auth codex` を実行する。format は responses に固定
+# effort   = "low"               # none | minimal | low | medium | high | xhigh | max(モデル依存)
 
 [provider.google]
 api_key = "${GOOGLE_AI_STUDIO_API_KEY}"
@@ -236,6 +246,7 @@ timeout_secs          = 600      # 待ち時間を含む
 max_iterations        = 25       # tool 呼び出しの反復上限
 tool_output_max_chars = 20000    # 各 tool の出力の文字数上限。超えた分は切り詰める
 approval              = "auto"   # MVP では auto のみ。tool-shell は code_or_tool の run に限る
+show_progress         = true     # Ack を編集して、Worker が使った tool(検索語や URL)を表示する
 
 [compactor]
 idle_minutes      = 10           # 人間の最終発言からの経過。Noth 自身の投稿では解除しない
@@ -249,6 +260,9 @@ backend = "tinyfish"
 [tool.web-agent]
 backend = "tinyfish"
 poll_interval_secs = 5
+max_duration_secs  = 300         # TinyFish 側で run を打ち切る秒数。Agent はステップ課金のため上限を設ける
+# max_steps         = 30          # 1 run の最大ステップ数(tool 入力の max_steps との小さい方。上限 150)
+# max_steps_per_run  = 60          # 1 回の調査(Worker の run_id)での累計ステップ上限。超えたら API を呼ばず失敗を返す
 [tool.shell]
 # cwd は run ごとの $NOTH_HOME/work/<run_id>/ に固定。設定項目なし
 

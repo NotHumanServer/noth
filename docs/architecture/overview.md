@@ -78,3 +78,4 @@ Core は必須で、feature 化しません。
 | tool のサンドボックス、対話的な承認 | 将来追加できるよう、インターフェースだけ用意([security.md §3](security.md#3-web-側の対策と承認ポリシー)) |
 | 設定のホットリロード | 変更は一律に再起動で反映する |
 | TUI、対話チャット CLI | Noth は Discord 常駐専用 |
+| リアクションでの反応(発言するほどではないが反応したいとき、絵文字リアクションだけ付ける) | MVP 後の要望(2026-10-15)。router の `intervention_action` に `react` を足し、`Channel` に `react(channel_id, message_id, emoji)` を加える形が候補。本線を起動しないので Layer 3 は変えず、どの絵文字を選ぶかの決め方は未定 |

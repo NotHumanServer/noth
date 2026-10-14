@@ -25,6 +25,7 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 |---|---|---|
 | (省略) | すべて | 各ベンダーの API に直接接続(OpenAI / Anthropic / Google AI Studio) |
 | `opencode-go` | openai / anthropic / google | ベース URL `https://opencode.ai/inference/go/v1`。モデル ID ごとに Chat Completions / Responses / Messages / Google 形式のいずれかを使う。利用者は使いたいモデルの形式に合う provider module を有効にする |
+| `codex` | openai | ChatGPT のサブスクリプションで OpenAI Codex のバックエンド(`https://chatgpt.com/backend-api/codex`)を Responses 形式で呼ぶ。認証は `noth auth codex` の OAuth([security.md §5](security.md#5-openai-codex-のトークン)) |
 | `agent-platform` | google | Google Agent Platform(旧 Vertex AI)。`project` / `location` とサービスアカウントの OAuth2 |
 
 ## 3. 任意 module を無効にしたときの動作
