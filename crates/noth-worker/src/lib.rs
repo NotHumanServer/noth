@@ -1,0 +1,780 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use noth_core::approval::ApprovalPolicy;
+use noth_core::config::WorkerSettings;
+use noth_core::registry::{ModuleCtx, Registry, WorkerDeps};
+use noth_core::traits::{Provider, Tool, Worker, WorkerOutcome, WorkerProgress, WorkerTask};
+use noth_core::types::*;
+use noth_core::{Error, Result};
+use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
+
+pub fn register(reg: &mut Registry) {
+    reg.register_worker(factory);
+}
+
+fn factory(ctx: &ModuleCtx, deps: WorkerDeps) -> Result<Arc<dyn Worker>> {
+    let settings = ctx.config.worker_settings()?;
+    if settings.approval != "auto" {
+        return Err(Error::Config(format!(
+            "[worker] approval は \"auto\" のみ対応しています(指定: \"{}\")",
+            settings.approval
+        )));
+    }
+    Ok(Arc::new(AgentWorker::new(
+        deps,
+        settings,
+        ctx.config.context.max_tokens,
+    )))
+}
+
+pub struct AgentWorker {
+    provider: Arc<dyn Provider>,
+    tools: Vec<Arc<dyn Tool>>,
+    /// 本線とキャッシュを共有するため、順序込みで一度だけ計算して使い回す
+    specs: Vec<ToolSpec>,
+    settings: WorkerSettings,
+    max_tokens: u32,
+}
+
+impl AgentWorker {
+    pub fn new(deps: WorkerDeps, settings: WorkerSettings, max_tokens: u32) -> Self {
+        let specs = deps.tools.iter().map(|t| t.spec()).collect();
+        Self {
+            provider: deps.provider,
+            tools: deps.tools,
+            specs,
+            settings,
+            max_tokens,
+        }
+    }
+
+    async fn run_call(
+        &self,
+        call: &ToolCall,
+        tctx: &ToolContext,
+        progress: Option<&UnboundedSender<WorkerProgress>>,
+    ) -> ToolResult {
+        if let Some(tx) = progress {
+            let _ = tx.send(WorkerProgress {
+                tool: call.name.clone(),
+                summary: progress_summary(&call.name, &call.input),
+            });
+        }
+        let (output, is_error) = match self.execute(call, tctx).await {
+            Ok(o) => (o.text, o.is_error),
+            Err(reason) => (reason, true),
+        };
+        ToolResult {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            output: truncate(output, self.settings.tool_output_max_chars),
+            is_error,
+        }
+    }
+
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        tctx: &ToolContext,
+    ) -> std::result::Result<ToolOutput, String> {
+        let (tool, spec) = self
+            .tools
+            .iter()
+            .zip(&self.specs)
+            .find(|(_, s)| s.name == call.name)
+            .ok_or_else(|| format!("未知の tool です: {}", call.name))?;
+        ApprovalPolicy.check(spec, &call.input, tctx)?;
+        tool.call(call.input.clone(), tctx)
+            .await
+            .map_err(|e| format!("tool の実行に失敗しました: {e}"))
+    }
+}
+
+const SUMMARY_MAX_CHARS: usize = 80;
+const SECRET_WORDS: &[&str] = &[
+    "token", "key", "secret", "password", "passwd", "auth", "bearer", "cookie",
+];
+
+fn is_secret_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SECRET_WORDS.iter().any(|w| lower.contains(w))
+}
+
+/// 進捗は Discord に出るため、コマンドラインに混ざった秘密らしき値は伏せる
+fn mask_secrets(line: &str) -> String {
+    let mut mask_next = false;
+    line.split_whitespace()
+        .map(|word| {
+            if std::mem::take(&mut mask_next) {
+                return "***".to_string();
+            }
+            if let Some((name, _)) = word.split_once('=') {
+                if is_secret_name(name) {
+                    return format!("{name}=***");
+                }
+            } else if is_secret_name(word.trim_start_matches('-')) {
+                mask_next = true;
+            }
+            word.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ellipsize(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        None => text.to_string(),
+        Some(_) => {
+            let head: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+            format!("{head}…")
+        }
+    }
+}
+
+fn str_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
+    input.get(key).and_then(Value::as_str)
+}
+
+/// tool の出力は含めない。入力から利用者に見せてよい部分だけを短く取り出す
+fn progress_summary(tool: &str, input: &Value) -> String {
+    let summary = match tool {
+        "web_search" => str_field(input, "query")
+            .map(|q| format!("「{}」", q.trim()))
+            .unwrap_or_default(),
+        "web_fetch" => {
+            let urls = input.get("urls").and_then(Value::as_array);
+            match urls.and_then(|u| u.first()).and_then(Value::as_str) {
+                Some(first) if urls.is_some_and(|u| u.len() > 1) => {
+                    format!("{first} ほか {} 件", urls.map_or(0, |u| u.len()) - 1)
+                }
+                Some(first) => first.to_string(),
+                None => String::new(),
+            }
+        }
+        "web_agent" => {
+            let url = str_field(input, "url").unwrap_or("");
+            let goal = str_field(input, "goal").unwrap_or("");
+            format!("{url} : {}", goal.lines().next().unwrap_or(""))
+        }
+        "shell" => {
+            let line = str_field(input, "command")
+                .and_then(|c| c.lines().next())
+                .unwrap_or("");
+            format!("`{}`", mask_secrets(line))
+        }
+        _ => String::new(),
+    };
+    ellipsize(&summary, SUMMARY_MAX_CHARS)
+}
+
+fn truncate(text: String, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        None => text,
+        Some((idx, _)) => format!(
+            "{}\n[出力が長いため {max_chars} 文字で切り詰めました]",
+            &text[..idx]
+        ),
+    }
+}
+
+fn category_label(c: TaskCategory) -> &'static str {
+    match c {
+        TaskCategory::None => "none",
+        TaskCategory::WebResearch => "web_research",
+        TaskCategory::FactCheck => "fact_check",
+        TaskCategory::CodeOrTool => "code_or_tool",
+    }
+}
+
+/// 指示は Layer 4 にだけ置く。system に足すと本線とのキャッシュ共有が崩れる(caching.md §3)。
+/// effort が低いと tool を呼ばずに結論しがちなので、手順を必須として書く
+fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Turn {
+    let has = |name: &str| specs.iter().any(|s| s.name == name);
+    let names = specs
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut steps = Vec::new();
+    if specs.is_empty() {
+        steps.push(
+            "使える tool がありません。その旨を結論メモの「不確かな点」に明記してください。"
+                .to_string(),
+        );
+    } else {
+        steps.push(format!("この run で使える tool: {names}"));
+        steps
+            .push("Goal に URL や手順が書かれていれば、省略せず必ず実行してください。".to_string());
+        let search = has("web_search");
+        let fetch = has("web_fetch");
+        match (search, fetch) {
+            (true, true) => steps.push(
+                "web_search と web_fetch は無料です。呼び出し回数は気にせず、正確さと網羅性を最優先してください。"
+                    .to_string(),
+            ),
+            (true, false) => steps.push(
+                "web_search は無料です。呼び出し回数は気にせず、正確さと網羅性を最優先してください。"
+                    .to_string(),
+            ),
+            (false, true) => steps.push(
+                "web_fetch は無料です。呼び出し回数は気にせず、正確さと網羅性を最優先してください。"
+                    .to_string(),
+            ),
+            (false, false) => {}
+        }
+        if has("web_agent") {
+            steps.push(
+                "web_agent は有料です。web_search と web_fetch で足りないときだけ使ってください。"
+                    .to_string(),
+            );
+        }
+        if search {
+            steps.push(
+                "Goal に URL が書かれていても、言語(日本語・英語)や言い回し、公式名称+機能・料金・制限などを変えて 2〜4 回検索してください。"
+                    .to_string(),
+            );
+        }
+        if search && fetch {
+            steps.push("web_search のスニペットだけで結論しないでください。".to_string());
+        }
+        if fetch {
+            steps.push(
+                "公式サイト、ドキュメント、料金ページ、告知などの一次情報を中心に、3〜5 ページの本文を web_fetch で読んでください。必要なら読んだページのリンクをたどってください。"
+                    .to_string(),
+            );
+        }
+        if search && !fetch {
+            steps.push("スニペットだけに基づく点は「不確かな点」に書いてください。".to_string());
+        }
+        if search || fetch {
+            steps.push(
+                "重要な事実は複数の出典で突き合わせてください。食い違うときは両方を日付つきで記録してください。"
+                    .to_string(),
+            );
+        }
+        steps.push(
+            "1 回の応答で複数の tool を同時に呼べます。並列に呼ぶと速く終わります。".to_string(),
+        );
+        steps.push(format!(
+            "この run には往復回数の上限({max_iterations} 回)と時間制限があります。余裕を持って結論を書いてください。"
+        ));
+        steps.push(
+            "tool を 1 回も呼ばずに結論メモを書かないでください。tool が失敗した場合は、その旨を明記してください。"
+                .to_string(),
+        );
+    }
+    let steps = steps
+        .iter()
+        .map(|s| format!("- {s}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let text = format!(
+        "これはバックグラウンドの調査作業です。あなたの出力は Discord には表示されません。\n\
+         task_category: {}\n\
+         Goal: {}\n\n\
+         手順(必須):\n{steps}\n\n\
+         調査が終わったら、結論メモだけを最終回答として書いてください。このとき tool は呼ばないでください。\n\
+         結論メモは数百トークンの構造化メモで、次を含めます。\n\
+         - 分かったこと\n\
+         - 出典(URL)\n\
+         - 不確かな点(確認できなかったことは必ずここに書く)\n\
+         tool の生の出力はメモに含めないでください。",
+        category_label(task.task_category),
+        task.goal
+    );
+    Turn {
+        id: None,
+        role: Role::User,
+        kind: TurnKind::Instruction,
+        text,
+        chunk_id: None,
+    }
+}
+
+#[async_trait]
+impl Worker for AgentWorker {
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.specs.clone()
+    }
+
+    async fn run(&self, task: WorkerTask) -> WorkerOutcome {
+        let mut prompt = task.base.clone();
+        prompt.ephemeral_tail.push(instruction(
+            &task,
+            &self.specs,
+            self.settings.max_iterations,
+        ));
+        prompt.cache_to_end = true;
+        let params = CompletionParams {
+            max_tokens: self.max_tokens,
+        };
+        let tctx = ToolContext {
+            run_id: task.run_id.clone(),
+            task_category: task.task_category,
+            work_dir: task.work_dir.clone(),
+        };
+
+        for iteration in 1..=self.settings.max_iterations {
+            let completion = match self.provider.complete(&prompt, &params).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(run_id = %task.run_id, iteration, "worker: API 呼び出しに失敗: {e}");
+                    return WorkerOutcome::Failed(format!("API エラー: {e}"));
+                }
+            };
+            if completion.tool_calls.is_empty() {
+                let memo = completion.text.as_deref().unwrap_or("").trim();
+                if memo.is_empty() {
+                    return WorkerOutcome::Failed("結論メモが空でした".into());
+                }
+                tracing::info!(run_id = %task.run_id, iteration, "worker: 結論を得ました");
+                return WorkerOutcome::Concluded(memo.to_string());
+            }
+
+            let mut results = Vec::with_capacity(completion.tool_calls.len());
+            for call in &completion.tool_calls {
+                tracing::info!(run_id = %task.run_id, iteration, tool = %call.name, "worker: tool を実行");
+                results.push(self.run_call(call, &tctx, task.progress.as_ref()).await);
+            }
+            prompt.tool_exchange.push(ExchangeItem::Assistant {
+                text: completion.text,
+                calls: completion.tool_calls,
+                raw: completion.raw_assistant,
+            });
+            prompt
+                .tool_exchange
+                .push(ExchangeItem::ToolResults(results));
+        }
+        WorkerOutcome::Failed(format!(
+            "反復上限 {} 回に達しました",
+            self.settings.max_iterations
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use noth_core::traits::{Completion, LayeredPrompt};
+    use serde_json::json;
+
+    use super::*;
+
+    struct MockProvider {
+        script: Mutex<VecDeque<Result<Completion>>>,
+        prompts: Mutex<Vec<LayeredPrompt>>,
+    }
+
+    impl MockProvider {
+        fn new(script: Vec<Result<Completion>>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script.into()),
+                prompts: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        async fn complete(&self, p: &LayeredPrompt, _: &CompletionParams) -> Result<Completion> {
+            self.prompts.lock().unwrap().push(p.clone());
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(Error::Other("script 切れ".into())))
+        }
+        async fn health_check(&self) -> Result<String> {
+            Ok("ok".into())
+        }
+    }
+
+    struct MockTool {
+        name: &'static str,
+        out: Result<String>,
+        called: Mutex<u32>,
+    }
+
+    fn tool(name: &'static str, out: Result<String>) -> Arc<MockTool> {
+        Arc::new(MockTool {
+            name,
+            out,
+            called: Mutex::new(0),
+        })
+    }
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: String::new(),
+                input_schema: json!({}),
+            }
+        }
+        async fn call(&self, _: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+            *self.called.lock().unwrap() += 1;
+            match &self.out {
+                Ok(t) => Ok(ToolOutput {
+                    text: t.clone(),
+                    is_error: false,
+                }),
+                Err(e) => Err(Error::Other(e.to_string())),
+            }
+        }
+    }
+
+    fn settings(max_iterations: u32, max_chars: usize) -> WorkerSettings {
+        WorkerSettings {
+            max_concurrent: 1,
+            timeout_secs: 60,
+            max_iterations,
+            tool_output_max_chars: max_chars,
+            approval: "auto".into(),
+            show_progress: true,
+        }
+    }
+
+    fn worker(
+        provider: Arc<MockProvider>,
+        tools: Vec<Arc<MockTool>>,
+        s: WorkerSettings,
+    ) -> AgentWorker {
+        AgentWorker::new(
+            WorkerDeps {
+                provider,
+                tools: tools.into_iter().map(|t| t as Arc<dyn Tool>).collect(),
+            },
+            s,
+            1024,
+        )
+    }
+
+    fn task(category: TaskCategory) -> WorkerTask {
+        WorkerTask {
+            run_id: "run1".into(),
+            goal: "Rust の最新版を調べる".into(),
+            task_category: category,
+            base: LayeredPrompt {
+                harness_rules: "rules".into(),
+                ..Default::default()
+            },
+            work_dir: "/tmp".into(),
+            progress: None,
+        }
+    }
+
+    fn text(t: &str) -> Result<Completion> {
+        Ok(Completion {
+            text: Some(t.into()),
+            ..Default::default()
+        })
+    }
+
+    fn call(name: &str) -> Result<Completion> {
+        Ok(Completion {
+            text: Some("調べます".into()),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: name.into(),
+                input: json!({"q": "x"}),
+            }],
+            raw_assistant: Some(json!({"raw": true})),
+            ..Default::default()
+        })
+    }
+
+    fn results_of(p: &LayeredPrompt) -> &Vec<ToolResult> {
+        match p.tool_exchange.last() {
+            Some(ExchangeItem::ToolResults(r)) => r,
+            other => panic!("ToolResults ではない: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concludes_directly() {
+        let p = MockProvider::new(vec![text("  結論  ")]);
+        let w = worker(p.clone(), vec![], settings(3, 100));
+        let out = w.run(task(TaskCategory::WebResearch)).await;
+        assert_eq!(out, WorkerOutcome::Concluded("結論".into()));
+        let prompts = p.prompts.lock().unwrap();
+        let tail = &prompts[0].ephemeral_tail;
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].kind, TurnKind::Instruction);
+        assert!(tail[0].text.contains("web_research"));
+        assert!(tail[0].text.contains("Rust の最新版を調べる"));
+        assert!(prompts[0].cache_to_end);
+        assert_eq!(prompts[0].harness_rules, "rules");
+    }
+
+    async fn instruction_text(names: &[&'static str]) -> String {
+        let p = MockProvider::new(vec![text("メモ")]);
+        let tools = names.iter().map(|n| tool(n, Ok(String::new()))).collect();
+        let w = worker(p.clone(), tools, settings(3, 100));
+        w.run(task(TaskCategory::WebResearch)).await;
+        let prompts = p.prompts.lock().unwrap();
+        assert!(prompts[0].harness_rules == "rules");
+        prompts[0].ephemeral_tail[0].text.clone()
+    }
+
+    #[tokio::test]
+    async fn instruction_mentions_only_existing_tools() {
+        let both = instruction_text(&["web_search", "web_fetch"]).await;
+        assert!(both.contains("web_fetch"));
+        assert!(both.contains("無料"));
+        assert!(both.contains("スニペットだけで結論しない"));
+        assert!(both.contains("2〜4 回検索"));
+        assert!(both.contains("3〜5 ページ"));
+        assert!(both.contains("突き合わせ"));
+        assert!(both.contains("1 回も呼ばず"));
+        assert!(both.contains("上限(3 回)"));
+        assert!(!both.contains("web_agent"));
+
+        let search_only = instruction_text(&["web_search"]).await;
+        assert!(!search_only.contains("web_fetch"));
+        assert!(search_only.contains("2〜4 回検索"));
+        assert!(!search_only.contains("3〜5 ページ"));
+
+        let fetch_only = instruction_text(&["web_fetch"]).await;
+        assert!(!fetch_only.contains("web_search"));
+        assert!(fetch_only.contains("3〜5 ページ"));
+        assert!(!fetch_only.contains("2〜4 回検索"));
+
+        let with_agent = instruction_text(&["web_search", "web_fetch", "web_agent"]).await;
+        assert!(with_agent.contains("web_agent は有料"));
+
+        let none = instruction_text(&[]).await;
+        assert!(!none.contains("web_fetch"));
+        assert!(!none.contains("無料"));
+        assert!(none.contains("使える tool がありません"));
+    }
+
+    #[tokio::test]
+    async fn empty_conclusion_fails() {
+        let p = MockProvider::new(vec![text("  ")]);
+        let w = worker(p, vec![], settings(3, 100));
+        assert!(matches!(
+            w.run(task(TaskCategory::None)).await,
+            WorkerOutcome::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_round_trip() {
+        let t = tool("web_search", Ok("検索結果".into()));
+        let p = MockProvider::new(vec![call("web_search"), text("メモ")]);
+        let w = worker(p.clone(), vec![t.clone()], settings(3, 100));
+        let out = w.run(task(TaskCategory::WebResearch)).await;
+        assert_eq!(out, WorkerOutcome::Concluded("メモ".into()));
+        assert_eq!(*t.called.lock().unwrap(), 1);
+        let prompts = p.prompts.lock().unwrap();
+        assert!(prompts[0].tool_exchange.is_empty());
+        let ex = &prompts[1].tool_exchange;
+        assert_eq!(ex.len(), 2);
+        match &ex[0] {
+            ExchangeItem::Assistant { text, calls, raw } => {
+                assert_eq!(text.as_deref(), Some("調べます"));
+                assert_eq!(calls[0].name, "web_search");
+                assert_eq!(*raw, Some(json!({"raw": true})));
+            }
+            other => panic!("{other:?}"),
+        }
+        let r = results_of(&prompts[1]);
+        assert_eq!(r[0].call_id, "c1");
+        assert_eq!(r[0].name, "web_search");
+        assert_eq!(r[0].output, "検索結果");
+        assert!(!r[0].is_error);
+    }
+
+    #[tokio::test]
+    async fn shell_rejected_for_web_research() {
+        let t = tool("shell", Ok("実行された".into()));
+        let p = MockProvider::new(vec![call("shell"), text("メモ")]);
+        let w = worker(p.clone(), vec![t.clone()], settings(3, 100));
+        w.run(task(TaskCategory::WebResearch)).await;
+        assert_eq!(*t.called.lock().unwrap(), 0);
+        let prompts = p.prompts.lock().unwrap();
+        let r = results_of(&prompts[1]);
+        assert!(r[0].is_error);
+        assert!(r[0].output.contains("code_or_tool"));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_and_tool_error_become_error_results() {
+        let t = tool("web_fetch", Err(Error::Other("接続失敗".into())));
+        let p = MockProvider::new(vec![call("nothing"), call("web_fetch"), text("メモ")]);
+        let w = worker(p.clone(), vec![t], settings(5, 100));
+        w.run(task(TaskCategory::WebResearch)).await;
+        let prompts = p.prompts.lock().unwrap();
+        let r1 = results_of(&prompts[1]);
+        assert!(r1[0].is_error && r1[0].output.contains("nothing"));
+        let r2 = results_of(&prompts[2]);
+        assert!(r2[0].is_error && r2[0].output.contains("接続失敗"));
+    }
+
+    #[tokio::test]
+    async fn truncates_by_chars() {
+        let t = tool("web_fetch", Ok("あ".repeat(50)));
+        let p = MockProvider::new(vec![call("web_fetch"), text("メモ")]);
+        let w = worker(p.clone(), vec![t], settings(3, 10));
+        w.run(task(TaskCategory::WebResearch)).await;
+        let prompts = p.prompts.lock().unwrap();
+        let out = &results_of(&prompts[1])[0].output;
+        assert!(out.starts_with(&"あ".repeat(10)));
+        assert!(!out.starts_with(&"あ".repeat(11)));
+        assert!(out.contains("切り詰め"));
+    }
+
+    #[tokio::test]
+    async fn stops_at_iteration_limit() {
+        let t = tool("web_search", Ok("x".into()));
+        let p = MockProvider::new(vec![
+            call("web_search"),
+            call("web_search"),
+            call("web_search"),
+        ]);
+        let w = worker(p, vec![t], settings(2, 100));
+        assert_eq!(
+            w.run(task(TaskCategory::WebResearch)).await,
+            WorkerOutcome::Failed("反復上限 2 回に達しました".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_error_fails() {
+        let p = MockProvider::new(vec![Err(Error::Transport("切断".into()))]);
+        let w = worker(p, vec![], settings(3, 100));
+        match w.run(task(TaskCategory::None)).await {
+            WorkerOutcome::Failed(r) => assert!(r.contains("切断")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_specs_order_is_stable() {
+        let p = MockProvider::new(vec![]);
+        let w = worker(
+            p,
+            vec![tool("b", Ok(String::new())), tool("a", Ok(String::new()))],
+            settings(1, 1),
+        );
+        let names = |w: &AgentWorker| {
+            w.tool_specs()
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&w), ["b", "a"]);
+        assert_eq!(names(&w), names(&w));
+    }
+
+    #[test]
+    fn summaries_per_tool() {
+        assert_eq!(
+            progress_summary("web_search", &json!({"query": "Rust 1.90"})),
+            "「Rust 1.90」"
+        );
+        assert_eq!(
+            progress_summary("web_fetch", &json!({"urls": ["https://a.example"]})),
+            "https://a.example"
+        );
+        assert_eq!(
+            progress_summary(
+                "web_fetch",
+                &json!({"urls": ["https://a", "https://b", "https://c"]})
+            ),
+            "https://a ほか 2 件"
+        );
+        assert_eq!(
+            progress_summary(
+                "web_agent",
+                &json!({"url": "https://a", "goal": "ログインする\n次"})
+            ),
+            "https://a : ログインする"
+        );
+        assert_eq!(
+            progress_summary("shell", &json!({"command": "ls -la\nrm x"})),
+            "`ls -la`"
+        );
+        assert_eq!(progress_summary("mystery", &json!({"query": "x"})), "");
+    }
+
+    #[test]
+    fn summary_is_truncated_by_chars() {
+        let s = progress_summary("web_search", &json!({"query": "あ".repeat(200)}));
+        assert_eq!(s.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn shell_secrets_are_masked() {
+        let s = progress_summary(
+            "shell",
+            &json!({"command": "API_KEY=abc123 curl --token s3cret -H x --password=pw https://h"}),
+        );
+        assert_eq!(
+            s,
+            "`API_KEY=*** curl --token *** -H x --password=*** https://h`"
+        );
+        assert!(!s.contains("abc123") && !s.contains("s3cret") && !s.contains("pw "));
+    }
+
+    #[tokio::test]
+    async fn progress_sent_in_order_including_rejected() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let search = tool("web_search", Ok("r".into()));
+        let shell = tool("shell", Ok("r".into()));
+        let two = Ok(Completion {
+            tool_calls: vec![
+                ToolCall {
+                    id: "1".into(),
+                    name: "web_search".into(),
+                    input: json!({"query": "q"}),
+                },
+                ToolCall {
+                    id: "2".into(),
+                    name: "shell".into(),
+                    input: json!({"command": "ls"}),
+                },
+            ],
+            ..Default::default()
+        });
+        let p = MockProvider::new(vec![two, text("メモ")]);
+        let w = worker(p, vec![search, shell], settings(3, 100));
+        let mut t = task(TaskCategory::WebResearch);
+        t.progress = Some(tx);
+        w.run(t).await;
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!(
+            (first.tool.as_str(), first.summary.as_str()),
+            ("web_search", "「q」")
+        );
+        assert_eq!(
+            (second.tool.as_str(), second.summary.as_str()),
+            ("shell", "`ls`")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_progress_channel_is_ignored() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let p = MockProvider::new(vec![call("web_search"), text("メモ")]);
+        let w = worker(
+            p,
+            vec![tool("web_search", Ok("r".into()))],
+            settings(3, 100),
+        );
+        let mut t = task(TaskCategory::WebResearch);
+        t.progress = Some(tx);
+        assert_eq!(w.run(t).await, WorkerOutcome::Concluded("メモ".into()));
+    }
+}
