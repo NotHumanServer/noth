@@ -1,0 +1,17 @@
+[package]
+name = "noth-tool-web-search"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+noth-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+noth-backend-tinyfish.workspace = true
+
+[dev-dependencies]
+noth-backend-tinyfish = { workspace = true, features = ["testing"] }
