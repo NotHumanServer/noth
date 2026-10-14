@@ -1,6 +1,6 @@
 # Noth CLI と設定ファイル仕様
 
-Noth の CLI は設定・セットアップ・常駐プロセスの管理だけを担います。対話チャットや TUI は持ちません。コマンドの形式は [hermes-agent](https://github.com/nousresearch/hermes-agent) の CLI(`website/docs/reference/cli-commands.md`、`user-guide/configuration.md`)を参考にし、Noth に必要な範囲へ絞っています。
+Noth の CLI は設定・セットアップ・常駐プロセスの管理だけを担います。対話チャットや TUI は持ちません。コマンドの形式は [hermes-agent](https://github.com/nousresearch/hermes-agent) の CLI(`website/docs/reference/cli-commands.md`、`user-guide/configuration.md`)を参考にし、Noth に必要な範囲に絞っています。
 
 ## 1. 呼び出し構造
 
@@ -27,14 +27,14 @@ noth [global-options] <command> [subcommand] [args] [--flags]
 noth init [--non-interactive]
 ```
 
-対話モードの流れ:
+対話モードでは次の順に進みます。
 
 1. Discord Bot トークンを入力。`.env` に `DISCORD_BOT_TOKEN` として保存する。`MESSAGE_CONTENT` 特権インテントを Developer Portal で有効にするよう案内する(メンバー一覧の取得に `GUILD_MEMBERS` 特権インテントも必要になる可能性があり、実装時に確認する)
-2. トークンで接続し、Bot が参加している guild を一覧して1つ選ぶ。メンバー一覧を取得して `allowed_users` に入れるメンバーを選ぶ。一覧が取れない場合はユーザー ID の手入力も受け付ける
+2. トークンで接続し、Bot が参加している guild の一覧から1つ選ぶ。メンバー一覧を取得して `allowed_users` に入れるメンバーを選ぶ。一覧を取得できない場合はユーザー ID の手入力も受け付ける
 3. router を選ぶ(`router-systemone` の preset `jev` / `clef`、または `router-mention`)。必要なキー(`TYPESAFE_API_KEY`、または `CF_API_TOKEN` と `CF_ACCOUNT_ID`)を `.env` に保存する
-4. provider を選び(ビルドに含まれる module から)、preset・モデル名・API キーを設定する
+4. ビルドに含まれる module から provider を選び、preset・モデル名・API キーを設定する
 5. ビルドに `tool-web-*` が含まれていれば `TINYFISH_API_KEY` を入力する
-6. `profiles/default.md` の雛形を置き、`[profile] name = "default"` を書く
+6. `profiles/default.md` の雛形を作成し、`[profile] name = "default"` を設定する
 7. `config.toml` を生成し、`noth doctor` を1回実行して結果を表示する
 
 `--non-interactive` では雛形だけを生成し、値はすべてプレースホルダにします。
@@ -63,7 +63,7 @@ noth module disable <name> [--restart]
 ```
 
 - `<name>` は module のフル名(`channel-discord`、`provider-anthropic` など)
-- `built-in` はビルド時に feature で組み込まれているか。組み込まれていない module は `enable` できず、必要な feature を案内する
+- `built-in` は、ビルド時に feature で組み込まれているかどうかを示す。組み込まれていない module は `enable` できず、必要な feature を案内する
 - `enable` / `disable` は `config.toml` の `[modules] enabled` を書き換えるだけ。router / provider を2つ以上有効にした状態は `noth config check` と起動時に拒否する
 - 常駐中なら「再起動が必要」と表示し、`--restart` で `noth service restart` まで行う
 
@@ -77,7 +77,7 @@ noth run
 
 ### `noth service`
 
-OS のサービスとして登録・操作します。macOS は launchd(user agent)、Linux は systemd(user unit)。
+OS のサービスとして登録・操作します。macOS では launchd(user agent)、Linux では systemd(user unit)を使います。
 
 ```text
 noth service install
@@ -97,7 +97,7 @@ noth service status
 
 ### `noth status`
 
-常駐プロセスの状態を表示します。SQLite の `heartbeat` テーブルと各テーブルから読むので、プロセスへの IPC は不要です。表示するのは最終 heartbeat 時刻と接続状態、接続中の guild、有効な module、直近の router 判定、進行中の Worker、直近ターンのプロンプト全体トークン数(`usage.input_tokens`)。heartbeat が一定時間更新されていなければ「停止中」と判断します。
+常駐プロセスの状態を表示します。SQLite の `heartbeat` テーブルと各テーブルを参照するので、プロセスへの IPC は不要です。表示するのは最終 heartbeat 時刻と接続状態、接続中の guild、有効な module、直近の router 判定、進行中の Worker、直近ターンのプロンプト全体のトークン数(`usage.input_tokens`)です。heartbeat が一定時間更新されていなければ「停止中」と判断します。
 
 ### `noth doctor`
 
@@ -119,7 +119,7 @@ noth logs [-f] [-n <lines>]
 
 ## 3. ディレクトリ構成
 
-既定は `~/.noth/`。環境変数 `NOTH_HOME` で変更できます。これはプロセス環境変数から読む唯一の値です。
+既定は `~/.noth/` で、環境変数 `NOTH_HOME` で変更できます。`NOTH_HOME` はプロセス環境変数から読む唯一の値です。
 
 ```text
 $NOTH_HOME/
@@ -138,11 +138,11 @@ $NOTH_HOME/
 
 ### 4.1 シークレットの扱い
 
-- シークレットは **`$NOTH_HOME/.env` にだけ**置きます。プロセス環境変数は `NOTH_HOME` 以外読みません。参照先を1か所にして「どこから読まれているか分からない」状態を避けるためです
-- `config.toml` には平文のキーを書かず、`${VAR}` で `.env` の変数を参照します
-- `${VAR}` の解決は **参照されるセクションだけ**に対して行い、`.env` に無ければ起動時にエラーで止めます。無効な module のセクションは参照されないので、下の例のように全 provider の設定を書いたままにしておけます
+- シークレットは **`$NOTH_HOME/.env` にだけ**置く。プロセス環境変数は `NOTH_HOME` 以外読まない。参照先を1か所にして「どこから読まれているか分からない」状態を避けるため
+- `config.toml` には平文のキーを書かず、`${VAR}` で `.env` の変数を参照する
+- `${VAR}` の解決は **参照されるセクションだけ**に対して行い、`.env` に無ければ起動時にエラーで止める。無効な module のセクションは参照されないので、下の例のように全 provider の設定を書いたままにしておける
 
-どのセクションが参照されるかの規則:
+セクションが参照される条件は次のとおりです。
 
 | セクション | 参照条件 |
 |---|---|
@@ -194,7 +194,7 @@ min_confidence   = 0.4
 
 [router.systemone]
 preset     = "clef"              # jev | clef | custom
-model      = "clef-flash"        # body の model。clef preset では URL の末尾もここから決める
+model      = "clef-flash"        # body の model。clef preset では URL の末尾もこの値で決まる
 api_key    = "${CF_API_TOKEN}"
 account_id = "${CF_ACCOUNT_ID}"  # clef のとき必須
 # endpoint = "..."               # custom のとき必須
@@ -215,7 +215,7 @@ cache_ttl = "5m"                 # 5m | 1h
 api_key  = "${OPENAI_API_KEY}"
 model    = "..."
 format   = "chat"                # chat | responses
-# base_url = "..."               # 互換サーバ
+# base_url = "..."               # 互換サーバー
 # preset   = "opencode-go"       # このとき api_key は ${OPENCODE_GO_API_KEY}
 
 [provider.google]
@@ -230,13 +230,13 @@ model   = "..."
 max_concurrent        = 2
 timeout_secs          = 600      # 待ち時間を含む
 max_iterations        = 25       # tool 呼び出しの反復上限
-tool_output_max_chars = 20000    # 各 tool 出力の切り詰め
+tool_output_max_chars = 20000    # 各 tool の出力の文字数上限。超えた分は切り詰める
 approval              = "auto"   # MVP では auto のみ。tool-shell は code_or_tool の run に限る
 
 [compactor]
 idle_minutes      = 10           # 人間の最終発言からの経過。Noth 自身の投稿では解除しない
 keep_recent_turns = 6
-digest_max_chars  = 12000        # Layer 2 の上限。超えたら古いエピソードから落とす
+digest_max_chars  = 12000        # Layer 2 の上限。超えたら古いエピソードから削除する
 
 [tool.web-search]
 backend = "tinyfish"
@@ -271,14 +271,14 @@ TINYFISH_API_KEY=
 
 ### 4.4 profile ファイル
 
-`profiles/<name>.md` は Markdown の自由記述で、そのまま Layer 1 の先頭に入ります。Core はこの後ろに guild のメンバー情報を機械的に付け足します。Harness Rules(Layer 0)はこのファイルより前に置かれるため、profile で Layer 0 の規約を上書きすることはできません。
+`profiles/<name>.md` は Markdown の自由記述で、そのまま Layer 1 の先頭に入ります。Core はその後ろに guild のメンバー情報を自動で追加します。Harness Rules(Layer 0)はこのファイルより前に置かれるため、profile で Layer 0 の規約を上書きすることはできません。
 
 ## 5. hermes-agent との対応
 
 | hermes | Noth | 備考 |
 |---|---|---|
 | `setup` | `init` | |
-| `auth add/list/remove` | `config set <UPPER_KEY>` | hermes の `auth` は同一プロバイダの複数キーを回すプールと OAuth を扱い `auth.json` に保存する。Noth は `.env` の単一キーのみで、プールと OAuth は対象外 |
+| `auth add/list/remove` | `config set <UPPER_KEY>` | hermes の `auth` は同一プロバイダの複数キーを切り替えて使うプールと OAuth を扱い `auth.json` に保存する。Noth は `.env` の単一キーのみで、プールと OAuth は対象外 |
 | `config show/get/set/unset/path/check` | 同名 | |
 | `mcp` / `plugins` | `module` | 静的リンクのため install / search は無い |
 | `gateway run/start/stop/status/install` | `run` / `service` | |

@@ -9,8 +9,8 @@ module の一覧とクレート構成は [modules.md](modules.md)、Core が公�
 1. **Core は小さく、機能は module に置く。** Core は「イベントを流す」「文脈を組み立てる」「状態を永続化する」「module を束ねる」だけを担う。Discord・LLM・System One・ツールはすべて module。
 2. **必要な module だけを静的リンクする。** module の有効化は Cargo feature で行い、1バイナリに必要な分だけ含める。実行時プラグインロードや外部プロセス接続は MVP では持たない。
 3. **module は Core の公開 trait にだけ依存する。** module 同士は直接参照しない。module 間のやり取りは Core のイベントバスと trait 経由に限る。
-4. **module を外したときの退化動作を定義する。** 任意 module が無い構成でも Core は起動し、仕様で決めた縮退動作に落ちる。
-5. **各サービスは公式の標準 API を直接使う。** LLM・System One・TinyFish はいずれも `reqwest` で公式 HTTP API を叩く。SDK やラッパーは挟まない。
+4. **module を無効にしたときの動作を定義する。** 任意 module が無効な構成でも Core は起動し、各 module の有無に応じて仕様で決めた動作を取る。
+5. **各サービスは公式の標準 API を直接使う。** LLM・System One・TinyFish はいずれも `reqwest` で公式 HTTP API を呼び出す。SDK やラッパーは使わない。
 
 ## 2. 全体像
 
@@ -51,7 +51,7 @@ Core は必須で、feature 化しません。
 | Config Loader | `config.toml` と `.env` の読み込み、`${VAR}` の解決、検証。解決するのは有効な module のセクションだけ |
 | CLI | `noth` コマンド群。[cli.md](../cli.md) 参照 |
 | Event Bus | module 間のイベント配送。`MessageReceived`、`WorkerFinished`、`IdleDetected` |
-| Context Layer Manager | 本線 actor。Layer 0〜4 の構築と Append-only 保証、Fork/Join、未昇格バッファの管理、閾値による判定の二値化、Compactor の置換。本線状態の唯一の writer |
+| Context Layer Manager | 本線 actor。Layer 0〜4 の構築と Append-only 保証、Fork/Join、未昇格バッファの管理、閾値による判定の二値化、Compactor による要約への置換。本線状態の唯一の writer |
 | SQLite Store | 生ログ、TopicChunk、エピソード要約、Worker 結論メモ、heartbeat の永続化。`guild_id` でキー付け |
 | Module Registry | feature で組み込まれた module の初期化順序と依存解決、設定で有効化された module のみ起動 |
 
@@ -74,7 +74,7 @@ Core は必須で、feature 化しません。
 |---|---|
 | 外部プロセス module(MCP / JSON-RPC over stdio、Python 等) | 静的リンクだけで MVP の機能は揃う。必要になったら `Tool` / `Router` の実装として追加する |
 | 動的プラグインロード(dylib / WASM) | ABI とサンドボックスの設計コストが見合わない |
-| キャッシュの keep-alive(`keep_alive()` の呼び出し) | 5分 TTL の期限切れ直前に `max_tokens: 0` のダミーを投げて延命する最適化。沈黙が多い少人数サーバーでは効くが、効果の検証を MVP 後に回す([caching.md §5](caching.md#5-keep-alivemvp-外)) |
-| tool のサンドボックス、対話的な承認 | 差し込み点のみ用意([security.md §3](security.md#3-web-側の対策と承認ポリシー)) |
-| 設定のホットリロード | 一律再起動 |
+| キャッシュの keep-alive(`keep_alive()` の呼び出し) | キャッシュを延命する最適化。効果の検証を MVP 後に回す([caching.md §5](caching.md#5-keep-alivemvp-外)) |
+| tool のサンドボックス、対話的な承認 | 将来追加できるよう、インターフェースだけ用意([security.md §3](security.md#3-web-側の対策と承認ポリシー)) |
+| 設定のホットリロード | 変更は一律に再起動で反映する |
 | TUI、対話チャット CLI | Noth は Discord 常駐専用 |
