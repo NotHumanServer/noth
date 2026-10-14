@@ -8,3 +8,11 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# Rust
+target/
+
+# Claude Code (devenv generated / personal)
+.mcp.json
+.claude/settings.json
+.claude/settings.local.json
