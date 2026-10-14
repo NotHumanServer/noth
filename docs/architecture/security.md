@@ -24,7 +24,7 @@ Worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolC
 
 - `tool-shell` は `task_category == code_or_tool` の run でだけ許可する。`web_research` / `fact_check` の run は Web から取得した文字列を読むので、そこに書かれた指示でシェルを実行させない(間接プロンプトインジェクション → RCE の経路を断つ)。tool 定義自体は全 run で同一のまま([caching.md §2](caching.md#2-本線と-worker-のキャッシュ共有))なので、拒否は `tool_result` のエラーとして Worker に返る
 
-tool の出力は Worker のコンテキストにだけ入り、本線には届きません。将来 Discord のボタン承認などを追加できるよう、拡張点は Core に置きます。tool のサンドボックスと対話的な承認は MVP に含めません([overview.md §5](overview.md#5-mvp-に含めないもの))。
+tool の出力は Worker のコンテキストにだけ入り、本線には届きません。将来 Discord のボタン承認などを追加できるよう、承認を差し込むインターフェースは Core に置きます。tool のサンドボックスと対話的な承認は MVP に含めません([overview.md §5](overview.md#5-mvp-に含めないもの))。
 
 ## 4. tool-shell の運用
 

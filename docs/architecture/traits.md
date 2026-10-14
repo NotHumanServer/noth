@@ -1,6 +1,6 @@
 # Noth アーキテクチャ: Core の公開 trait
 
-本書は、module が実装する拡張点として `noth-core` が公開する trait(`Channel` / `Router` / `Provider` / `Tool` / `Compactor`)を定義します。シグネチャは意図を示すための骨子で、実装時にエラー型の詳細を詰めます。どの module がどの trait を実装するかは [modules.md](modules.md)、Provider のキャッシュ戦略は [caching.md](caching.md)、Tool の承認ポリシーは [security.md](security.md) を参照してください。
+本書は、module が実装する trait として `noth-core` が公開するもの(`Channel` / `Router` / `Provider` / `Tool` / `Compactor`)を定義します。シグネチャは意図を示すための骨子で、実装時にエラー型の詳細を詰めます。どの module がどの trait を実装するかは [modules.md](modules.md)、Provider のキャッシュ戦略は [caching.md](caching.md)、Tool の承認ポリシーは [security.md](security.md) を参照してください。
 
 trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`async-trait` を使わずに `async fn` を定義した trait は trait オブジェクト(`dyn Trait`)として扱えず、返される Future の `Send` も保証されないため、非同期メソッドは `async-trait` クレートで定義します。
 

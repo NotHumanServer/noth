@@ -49,7 +49,7 @@ Noth は少人数の Discord サーバーに常駐する AI エージェント�
 | 本線にも Worker と同じ tool 定義を渡し、本線の `tool_calls` は `spawn_task` 扱い | Anthropic は `tools → system → messages` の前方一致なので、tool 定義が違うと Fork でキャッシュを引き継げない | Worker だけが tool を持つ | Worker を起動するたびにキャッシュ書き込みが発生する | [caching §2](architecture/caching.md#2-本線と-worker-のキャッシュ共有) |
 | Worker 固有の指示は最初の user メッセージに置く | `system` が1文字でも違えば Layer 3 のキャッシュが全部外れる | `system` に追記 | | [caching §3](architecture/caching.md#3-worker-固有の指示の置き場) |
 | Anthropic はブレークポイント3つ、OpenAI / Google は自動キャッシュに任せる | Layer 2 更新時に Layer 0〜1 を保ち、バッファ一括追記の lookback 超過に備える | Gemini の explicit caching | Gemini 4 Argon 以降で非対応 | [caching §1](architecture/caching.md#1-provider-ごとの-layer-の載せ方) |
-| キャッシュの keep-alive は MVP 外 | 効果の検証を MVP 後に回す。拡張点(`keep_alive()`)だけ用意 | 常時 keep-alive | | [caching §5](architecture/caching.md#5-keep-alivemvp-外) |
+| キャッシュの keep-alive は MVP 外 | 効果の検証を MVP 後に回す。trait メソッド(`keep_alive()`)だけ用意 | 常時 keep-alive | | [caching §5](architecture/caching.md#5-keep-alivemvp-外) |
 | Discord は `allowed_users` の発言だけ通し、リストに含まれないユーザーと他 Bot の発言は保存もしない。読むのは `content` だけ | 信頼境界の外の文字列をプロセスに入れない | 全部保存して router で捨てる | SQLite と router の入力に未信頼の文字列が残る | [security §2](architecture/security.md#2-discord-側の対策) |
 | `tool-shell` はサンドボックスなし。`code_or_tool` の run でだけ許可 | Web 由来の文字列を読む run からシェルを動かさない(間接プロンプトインジェクション → RCE の遮断) | run ごとに tool 定義を変える | キャッシュ共有が崩れる | [security §3, §4](architecture/security.md#3-web-側の対策と承認ポリシー) |
 | Compactor は人間の最終発言から 10 分で通常圧縮、ハード上限超過で TopicChunk 単位の緊急退避 | 会話中に Layer 3 を書き換えず、Append-only を保つ | ターンごとの圧縮 | | [context-layers §5 パターン D](context-layers.md#パターン-d-アイドル時コンパクション) |

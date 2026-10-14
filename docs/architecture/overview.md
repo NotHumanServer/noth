@@ -75,6 +75,6 @@ Core は必須で、feature 化しません。
 | 外部プロセス module(MCP / JSON-RPC over stdio、Python 等) | 静的リンクだけで MVP の機能は揃う。必要になったら `Tool` / `Router` の実装として追加する |
 | 動的プラグインロード(dylib / WASM) | ABI とサンドボックスの設計コストが見合わない |
 | キャッシュの keep-alive(`keep_alive()` の呼び出し) | キャッシュを延命する最適化。効果の検証を MVP 後に回す([caching.md §5](caching.md#5-keep-alivemvp-外)) |
-| tool のサンドボックス、対話的な承認 | 拡張点のみ用意([security.md §3](security.md#3-web-側の対策と承認ポリシー)) |
+| tool のサンドボックス、対話的な承認 | 将来追加できるよう、インターフェースだけ用意([security.md §3](security.md#3-web-側の対策と承認ポリシー)) |
 | 設定のホットリロード | 変更は一律に再起動で反映する |
 | TUI、対話チャット CLI | Noth は Discord 常駐専用 |
