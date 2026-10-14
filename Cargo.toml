@@ -3,4 +3,57 @@ name = "noth"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+noth-core = { path = "crates/noth-core" }
+noth-channel-discord = { path = "crates/noth-channel-discord" }
+noth-router-mention = { path = "crates/noth-router-mention" }
+noth-router-systemone = { path = "crates/noth-router-systemone" }
+noth-provider-anthropic = { path = "crates/noth-provider-anthropic" }
+tokio = { version = "1.53", features = ["full"] }
+serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "http", "cache", "rustls_backend"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+clap = { version = "4.6", features = ["derive"] }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "migrate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "2.0"
+anyhow = "1.0"
+async-trait = "0.1"
+jiff = { version = "0.2", features = ["serde"] }
+
+[features]
+default = ["channel-discord", "router-systemone", "router-mention", "provider-anthropic"]
+channel-discord = ["dep:noth-channel-discord"]
+router-systemone = ["dep:noth-router-systemone"]
+router-mention = ["dep:noth-router-mention"]
+provider-anthropic = ["dep:noth-provider-anthropic"]
+
 [dependencies]
+noth-core.workspace = true
+noth-channel-discord = { workspace = true, optional = true }
+noth-router-mention = { workspace = true, optional = true }
+noth-router-systemone = { workspace = true, optional = true }
+noth-provider-anthropic = { workspace = true, optional = true }
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+jiff.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
