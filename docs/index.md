@@ -14,6 +14,7 @@ Noth は少人数の Discord サーバーに常駐する AI エージェント�
 | [architecture/dependencies.md](architecture/dependencies.md) | 採用クレートと版、出典 | 依存を更新する |
 | [context-layers.md](context-layers.md) | Layer 0〜4 の層構造、System One 判定スキーマ、ライフサイクル(静観 / 介入 / 自律タスク / 圧縮)、SQLite のデータと再起動復元 | 本線の挙動を変える |
 | [cli.md](cli.md) | `noth` コマンド群、ディレクトリ構成、`config.toml` と `.env`、profile ファイル | セットアップする、設定項目を足す |
+| [discord-setup.md](discord-setup.md) | Discord Bot の作成、特権インテント、招待 URL と権限、ID の取得、`noth init` から `noth run` まで | Bot を用意する、Discord に接続できない |
 
 ## 用語
 

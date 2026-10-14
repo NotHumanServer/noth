@@ -9,10 +9,10 @@ trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`as
 | 型 | 内容 |
 |---|---|
 | `Member` | `user_id`、表示名、ロール名の一覧 |
-| `IncomingMessage` | `channel_id`、`message_id`、`user_id`、本文(`content` のみ)、時刻、`is_self` |
+| `IncomingMessage` | `guild_id`、`channel_id`、チャンネル名、`message_id`、`user_id`、投稿者の表示名、本文(`content` のみ)、時刻、`is_self`、Noth 宛てのメンションか、Noth の発言へのリプライか。チャンネル名と表示名は router の state に入れるため、メンション・リプライの有無は `router-mention` が使うため |
 | `Turn` | Layer 3 / 4 の1ブロック。`role`(user / assistant)、本文、種別(バッファ / トリガー / 応答 / 結論メモ / 関連チャンク)、`chunk_id` |
 | `RouterState` | [context-layers.md §4.1](../context-layers.md#41-state-の組み立て) の JSON |
-| `CompletionParams` | `max_tokens`、effort などモデル依存の生成パラメータ |
+| `CompletionParams` | `max_tokens`。effort のようにモデルに依存する生成パラメータは provider の設定(例: `[provider.anthropic] effort`)に置き、Core は関与しない |
 | `ToolContext` | `run_id`、`task_category`、作業ディレクトリ、承認ポリシーへの参照 |
 
 ## 2. `Channel`
@@ -20,6 +20,8 @@ trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`as
 ```rust
 #[async_trait]
 pub trait Channel: Send + Sync {
+    /// 担当する guild。Core はこれで SQLite の行を分ける
+    fn guild_id(&self) -> GuildId;
     /// 接続し、受信した発言を Event Bus に流す。allowed_users 以外と Bot の発言はここで捨てる
     async fn run(&self, bus: BusHandle) -> Result<()>;
     /// 発言を投稿する。2,000 文字を超えれば分割し、最後の MessageId を返す。
@@ -29,6 +31,10 @@ pub trait Channel: Send + Sync {
     async fn typing(&self, channel_id: ChannelId) -> Result<()>;
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
+    /// `noth doctor` の疎通確認。成功時は表示用の短い説明を返す
+    async fn health_check(&self) -> Result<String>;
+    /// 現在の接続状態(Connecting / Connected / Disconnected)。heartbeat が周期ごとに読んで保存する。既定は Connected
+    fn connection_state(&self) -> ConnectionState { ConnectionState::Connected }
 }
 ```
 
@@ -64,6 +70,9 @@ pub trait Router: Send + Sync {
     async fn decide(&self, state: &RouterState, questions: &[(String, Question)]) -> Result<Decision>;
     /// 1リクエストに載せられる質問数。候補チャンクの数を決めるのに使う(Clef は 64)
     fn max_questions(&self) -> usize;
+    /// `decisions.model` に記録する識別子(例: `jev/jev-latest`)。モデルごとの判定傾向を比べるため
+    fn model_label(&self) -> String;
+    async fn health_check(&self) -> Result<String>;
 }
 ```
 
@@ -96,6 +105,7 @@ pub trait Provider: Send + Sync {
     async fn complete(&self, prompt: &LayeredPrompt, params: &CompletionParams) -> Result<Completion>;
     /// Layer 0〜3 のキャッシュ期限を延ばす keep-alive。既定は何もしない。MVP では呼び出し処理も無効
     async fn keep_alive(&self, _prefix: &LayeredPrompt) -> Result<()> { Ok(()) }
+    async fn health_check(&self) -> Result<String>;
 }
 ```
 
@@ -104,7 +114,7 @@ provider のエラー(429 / 5xx)は `retry_max` 回まで指数バックオフ�
 ## 5. `Tool`
 
 ```rust
-pub struct ToolSpec { pub name: String, pub description: String, pub input_schema: schemars::Schema }
+pub struct ToolSpec { pub name: String, pub description: String, pub input_schema: serde_json::Value }
 
 #[async_trait]
 pub trait Tool: Send + Sync {

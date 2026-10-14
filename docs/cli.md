@@ -31,7 +31,7 @@ noth init [--non-interactive]
 
 1. Discord Bot トークンを入力。`.env` に `DISCORD_BOT_TOKEN` として保存する。`MESSAGE_CONTENT` 特権インテントを Developer Portal で有効にするよう案内する(メンバー一覧の取得に `GUILD_MEMBERS` 特権インテントも必要になる可能性があり、実装時に確認する)
 2. トークンで接続し、Bot が参加している guild の一覧から1つ選ぶ。メンバー一覧を取得して `allowed_users` に入れるメンバーを選ぶ。一覧を取得できない場合はユーザー ID の手入力も受け付ける
-3. router を選ぶ(`router-systemone` の preset `jev` / `clef`、または `router-mention`)。必要なキー(`TYPESAFE_API_KEY`、または `CF_API_TOKEN` と `CF_ACCOUNT_ID`)を `.env` に保存する
+3. router を選ぶ(`router-systemone` の preset `jev`(既定)/ `clef`、または `router-mention`)。必要なキー(`TYPESAFE_API_KEY`、または `CF_API_TOKEN` と `CF_ACCOUNT_ID`)を `.env` に保存する
 4. ビルドに含まれる module から provider を選び、preset・モデル名・API キーを設定する
 5. ビルドに `tool-web-*` が含まれていれば `TINYFISH_API_KEY` を入力する
 6. `profiles/default.md` の雛形を作成し、`[profile] name = "default"` を設定する
@@ -185,18 +185,21 @@ debounce_secs = 2.0
 recent_messages  = 30            # state.recent に入れる直近発言数
 state_max_chars  = 24000         # state 全体の文字数上限。Clef-flash(24,576 tokens)では保守的に
 candidate_chunks = 32            # 関連判定にかける候補 TopicChunk の数(上限は max_questions - 4)
+call_names       = ["noth", "ノス", "のす"]  # 本文でこう呼ばれたら min_confidence を無視して router の判定に従う
+conversation_window_secs = 120  # Noth が応答してからこの秒数は、話していた相手の発言を呼び名と同じ扱いにする
 
 [router.thresholds]              # noul の二値化閾値と choice の最低 confidence
-is_noise_or_meme = 0.7
+is_noise_or_meme = 0.5
 is_topic_shift   = 0.6
 relevant_chunk   = 0.5
-min_confidence   = 0.4
+min_confidence   = 0.15
+name_call_reply  = 0.25  # 呼び名で呼ばれたとき、reply_only と spawn_task の確率の合計がこれ以上なら応答する
 
 [router.systemone]
-preset     = "clef"              # jev | clef | custom
-model      = "clef-flash"        # body の model。clef preset では URL の末尾もこの値で決まる
-api_key    = "${CF_API_TOKEN}"
-account_id = "${CF_ACCOUNT_ID}"  # clef のとき必須
+preset     = "jev"               # jev | clef | custom。省略時も jev
+api_key    = "${TYPESAFE_API_KEY}"
+# model    = "jev-latest"        # body の model。clef preset では URL の末尾もこの値で決まる(例: "clef-flash")
+# account_id = "${CF_ACCOUNT_ID}"  # clef のとき必須(api_key は "${CF_API_TOKEN}")
 # endpoint = "..."               # custom のとき必須
 
 [router.mention]
@@ -207,6 +210,7 @@ topic_gap_mins  = 30             # これ以上空いたら is_topic_shift = tru
 api_key   = "${ANTHROPIC_API_KEY}"
 model     = "claude-opus-5-5"
 cache_ttl = "5m"                 # 5m | 1h
+effort    = "low"                # low | medium | high | xhigh | max。雑談は low で速く返す。変えると直後の1回はキャッシュが効かない
 # OpenCode Go の Messages 形式モデルを使うときは preset を指定し、api_key にそのキーを書く
 # preset  = "opencode-go"
 # api_key = "${OPENCODE_GO_API_KEY}"

@@ -21,7 +21,7 @@ Noth はサーバーの全チャンネルを常時観測し、「同じ空間に
 | ④ | Ephemeral Task Worker(作業用 LLM) | `worker` + `tool-*` | 本線から Fork した使い捨てのワーカー。tool を使って調査・作業し、完了後に結論メモだけを本線に返して終了する |
 | ⑤ | Idle Compactor | `compactor` | サーバー全体がアイドルになったとき Layer 3 を三人称のエピソード記憶に圧縮して Layer 2 へ統合する |
 
-デバウンスでは、チャンネルの最終発言から既定で 2.0 秒待ち、短文の連投は1つに結合します。Noth 自身の投稿も `is_self` 付きで SQLite に保存します。router が「直前に自分が答えた」ことを判断できるようにするためです。
+デバウンスでは、チャンネルの最終発言から既定で 2.0 秒待ち、短文の連投は1つに結合します。間を空けずに発言が続いても、最初の発言から 10 秒経てばその時点で判定に回します。活発な雑談の最中に届いた Noth 宛ての発言を、いつまでも判定しないままにしないためです。Noth 自身の投稿も `is_self` 付きで SQLite に保存します。router が「直前に自分が答えた」ことを判断できるようにするためです。
 
 ### 2.1 本線 actor と処理単位
 
@@ -82,7 +82,7 @@ provider ごとのブレークポイントの置き方と TTL、本線と Worker
 
 Core は以下の質問セットを定義し、router module に渡します。質問型は System One API と同じ `noul`(yes/no の確率)/ `choice`(単一選択、各選択肢の確率と confidence)/ `score`(段階別の評価基準)の3種類だけです。`router-systemone` はこれをそのまま API の `questions` に変換し、`router-mention` はルールで同じ形の回答(確率は 0.0 / 1.0、confidence は 1.0)を返します。
 
-二値化は Core が行います。`noul` は `[router.thresholds]` の閾値以上なら true、`choice` は最大確率の選択肢を採り、`confidence` が `min_confidence` 未満なら安全側の値を採ります(介入判定なら `silent`、合流判定なら `abort`)。確率そのものも SQLite に保存し、閾値の調整や後の分析に使えるようにします。
+二値化は Core が行います。`noul` は `[router.thresholds]` の閾値以上なら true、`choice` は最大確率の選択肢を採り、`confidence` が `min_confidence` 未満なら安全側の値を採ります(介入判定なら `silent`、合流判定なら `abort`)。Clef の choice の confidence は最大確率が 0.6 程度でも 0.15〜0.25 に収まるため、既定の `min_confidence` は 0.15 にしています。`is_noise_or_meme` も「ん」「んにゃ」で 0.5〜0.6 にとどまるため、既定の閾値は 0.5 です(いずれも 2026-10-15 の実測 26 件から決めた暫定値)。ただし Noth へのメンションか Noth の発言へのリプライを含む発言群は、router の判定や失敗に関係なく `reply_only` 以上として扱い、ノイズ扱いもしません。名指しされたのに無視すると、利用者には故障にしか見えないためです。本文で `[router] call_names` の呼び名(単語の一部としての一致は除く)が出た発言群は、介入判定だけ `min_confidence` を問わず、router が静観を選んでも `reply_only` と `spawn_task` の確率の合計が `name_call_reply`(既定 0.25)以上なら応答します。呼び名の後ろに続くひらがな(「くん」「さん」や助詞)は単語の切れ目とみなします。Noth がそのチャンネルで応答してから `conversation_window_secs`(既定 120 秒)の間は、そのとき話しかけてきた人の発言も同じ扱いにします。Clef は Noth の応答直後の返事を Noth 宛てと見なさないことが多いためです(2026-10-15 の実測)。この時刻と相手はメモリにだけ持ち、再起動で消えます。`state.trigger` にも `calls_noth_by_name` として渡します。必ず応答にはしません。開発や設定の話題で名前が出るたびに割り込まないためです。確率そのものも判定したモデル名と一緒に SQLite に保存し、閾値の調整や後の分析に使えるようにします。なお同じ会話で比べると、Jev は Noth 宛てかどうかを 0.6〜0.9 の確率ではっきり分け、Noth の応答直後の返事も Noth 宛てと判定できた一方、Clef と Clef-flash は確率が 0.3〜0.6 に寄って区別がつかなかったため、雛形の既定は Jev にしています(2026-10-15 の実測)。上記の補正の多くは Clef 向けで、Jev ではほとんど効きません。
 
 ### 4.1 `state` の組み立て
 
@@ -105,9 +105,9 @@ Core は以下の質問セットを定義し、router module に渡します。�
 | `relevant_chunk_<id>` | noul × 候補数 | 候補 TopicChunk `<id>` が今回の発言に関連するか。候補ごとに1問 |
 
 - TopicChunk は **チャンネルごと** に管理する。`is_topic_shift == true` ならそのチャンネルで新しい TopicChunk の ID を割り当てる。チャンネルが違えば別のチャンクなので、2チャンネルの交互発言で毎回 topic shift になることはない
-- `is_noise_or_meme == true` なら SQLite には記録するが、Layer 3 への昇格対象から外す
+- `is_noise_or_meme == true` なら SQLite には記録するが、Layer 3 への昇格対象から外す。TopicChunk の要約にも足さず、topic shift でも新しいチャンクを作らない。ただし同時に `reply_only` / `spawn_task` と判定された場合は応答し、その発言をトリガーとして Layer 3 に入れる。応答した発言が Layer 3 に無いと会話が成り立たないため
 - `intervention_action == spawn_task` かつ `task_category == none` は `reply_only` として扱う
-- 候補 TopicChunk は直近のものから `candidate_chunks` 個(既定 32)。上限は `Router::max_questions() - 4`(Clef なら 60)。Layer 3 のターンが属しているチャンクは候補から外す。候補の要約は TopicChunk 作成時に冒頭の数件の発言から機械的に作成する(LLM は使わない)
+- 候補 TopicChunk は直近のものから `candidate_chunks` 個(既定 32)。上限は `Router::max_questions() - 4`(Clef なら 60)。Layer 3 のターンが属しているチャンクと、未昇格クリーンバッファの発言が属しているチャンクは候補から外す。バッファはこのターンで Layer 3 に昇格するので、候補に入れると同じ本文が Layer 3 と Layer 4 に二重に入るため。候補の要約は TopicChunk 作成時に冒頭の数件の発言から機械的に作成する(LLM は使わない)
 - System One API に複数選択型は無いため、関連チャンクは候補ごとの `noul` で表現する。`choice` の選択肢上限 255 は本設計では使わない
 
 ### 4.3 Worker 合流判定(Worker 完了時)
@@ -235,9 +235,9 @@ sequenceDiagram
 
 | テーブル | 内容 |
 |---|---|
-| `messages` | `allowed_users` と Noth 自身の発言の生ログ。チャンネル、投稿者、`is_self`、本文、時刻、所属 TopicChunk、`is_noise_or_meme`、`decision_id`(NULL なら未判定)、`promoted_turn_id`(NULL なら未昇格) |
+| `messages` | `allowed_users` と Noth 自身の発言の生ログ。チャンネル、投稿者、`is_self`、本文、時刻、所属 TopicChunk、`is_noise_or_meme`、自分宛てのメンション・リプライか、`decision_id`(NULL なら未判定)、`promoted_turn_id`(NULL なら未昇格) |
 | `topic_chunks` | TopicChunk の ID、チャンネル、開始・終了時刻、候補用の機械要約、Compactor による要約が済んでいるか |
-| `decisions` | router の判定結果と各回答の確率・confidence、レイテンシ |
+| `decisions` | router の判定結果と各回答の確率・confidence、レイテンシ、判定したモデル(`jev/jev-latest` など) |
 | `active_log` | Layer 3 のターン列。各ターンの種別(バッファ / トリガー / 応答 / 結論メモ)、`chunk_id`、その時点の `usage` |
 | `digests` | Layer 2 の履歴 |
 | `worker_runs` | `run_id`、Goal、`task_category`、`trigger_message_id`、`channel_id`、状態(queued / running / finished / failed / aborted)、開始・終了時刻、結論メモ、`delivery_style` |
