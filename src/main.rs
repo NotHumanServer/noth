@@ -14,8 +14,24 @@ fn registry() -> Registry {
     noth_router_systemone::register(&mut reg);
     #[cfg(feature = "router-mention")]
     noth_router_mention::register(&mut reg);
+    #[cfg(feature = "provider-openai")]
+    noth_provider_openai::register(&mut reg);
     #[cfg(feature = "provider-anthropic")]
     noth_provider_anthropic::register(&mut reg);
+    #[cfg(feature = "provider-google")]
+    noth_provider_google::register(&mut reg);
+    #[cfg(feature = "worker")]
+    noth_worker::register(&mut reg);
+    #[cfg(feature = "compactor")]
+    noth_compactor::register(&mut reg);
+    #[cfg(feature = "tool-web-search")]
+    noth_tool_web_search::register(&mut reg);
+    #[cfg(feature = "tool-web-fetch")]
+    noth_tool_web_fetch::register(&mut reg);
+    #[cfg(feature = "tool-web-agent")]
+    noth_tool_web_agent::register(&mut reg);
+    #[cfg(feature = "tool-shell")]
+    noth_tool_shell::register(&mut reg);
     reg
 }
 

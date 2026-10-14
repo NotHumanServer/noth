@@ -2,14 +2,10 @@ use tokio::sync::mpsc;
 
 use crate::types::IncomingMessage;
 
+/// Channel から Core への入力。Worker の完了とアイドル検知は actor 自身が仕事のキュー(`actor::Job`)に直接積むので、ここには流さない
 #[derive(Debug, Clone)]
 pub enum BusEvent {
     MessageReceived(IncomingMessage),
-    /// MVP では worker が無いので流れない
-    WorkerFinished {
-        run_id: String,
-    },
-    IdleDetected,
 }
 
 #[derive(Clone)]

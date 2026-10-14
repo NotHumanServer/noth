@@ -1,9 +1,12 @@
+mod auth;
 mod config_cmd;
 mod doctor;
+mod edit;
 mod init;
 mod logs;
 mod module;
 mod run;
+mod service;
 mod status;
 
 use std::path::{Path, PathBuf};
@@ -50,14 +53,17 @@ pub enum Command {
     /// 設定の表示・検査
     #[command(subcommand)]
     Config(ConfigCmd),
-    /// module の一覧・有効化
+    /// module の一覧・有効化・無効化
     #[command(subcommand)]
     Module(ModuleCmd),
     /// フォアグラウンドで常駐する
     Run,
-    /// OS のサービスとして管理する(MVP では未実装)
+    /// OS のサービスとして管理する(macOS: launchd、Linux: systemd のユーザーレベル)
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// 外部サービスにログインする
+    #[command(subcommand)]
+    Auth(AuthCmd),
     /// 常駐プロセスの状態を表示する
     Status,
     /// 設定と外部疎通を検査する
@@ -92,14 +98,17 @@ pub enum ConfigCmd {
         #[arg(long)]
         reveal: bool,
     },
-    /// 値を設定する(MVP では未実装)
+    /// 値を設定する(大文字スネークケースのキーは .env、それ以外は config.toml)
     Set {
-        /// 設定するキー
+        /// 設定するキー(例: channel.discord.debounce_secs、ANTHROPIC_API_KEY)
         key: String,
-        /// 設定する値
+        /// 設定する値(bool・10 進の数値・"文字列"・配列は型付き、それ以外は文字列。ID のキーは常に文字列)
         value: String,
+        /// 値を型の解釈なしに文字列として設定する
+        #[arg(long)]
+        string: bool,
     },
-    /// 値を削除する(MVP では未実装)
+    /// 値を削除する
     Unset {
         /// 削除するキー
         key: String,
@@ -110,37 +119,43 @@ pub enum ConfigCmd {
 pub enum ModuleCmd {
     /// module の組み込み状況と有効状態を一覧表示する
     List,
-    /// module を有効にする(MVP では未実装)
+    /// module を有効にする(config.toml の [modules] enabled に追加)
     Enable {
         /// module 名
         name: String,
-        /// 常駐中なら再起動する
+        /// 変更後に `noth service restart` まで行う
         #[arg(long)]
         restart: bool,
     },
-    /// module を無効にする(MVP では未実装)
+    /// module を無効にする(config.toml の [modules] enabled から外す)
     Disable {
         /// module 名
         name: String,
-        /// 常駐中なら再起動する
+        /// 変更後に `noth service restart` まで行う
         #[arg(long)]
         restart: bool,
     },
 }
 
 #[derive(Subcommand)]
+pub enum AuthCmd {
+    /// ChatGPT のサブスクリプションで OpenAI Codex にログインする(provider-openai の preset = "codex" 用)
+    Codex,
+}
+
+#[derive(Subcommand)]
 pub enum ServiceCmd {
-    /// サービスとして登録する(MVP では未実装)
+    /// サービスとして登録する(開始はしない)
     Install,
-    /// サービス登録を解除する(MVP では未実装)
+    /// サービス登録を解除する
     Uninstall,
-    /// サービスを開始する(MVP では未実装)
+    /// サービスを開始する
     Start,
-    /// サービスを停止する(MVP では未実装)
+    /// サービスを停止する
     Stop,
-    /// サービスを再起動する(MVP では未実装)
+    /// サービスを再起動する
     Restart,
-    /// サービスの状態を表示する(MVP では未実装)
+    /// サービスの状態を表示する
     Status,
 }
 
@@ -166,20 +181,22 @@ fn localize(cmd: clap::Command) -> clap::Command {
 pub async fn dispatch(cli: Cli) -> Result<ExitCode> {
     let cfg = cli.config.as_deref();
     match cli.command {
-        Command::Init { non_interactive } => init::run(cfg, non_interactive),
-        Command::Config(cmd) => config_cmd::run(cfg, cmd),
+        Command::Init { non_interactive } => init::run(cfg, non_interactive).await,
+        Command::Config(cmd) => config_cmd::run(cfg, cmd).await,
         Command::Module(ModuleCmd::List) => module::list(cfg),
-        Command::Module(_) | Command::Service(_) => Ok(unimplemented_exit()),
+        Command::Module(ModuleCmd::Enable { name, restart }) => {
+            module::set_enabled(cfg, &name, true, restart).await
+        }
+        Command::Module(ModuleCmd::Disable { name, restart }) => {
+            module::set_enabled(cfg, &name, false, restart).await
+        }
+        Command::Service(cmd) => service::run(cfg, cmd).await,
         Command::Run => run::run(cfg, cli.verbose).await,
+        Command::Auth(AuthCmd::Codex) => auth::codex(cfg).await,
         Command::Status => status::run(cfg).await,
         Command::Doctor => doctor::run(cfg).await,
         Command::Logs { follow, lines } => logs::run(cfg, follow, lines).await,
     }
-}
-
-pub(crate) fn unimplemented_exit() -> ExitCode {
-    eprintln!("MVP では未実装です");
-    ExitCode::from(2)
 }
 
 /// `-c` の指定が使えるファイルか確認する。`init` は作成するので対象外

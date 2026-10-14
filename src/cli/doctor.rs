@@ -104,6 +104,9 @@ pub async fn run(cfg: Option<&Path>) -> anyhow::Result<ExitCode> {
             failed |= check("channel", m.channel.health_check().await);
             failed |= check("router", m.router.health_check().await);
             failed |= check("provider", m.provider.health_check().await);
+            for (name, tool) in &m.tools {
+                failed |= check(name, tool.health_check().await);
+            }
         }
         None => {
             report(Mark::Skip, format!("module の疎通確認({SKIPPED})"));
@@ -156,13 +159,5 @@ fn warnings(c: &Config) {
             Mark::Warn,
             format!("profile ファイルがありません: {}", profile.display()),
         );
-    }
-    for m in &c.modules.enabled {
-        if matches!(
-            kind_of(m),
-            Some(ModuleKind::Worker | ModuleKind::Compactor | ModuleKind::Tool)
-        ) {
-            report(Mark::Warn, format!("{m} は MVP では未実装です"));
-        }
     }
 }

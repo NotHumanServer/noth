@@ -1,5 +1,5 @@
 use noth_core::traits::{Completion, LayeredPrompt};
-use noth_core::types::{CompletionParams, Role, ToolCall, Turn, Usage};
+use noth_core::types::{CompletionParams, ExchangeItem, Role, ToolCall, Turn, Usage};
 use noth_core::{Error, Result};
 use serde_json::{Value, json};
 
@@ -63,6 +63,105 @@ fn role_str(role: Role) -> &'static str {
 struct Message {
     role: Role,
     blocks: Vec<Value>,
+    /// 他の block と混ぜないメッセージ。raw の assistant content(thinking の署名を守る)と tool_result が該当
+    raw: bool,
+}
+
+fn tool_use_block(call: &ToolCall) -> Value {
+    json!({"type": "tool_use", "id": call.id, "name": call.name, "input": call.input})
+}
+
+/// 空の tool_result は API が弾く(特に is_error: true)
+const EMPTY_OUTPUT_NOTICE: &str = "(出力なし)";
+
+fn is_blank_text(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_none_or(|t| t.trim().is_empty())
+}
+
+fn push_exchange(messages: &mut Vec<Message>, item: &ExchangeItem) {
+    match item {
+        ExchangeItem::Assistant { text, calls, raw } => {
+            // 空白だけの text ブロックは再送すると 400 になる。thinking など他のブロックはそのまま返す
+            let raw_blocks: Vec<Value> = match raw {
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter(|b| !is_blank_text(b))
+                    .cloned()
+                    .collect(),
+                Some(other) => vec![other.clone()],
+                None => Vec::new(),
+            };
+            let from_raw = !raw_blocks.is_empty();
+            let blocks = if from_raw {
+                raw_blocks
+            } else {
+                text.iter()
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| text_block(t))
+                    .chain(calls.iter().map(tool_use_block))
+                    .collect()
+            };
+            if blocks.is_empty() {
+                return;
+            }
+            match messages.last_mut() {
+                Some(m) if m.role == Role::Assistant && !m.raw && !from_raw => {
+                    m.blocks.extend(blocks);
+                }
+                _ => messages.push(Message {
+                    role: Role::Assistant,
+                    blocks,
+                    raw: from_raw,
+                }),
+            }
+        }
+        ExchangeItem::ToolResults(results) => {
+            let blocks: Vec<Value> = results
+                .iter()
+                .map(|r| {
+                    let output = if r.output.is_empty() {
+                        EMPTY_OUTPUT_NOTICE
+                    } else {
+                        &r.output
+                    };
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": r.call_id,
+                        "content": output,
+                        "is_error": r.is_error,
+                    })
+                })
+                .collect();
+            if blocks.is_empty() {
+                return;
+            }
+            // tool_result は直前の assistant の tool_use に続く user メッセージの先頭になければならないため、他の user 内容とは混ぜない
+            messages.push(Message {
+                role: Role::User,
+                blocks,
+                raw: true,
+            });
+        }
+    }
+}
+
+/// thinking ブロックには cache_control を付けられないため、末尾から遡って最初の非 thinking ブロックを探す
+fn last_cacheable(messages: &[Message]) -> Option<(usize, usize)> {
+    messages.iter().enumerate().rev().find_map(|(mi, m)| {
+        m.blocks
+            .iter()
+            .rposition(|b| {
+                !matches!(
+                    b.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+            .map(|bi| (mi, bi))
+    })
 }
 
 /// 連続する同 role のターンは1メッセージの複数 block に畳む。追加した block の位置を返す
@@ -72,10 +171,11 @@ fn push_turn(messages: &mut Vec<Message>, turn: &Turn) -> Option<(usize, usize)>
         return None;
     }
     match messages.last_mut() {
-        Some(m) if m.role == turn.role => m.blocks.push(text_block(&turn.text)),
+        Some(m) if m.role == turn.role && !m.raw => m.blocks.push(text_block(&turn.text)),
         _ => messages.push(Message {
             role: turn.role,
             blocks: vec![text_block(&turn.text)],
+            raw: false,
         }),
     }
     let mi = messages.len() - 1;
@@ -107,6 +207,9 @@ pub fn build_request(
     for turn in &prompt.ephemeral_tail {
         push_turn(&mut messages, turn);
     }
+    for item in &prompt.tool_exchange {
+        push_exchange(&mut messages, item);
+    }
 
     match messages.last() {
         None => return Err(Error::Other("anthropic: messages is empty".into())),
@@ -117,7 +220,13 @@ pub fn build_request(
         }
         Some(_) => {}
     }
-    if let Some((mi, bi)) = layer3_end {
+    // Worker は tool 往復のたびに末尾が伸びるので、境界を末尾へ動かして直前までの往復をキャッシュに乗せる
+    let breakpoint = if prompt.cache_to_end {
+        last_cacheable(&messages)
+    } else {
+        layer3_end
+    };
+    if let Some((mi, bi)) = breakpoint {
         messages[mi].blocks[bi]["cache_control"] = ttl.cache_control();
     }
     if messages[0].role == Role::Assistant {
@@ -126,6 +235,7 @@ pub fn build_request(
             Message {
                 role: Role::User,
                 blocks: vec![text_block(OMITTED_NOTICE)],
+                raw: false,
             },
         );
     }
@@ -140,6 +250,7 @@ pub fn build_request(
         "system": system,
         "messages": messages,
     });
+    // キャッシュのプレフィックスは tools → system → messages の順なので、system の境界が tools も覆う
     if !prompt.tools.is_empty() {
         body["tools"] = prompt
             .tools
@@ -203,16 +314,18 @@ pub fn parse_response(resp: &Value) -> Result<Completion> {
         cached_tokens: cache_read,
         output_tokens: u("output_tokens"),
     };
+    let raw_assistant = (!tool_calls.is_empty()).then(|| Value::Array(blocks.clone()));
     Ok(Completion {
         text: (!text.is_empty()).then_some(text),
         tool_calls,
         usage,
+        raw_assistant,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use noth_core::types::{ToolSpec, TurnKind};
+    use noth_core::types::{ToolResult, ToolSpec, TurnKind};
 
     use super::*;
 
@@ -234,6 +347,7 @@ mod tests {
             active_log: vec![turn(Role::User, "a"), turn(Role::Assistant, "b")],
             ephemeral_tail: vec![turn(Role::User, "c")],
             tools: vec![],
+            ..Default::default()
         }
     }
 
@@ -340,6 +454,223 @@ mod tests {
         let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
         assert_eq!(body["tools"][0]["name"], "t");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "shell".into(),
+            description: "d".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn exchange() -> Vec<ExchangeItem> {
+        vec![
+            ExchangeItem::Assistant {
+                text: Some("調べます".into()),
+                calls: vec![ToolCall {
+                    id: "toolu_1".into(),
+                    name: "shell".into(),
+                    input: json!({"command": "ls"}),
+                }],
+                raw: Some(json!([
+                    {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+                    {"type": "text", "text": "調べます"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "shell", "input": {"command": "ls"}}
+                ])),
+            },
+            ExchangeItem::ToolResults(vec![ToolResult {
+                call_id: "toolu_1".into(),
+                name: "shell".into(),
+                output: "a.txt".into(),
+                is_error: false,
+            }]),
+        ]
+    }
+
+    #[test]
+    fn tool_exchange_round_trip_keeps_raw_content() {
+        let mut p = prompt();
+        p.tools = vec![spec()];
+        p.tool_exchange = exchange();
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[3]["content"][0]["type"], "thinking");
+        assert_eq!(msgs[3]["content"][0]["signature"], "sig");
+        assert_eq!(msgs[3]["content"][2]["id"], "toolu_1");
+        assert_eq!(msgs[4]["role"], "user");
+        let r = &msgs[4]["content"][0];
+        assert_eq!(r["type"], "tool_result");
+        assert_eq!(r["tool_use_id"], "toolu_1");
+        assert_eq!(r["content"], "a.txt");
+        assert_eq!(r["is_error"], false);
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn exchange_without_raw_builds_blocks() {
+        let mut p = prompt();
+        p.tool_exchange = vec![
+            ExchangeItem::Assistant {
+                text: Some("x".into()),
+                calls: vec![ToolCall {
+                    id: "t".into(),
+                    name: "shell".into(),
+                    input: json!({}),
+                }],
+                raw: None,
+            },
+            ExchangeItem::ToolResults(vec![]),
+            ExchangeItem::ToolResults(vec![ToolResult {
+                call_id: "t".into(),
+                name: "shell".into(),
+                output: "e".into(),
+                is_error: true,
+            }]),
+        ];
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[3]["content"][0]["text"], "x");
+        assert_eq!(msgs[3]["content"][1]["type"], "tool_use");
+        assert_eq!(msgs[4]["content"][0]["is_error"], true);
+    }
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "shell".into(),
+            input: json!({}),
+        }
+    }
+
+    #[test]
+    fn raw_drops_blank_text_but_keeps_thinking() {
+        let mut p = prompt();
+        p.tool_exchange = vec![
+            ExchangeItem::Assistant {
+                text: None,
+                calls: vec![call("t")],
+                raw: Some(json!([
+                    {"type": "thinking", "thinking": "x", "signature": "s"},
+                    {"type": "text", "text": " \n"},
+                    {"type": "tool_use", "id": "t", "name": "shell", "input": {}}
+                ])),
+            },
+            ExchangeItem::ToolResults(vec![ToolResult {
+                call_id: "t".into(),
+                name: "shell".into(),
+                output: "ok".into(),
+                is_error: false,
+            }]),
+        ];
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let content = body["messages"][3]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn empty_tool_output_gets_placeholder() {
+        let mut p = prompt();
+        p.tool_exchange = vec![
+            ExchangeItem::Assistant {
+                text: None,
+                calls: vec![call("t")],
+                raw: None,
+            },
+            ExchangeItem::ToolResults(vec![ToolResult {
+                call_id: "t".into(),
+                name: "shell".into(),
+                output: String::new(),
+                is_error: true,
+            }]),
+        ];
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        assert_eq!(body["messages"][4]["content"][0]["content"], "(出力なし)");
+        assert_eq!(body["messages"][4]["content"][0]["is_error"], true);
+    }
+
+    #[test]
+    fn empty_raw_falls_back_to_calls_and_results_stay_separate() {
+        let mut p = prompt();
+        p.tool_exchange = vec![
+            ExchangeItem::Assistant {
+                text: None,
+                calls: vec![call("t")],
+                raw: Some(json!([])),
+            },
+            ExchangeItem::ToolResults(vec![ToolResult {
+                call_id: "t".into(),
+                name: "shell".into(),
+                output: "ok".into(),
+                is_error: false,
+            }]),
+        ];
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[3]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[4]["role"], "user");
+        assert_eq!(msgs[4]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[4]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cache_to_end_puts_breakpoint_on_last_block() {
+        let mut p = prompt();
+        p.tools = vec![spec()];
+        p.tool_exchange = exchange();
+        p.cache_to_end = true;
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(msgs[1]["content"][0].get("cache_control").is_none());
+        assert!(msgs[4]["content"][0].get("cache_control").is_some());
+        assert_eq!(count_cache_controls(&body["messages"]), 1);
+        assert!(count_cache_controls(&body) <= 4);
+    }
+
+    #[test]
+    fn cache_to_end_skips_thinking_blocks() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            blocks: vec![
+                json!({"type": "text", "text": "a"}),
+                json!({"type": "thinking", "thinking": "t", "signature": "s"}),
+            ],
+            raw: true,
+        }];
+        assert_eq!(last_cacheable(&msgs), Some((0, 0)));
+    }
+
+    #[test]
+    fn main_prompt_keeps_layer3_breakpoint_with_tools() {
+        let mut p = prompt();
+        p.tools = vec![spec()];
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(msgs[1]["content"][0].get("cache_control").is_some());
+        assert!(msgs[2]["content"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][0]["name"], "shell");
+        assert_eq!(count_cache_controls(&body), 3);
+    }
+
+    #[test]
+    fn raw_assistant_set_only_with_tool_use() {
+        let resp = json!({
+            "content": [
+                {"type": "thinking", "thinking": "t", "signature": "s"},
+                {"type": "tool_use", "id": "a", "name": "n", "input": {}}
+            ],
+            "usage": {}
+        });
+        let c = parse_response(&resp).unwrap();
+        assert_eq!(c.raw_assistant, Some(resp["content"].clone()));
+        let plain = json!({"content": [{"type":"text","text":"x"}], "usage": {}});
+        assert!(parse_response(&plain).unwrap().raw_assistant.is_none());
     }
 
     #[test]

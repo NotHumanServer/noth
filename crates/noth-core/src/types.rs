@@ -115,6 +115,28 @@ pub struct ToolCall {
     pub input: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub call_id: String,
+    /// Gemini の functionResponse は call id ではなく関数名で対応づけるため持つ
+    pub name: String,
+    pub output: String,
+    pub is_error: bool,
+}
+
+/// Worker の tool 往復。Layer 4 の後ろに積み、本線の Layer 3 には入れない
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExchangeItem {
+    Assistant {
+        text: Option<String>,
+        calls: Vec<ToolCall>,
+        /// provider が返した assistant の生の content。thinking ブロックや thought signature を
+        /// 次の呼び出しでそのまま返さないと API に弾かれるので、生成した provider がそのまま使う
+        raw: Option<serde_json::Value>,
+    },
+    ToolResults(Vec<ToolResult>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCategory {

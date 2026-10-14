@@ -207,7 +207,8 @@ impl Channel for DiscordChannel {
     ) -> Result<MessageId> {
         let channel = sn::ChannelId::new(channel_id);
         let mut last = None;
-        for (i, chunk) in split_message(text, MESSAGE_LIMIT).into_iter().enumerate() {
+        let text = wrap_urls(text);
+        for (i, chunk) in split_message(&text, MESSAGE_LIMIT).into_iter().enumerate() {
             // メンションによる意図しない通知・権限昇格を防ぐため、常に空を明示する
             let mut msg = sn::CreateMessage::new()
                 .content(chunk)
@@ -229,6 +230,17 @@ impl Channel for DiscordChannel {
             }
         }
         last.ok_or_else(|| Error::Other("cannot send an empty message".into()))
+    }
+
+    async fn edit(&self, channel_id: ChannelId, message_id: MessageId, text: &str) -> Result<()> {
+        let msg = sn::EditMessage::new()
+            .content(prepare_edit(text))
+            .allowed_mentions(sn::CreateAllowedMentions::new());
+        sn::ChannelId::new(channel_id)
+            .edit_message(&self.http, sn::MessageId::new(message_id), msg)
+            .await
+            .map(|_| ())
+            .map_err(transport)
     }
 
     async fn typing(&self, channel_id: ChannelId) -> Result<()> {
@@ -449,6 +461,109 @@ fn replace_mentions(
     out
 }
 
+/// Discord は URL を次の空白まで自動リンクにするため、日本語の括弧や句読点が続くとリンクに巻き込まれる。
+/// `<URL>` で囲むと終端が確定し、プレビューも出ない。コード・Markdown リンク・囲み済みの URL は触らない
+fn wrap_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let skip = if let Some(body) = rest.strip_prefix("```") {
+            Some(body.find("```").map_or(rest.len(), |p| p + 6))
+        } else if let Some(body) = rest.strip_prefix('`') {
+            body.find('`').map(|p| p + 2)
+        } else if rest.starts_with("](") {
+            Some(markdown_link_end(rest))
+        } else if rest.starts_with("<http") {
+            rest.find('>').map(|p| p + 1)
+        } else {
+            None
+        };
+        if let Some(n) = skip {
+            out.push_str(&rest[..n]);
+            i += n;
+            continue;
+        }
+        let after_word = out
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        if !after_word && (rest.starts_with("http://") || rest.starts_with("https://")) {
+            let url = trim_url(url_candidate(rest));
+            let scheme_only = url.ends_with("://");
+            // `[https://x](https://x)` の表示側は Markdown リンクの一部なので囲まない
+            let link_label = rest[url.len()..].starts_with("](");
+            if !scheme_only && !link_label {
+                out.push('<');
+                out.push_str(url);
+                out.push('>');
+                i += url.len();
+                continue;
+            }
+        }
+        let c = rest.chars().next().expect("non-empty");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// 編集は分割できないため、上限を超えたら切り捨てる。Core が事前に収めるので通常は到達しない安全網
+fn prepare_edit(text: &str) -> String {
+    let wrapped = wrap_urls(text);
+    match wrapped.char_indices().nth(MESSAGE_LIMIT) {
+        Some((i, _)) => wrapped[..i].to_string(),
+        None => wrapped,
+    }
+}
+
+/// `](` で始まる文字列から、対応する `)` の直後までの長さ。閉じていなければ `](` だけ
+fn markdown_link_end(rest: &str) -> usize {
+    let mut depth = 1;
+    for (i, b) in rest.bytes().enumerate().skip(2) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    2
+}
+
+/// 空白・非 ASCII(日本語や全角括弧)・`<>` と backtick の手前までを URL 候補とする
+fn url_candidate(rest: &str) -> &str {
+    let end = rest
+        .bytes()
+        .position(|b| !b.is_ascii() || b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'`'))
+        .unwrap_or(rest.len());
+    let candidate = &rest[..end];
+    // Markdown リンクの表示側に URL を書いた場合、`](` 以降は別のリンクの URL
+    &candidate[..candidate.find("](").unwrap_or(candidate.len())]
+}
+
+/// 文末の句読点と、開き括弧と対応しない閉じ括弧を URL から外す
+fn trim_url(mut url: &str) -> &str {
+    loop {
+        let unbalanced =
+            |open: char, close: char| url.matches(close).count() > url.matches(open).count();
+        let trim = match url.chars().last() {
+            Some('.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"') => true,
+            Some(')') => unbalanced('(', ')'),
+            Some(']') => unbalanced('[', ']'),
+            _ => false,
+        };
+        if !trim {
+            return url;
+        }
+        url = &url[..url.len() - 1];
+    }
+}
+
 fn split_message(text: &str, limit: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut rest = text;
@@ -515,6 +630,88 @@ mod tests {
             replace("<@&5> @everyone <@abc> <@1 <@"),
             "<@&5> @everyone <@abc> <@1 <@"
         );
+    }
+
+    #[test]
+    fn wraps_url_inside_japanese_parens() {
+        assert_eq!(
+            wrap_urls("公式サイト(https://www.tinyfish.ai/)を見る"),
+            "公式サイト(<https://www.tinyfish.ai/>)を見る"
+        );
+        assert_eq!(
+            wrap_urls("https://a.example/pathを参照"),
+            "<https://a.example/path>を参照"
+        );
+        assert_eq!(
+            wrap_urls("（https://a.example）です"),
+            "（<https://a.example>）です"
+        );
+    }
+
+    #[test]
+    fn trims_trailing_punctuation() {
+        assert_eq!(
+            wrap_urls("見て https://a.example/x."),
+            "見て <https://a.example/x>."
+        );
+        assert_eq!(
+            wrap_urls("https://a.example/x?!"),
+            "<https://a.example/x>?!"
+        );
+        assert_eq!(
+            wrap_urls("\"https://a.example/x\","),
+            "\"<https://a.example/x>\","
+        );
+    }
+
+    #[test]
+    fn keeps_balanced_parens() {
+        assert_eq!(
+            wrap_urls("https://ja.wikipedia.org/wiki/A_(b)"),
+            "<https://ja.wikipedia.org/wiki/A_(b)>"
+        );
+        assert_eq!(
+            wrap_urls("(https://ja.wikipedia.org/wiki/A_(b))"),
+            "(<https://ja.wikipedia.org/wiki/A_(b)>)"
+        );
+    }
+
+    #[test]
+    fn leaves_wrapped_markdown_and_code_untouched() {
+        for s in [
+            "<https://a.example/x>",
+            "[見出し](https://a.example/x)",
+            "[https://a.example](https://a.example)",
+            "```\nhttps://a.example\n```",
+            "`https://a.example`",
+        ] {
+            assert_eq!(wrap_urls(s), s);
+        }
+        assert_eq!(
+            wrap_urls("`x` https://a.example [t](https://b.example) https://c.example"),
+            "`x` <https://a.example> [t](https://b.example) <https://c.example>"
+        );
+    }
+
+    #[test]
+    fn wraps_multiple_and_ignores_bare_scheme() {
+        assert_eq!(
+            wrap_urls("A https://a.example と B http://b.example/ です"),
+            "A <https://a.example> と B <http://b.example/> です"
+        );
+        assert_eq!(wrap_urls("https:// だけ"), "https:// だけ");
+        assert_eq!(wrap_urls("日本語のみ"), "日本語のみ");
+    }
+
+    #[test]
+    fn prepare_edit_wraps_urls_and_cuts_at_limit() {
+        assert_eq!(
+            prepare_edit("進捗(https://a.example)です"),
+            "進捗(<https://a.example>)です"
+        );
+        let long = "あ".repeat(MESSAGE_LIMIT + 50);
+        assert_eq!(prepare_edit(&long).chars().count(), MESSAGE_LIMIT);
+        assert_eq!(prepare_edit("短い"), "短い");
     }
 
     #[test]

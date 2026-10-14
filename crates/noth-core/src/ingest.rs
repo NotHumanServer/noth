@@ -86,7 +86,6 @@ pub async fn run(
                         reply_to_self: msg.reply_to_self,
                     });
                 }
-                Some(BusEvent::WorkerFinished { .. } | BusEvent::IdleDetected) => {}
                 None => {
                     flush(&mut pending, &jobs, true);
                     return;

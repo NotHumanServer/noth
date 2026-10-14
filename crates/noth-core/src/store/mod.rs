@@ -68,11 +68,67 @@ pub struct HeartbeatRow {
     pub info: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Queued,
+    Running,
+    Finished,
+    Failed,
+    Aborted,
+}
+
+impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "queued" => Self::Queued,
+            "running" => Self::Running,
+            "finished" => Self::Finished,
+            "failed" => Self::Failed,
+            "aborted" => Self::Aborted,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerRunRow {
     pub run_id: String,
-    pub status: String,
+    pub status: RunStatus,
+    pub task_category: TaskCategory,
+    pub goal: String,
+    /// queued の間は None。running になった時刻
     pub started_at: Option<Timestamp>,
+    pub finished_at: Option<Timestamp>,
+    pub channel_id: ChannelId,
+    pub chunk_id: Option<i64>,
+    /// reply_anchor のリプライ先。トリガー発言群の最後の Discord メッセージ
+    pub trigger_message_id: Option<MessageId>,
+    /// これより大きい messages.id が「Fork 以降に届いた発言」
+    pub fork_message_id: i64,
+    /// finished なら結論メモ、failed なら失敗理由
+    pub conclusion: Option<String>,
+    pub delivery_style: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewWorkerRun {
+    pub run_id: String,
+    pub goal: String,
+    pub task_category: TaskCategory,
+    pub channel_id: ChannelId,
+    pub chunk_id: i64,
+    pub trigger_message_id: Option<MessageId>,
+    pub fork_message_id: i64,
 }
 
 /// 機械要約の上限。候補用なので短く保つ
@@ -80,6 +136,7 @@ const SUMMARY_MAX_CHARS: usize = 200;
 
 const MESSAGE_COLUMNS: &str = "id, guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, content, created_at, chunk_id, is_noise, decision_id, promoted_turn_id";
 const CHUNK_COLUMNS: &str = "id, guild_id, channel_id, started_at, ended_at, summary, compacted";
+const RUN_COLUMNS: &str = "run_id, status, task_category, goal, started_at, finished_at, channel_id, chunk_id, trigger_message_id, fork_message_id, conclusion, delivery_style";
 
 fn ts(ms: i64) -> Timestamp {
     // 範囲外の値は壊れた行なので epoch に倒す(読み出しで panic させない)
@@ -120,6 +177,49 @@ fn chunk_row(r: &SqliteRow) -> Result<ChunkRow> {
         ended_at: ts(r.try_get("ended_at")?),
         summary: r.try_get("summary")?,
         compacted: r.try_get("compacted")?,
+    })
+}
+
+fn run_row(r: &SqliteRow) -> Result<WorkerRunRow> {
+    let status: String = r.try_get("status")?;
+    let category: String = r.try_get("task_category")?;
+    Ok(WorkerRunRow {
+        run_id: r.try_get("run_id")?,
+        status: RunStatus::parse(&status)
+            .ok_or_else(|| Error::Other(format!("worker_runs: 未知の status {status:?}")))?,
+        task_category: parse_category(&category).ok_or_else(|| {
+            Error::Other(format!("worker_runs: 未知の task_category {category:?}"))
+        })?,
+        goal: r.try_get("goal")?,
+        started_at: r.try_get::<Option<i64>, _>("started_at")?.map(ts),
+        finished_at: r.try_get::<Option<i64>, _>("finished_at")?.map(ts),
+        channel_id: r.try_get::<i64, _>("channel_id")? as u64,
+        chunk_id: r.try_get("chunk_id")?,
+        trigger_message_id: r
+            .try_get::<Option<i64>, _>("trigger_message_id")?
+            .map(|id| id as u64),
+        fork_message_id: r.try_get("fork_message_id")?,
+        conclusion: r.try_get("conclusion")?,
+        delivery_style: r.try_get("delivery_style")?,
+    })
+}
+
+pub fn category_str(c: TaskCategory) -> &'static str {
+    match c {
+        TaskCategory::None => "none",
+        TaskCategory::WebResearch => "web_research",
+        TaskCategory::FactCheck => "fact_check",
+        TaskCategory::CodeOrTool => "code_or_tool",
+    }
+}
+
+fn parse_category(s: &str) -> Option<TaskCategory> {
+    Some(match s {
+        "none" => TaskCategory::None,
+        "web_research" => TaskCategory::WebResearch,
+        "fact_check" => TaskCategory::FactCheck,
+        "code_or_tool" => TaskCategory::CodeOrTool,
+        _ => return None,
     })
 }
 
@@ -257,6 +357,38 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(message_row).collect()
+    }
+    pub async fn message(&self, id: i64) -> Result<Option<MessageRow>> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(message_row).transpose()
+    }
+    /// 発言が 1 件も無ければ 0
+    pub async fn max_message_id(&self, guild: GuildId) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM messages WHERE guild_id = ?")
+                .bind(guild as i64)
+                .fetch_one(&self.pool)
+                .await?
+                .unwrap_or(0),
+        )
+    }
+    /// アイドル判定に使う、Noth 以外の最後の発言の (行 ID, 時刻)
+    pub async fn last_human_message(&self, guild: GuildId) -> Result<Option<(i64, Timestamp)>> {
+        let row = sqlx::query(
+            "SELECT id, created_at FROM messages WHERE guild_id = ? AND is_self = 0 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(guild as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| -> Result<(i64, Timestamp)> {
+            Ok((r.try_get("id")?, ts(r.try_get("created_at")?)))
+        })
+        .transpose()
     }
     /// Noth 自身の発言は判定対象にしない
     pub async fn unjudged_messages(&self, guild: GuildId) -> Result<Vec<MessageRow>> {
@@ -445,6 +577,56 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+    /// spawn_task の Ack + Goal を Layer 3 に残し、run を queued で登録する。
+    /// Worker の文脈にトリガーと Goal を含めるため Fork より前に呼ぶ。run だけ残って Goal が無い状態を作らないよう 1 トランザクションにする
+    pub async fn record_task(
+        &self,
+        guild: GuildId,
+        trigger: &Turn,
+        response: &Turn,
+        ids: &[i64],
+        usage: &Usage,
+        run: &NewWorkerRun,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let trigger_id = insert_turn(&mut *tx, guild, trigger).await?;
+        let response_id = insert_turn(&mut *tx, guild, response).await?;
+        promote_rows(&mut tx, ids, trigger_id).await?;
+        write_usage(&mut *tx, response_id, usage).await?;
+        insert_run(&mut *tx, guild, run).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    /// Layer 3 の範囲を Layer 2 の要約に置き換える。要約だけ増えてターンが残る(またはその逆の)状態を作らないよう 1 トランザクションにする
+    pub async fn replace_with_digest(
+        &self,
+        guild: GuildId,
+        digest: &str,
+        turn_ids: &[i64],
+        compacted_chunks: &[i64],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO digests (guild_id, text, created_at) VALUES (?, ?, ?)")
+            .bind(guild as i64)
+            .bind(digest)
+            .bind(now_ms())
+            .execute(&mut *tx)
+            .await?;
+        for id in turn_ids {
+            sqlx::query("UPDATE active_log SET removed = 1 WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for id in compacted_chunks {
+            sqlx::query("UPDATE topic_chunks SET compacted = 1 WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
     /// 削除されていないターンを追記順で
     pub async fn active_turns(&self, guild: GuildId) -> Result<Vec<Turn>> {
         let rows = sqlx::query("SELECT id, role, kind, text, chunk_id FROM active_log WHERE guild_id = ? AND removed = 0 ORDER BY id ASC")
@@ -529,21 +711,77 @@ impl Store {
         Ok(r.rows_affected())
     }
     pub async fn active_runs(&self, guild: GuildId) -> Result<Vec<WorkerRunRow>> {
-        let rows = sqlx::query(
-            "SELECT run_id, status, started_at FROM worker_runs WHERE guild_id = ? AND status IN ('queued', 'running') ORDER BY rowid ASC",
-        )
-        .bind(guild as i64)
-        .fetch_all(&self.pool)
+        self.worker_runs(guild, &[RunStatus::Queued, RunStatus::Running])
+            .await
+    }
+    /// `statuses` のいずれかに当たる run を登録順で。`noth status` が状態ごとに一覧するため
+    pub async fn worker_runs(
+        &self,
+        guild: GuildId,
+        statuses: &[RunStatus],
+    ) -> Result<Vec<WorkerRunRow>> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; statuses.len()].join(", ");
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {RUN_COLUMNS} FROM worker_runs WHERE guild_id = ? AND status IN ({marks}) ORDER BY rowid ASC"
+        )))
+        .bind(guild as i64);
+        for s in statuses {
+            q = q.bind(s.as_str());
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.iter().map(run_row).collect()
+    }
+    pub async fn worker_run(&self, run_id: &str) -> Result<Option<WorkerRunRow>> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {RUN_COLUMNS} FROM worker_runs WHERE run_id = ?"
+        )))
+        .bind(run_id)
+        .fetch_optional(&self.pool)
         .await?;
-        rows.iter()
-            .map(|r| {
-                Ok(WorkerRunRow {
-                    run_id: r.try_get("run_id")?,
-                    status: r.try_get("status")?,
-                    started_at: r.try_get::<Option<i64>, _>("started_at")?.map(ts),
-                })
-            })
-            .collect()
+        row.as_ref().map(run_row).transpose()
+    }
+    pub async fn insert_worker_run(&self, guild: GuildId, run: &NewWorkerRun) -> Result<()> {
+        insert_run(&self.pool, guild, run).await
+    }
+    /// 再起動で aborted にされた run を後から動かさないよう、queued のときだけ進める。進めたら true
+    pub async fn start_run(&self, run_id: &str) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE worker_runs SET status = 'running', started_at = ? WHERE run_id = ? AND status = 'queued'",
+        )
+        .bind(now_ms())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+    /// `status` は Finished か Failed。`conclusion` は結論メモか失敗理由
+    pub async fn finish_run(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        conclusion: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE worker_runs SET status = ?, conclusion = ?, finished_at = ? WHERE run_id = ?",
+        )
+        .bind(status.as_str())
+        .bind(conclusion)
+        .bind(now_ms())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+    pub async fn set_delivery_style(&self, run_id: &str, style: &str) -> Result<()> {
+        sqlx::query("UPDATE worker_runs SET delivery_style = ? WHERE run_id = ?")
+            .bind(style)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // --- heartbeat ---
@@ -592,6 +830,28 @@ async fn insert_turn<'e>(
         .execute(exec)
         .await?;
     Ok(r.last_insert_rowid())
+}
+
+async fn insert_run<'e>(
+    exec: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    guild: GuildId,
+    run: &NewWorkerRun,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO worker_runs (run_id, guild_id, goal, task_category, trigger_message_id, channel_id, status, chunk_id, fork_message_id)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+    )
+    .bind(&run.run_id)
+    .bind(guild as i64)
+    .bind(&run.goal)
+    .bind(category_str(run.task_category))
+    .bind(run.trigger_message_id.map(|id| id as i64))
+    .bind(run.channel_id as i64)
+    .bind(run.chunk_id)
+    .bind(run.fork_message_id)
+    .execute(exec)
+    .await?;
+    Ok(())
 }
 
 async fn promote_rows(
@@ -887,27 +1147,123 @@ mod tests {
         assert_eq!(s.latest_digest(G).await.unwrap().as_deref(), Some("new"));
     }
 
+    fn new_run(run_id: &str) -> NewWorkerRun {
+        NewWorkerRun {
+            run_id: run_id.into(),
+            goal: format!("goal {run_id}"),
+            task_category: TaskCategory::WebResearch,
+            channel_id: C,
+            chunk_id: 3,
+            trigger_message_id: Some(42),
+            fork_message_id: 7,
+        }
+    }
+
     #[tokio::test]
     async fn worker_runs() {
         let s = Store::open_memory().await.unwrap();
-        for (id, status) in [("r1", "queued"), ("r2", "running"), ("r3", "finished")] {
-            sqlx::query("INSERT INTO worker_runs (run_id, guild_id, goal, task_category, channel_id, status, started_at) VALUES (?, ?, 'g', 'none', 10, ?, 5)")
-                .bind(id)
-                .bind(G as i64)
-                .bind(status)
-                .execute(&s.pool)
-                .await
-                .unwrap();
+        for id in ["r1", "r2", "r3", "r4"] {
+            s.insert_worker_run(G, &new_run(id)).await.unwrap();
         }
-        let active = s.active_runs(G).await.unwrap();
+        assert!(s.start_run("r2").await.unwrap());
+        assert!(s.start_run("r3").await.unwrap());
+        s.finish_run("r3", RunStatus::Finished, "memo")
+            .await
+            .unwrap();
+        assert!(s.start_run("r4").await.unwrap());
+        s.finish_run("r4", RunStatus::Failed, "timeout")
+            .await
+            .unwrap();
+        // running からはもう一度 start できない
+        assert!(!s.start_run("r2").await.unwrap());
+
+        let r3 = s.worker_run("r3").await.unwrap().unwrap();
+        assert_eq!(r3.status, RunStatus::Finished);
+        assert_eq!(r3.conclusion.as_deref(), Some("memo"));
+        assert_eq!(r3.task_category, TaskCategory::WebResearch);
+        assert_eq!(r3.trigger_message_id, Some(42));
+        assert_eq!(r3.fork_message_id, 7);
+        assert_eq!(r3.chunk_id, Some(3));
+        assert!(r3.started_at.is_some() && r3.finished_at.is_some());
+        s.set_delivery_style("r3", "abort").await.unwrap();
         assert_eq!(
-            active.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
-            vec!["r1", "r2"]
+            s.worker_run("r3")
+                .await
+                .unwrap()
+                .unwrap()
+                .delivery_style
+                .as_deref(),
+            Some("abort")
         );
-        assert_eq!(active[0].started_at.unwrap().as_millisecond(), 5);
+        assert!(s.worker_run("nope").await.unwrap().is_none());
+
+        let ids = |v: Vec<WorkerRunRow>| v.into_iter().map(|r| r.run_id).collect::<Vec<_>>();
+        assert_eq!(ids(s.active_runs(G).await.unwrap()), vec!["r1", "r2"]);
+        assert!(s.active_runs(G).await.unwrap()[0].started_at.is_none());
+        assert_eq!(
+            ids(s
+                .worker_runs(G, &[RunStatus::Finished, RunStatus::Failed])
+                .await
+                .unwrap()),
+            vec!["r3", "r4"]
+        );
+        assert!(s.worker_runs(G, &[]).await.unwrap().is_empty());
+
         assert_eq!(s.abort_pending_runs(G).await.unwrap(), 2);
         assert!(s.active_runs(G).await.unwrap().is_empty());
         assert_eq!(s.abort_pending_runs(G).await.unwrap(), 0);
+        // aborted にされた queued の run は後から running にならない
+        assert!(!s.start_run("r1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn record_task_and_digest_replacement() {
+        let s = Store::open_memory().await.unwrap();
+        let a = s.insert_message(&incoming(1, false, "a")).await.unwrap();
+        s.insert_message(&incoming(2, true, "self")).await.unwrap();
+        assert_eq!(s.max_message_id(G).await.unwrap(), a + 1);
+        assert_eq!(s.max_message_id(2).await.unwrap(), 0);
+        assert_eq!(s.last_human_message(G).await.unwrap().unwrap().0, a);
+        assert_eq!(s.message(a).await.unwrap().unwrap().message_id, 1);
+
+        let turn = |text: &str, role, kind| Turn {
+            id: None,
+            role,
+            kind,
+            text: text.into(),
+            chunk_id: Some(3),
+        };
+        s.record_task(
+            G,
+            &turn("t", Role::User, TurnKind::Trigger),
+            &turn("ack\n[Goal]\ngoal", Role::Assistant, TurnKind::Response),
+            &[a],
+            &Usage::default(),
+            &new_run("r1"),
+        )
+        .await
+        .unwrap();
+        let turns = s.active_turns(G).await.unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            s.message(a).await.unwrap().unwrap().promoted_turn_id,
+            turns[0].id
+        );
+        assert_eq!(
+            s.worker_run("r1").await.unwrap().unwrap().status,
+            RunStatus::Queued
+        );
+
+        let c = s
+            .create_chunk(G, C, Timestamp::from_millisecond(1).unwrap(), "")
+            .await
+            .unwrap();
+        s.replace_with_digest(G, "digest", &[turns[0].id.unwrap()], &[c])
+            .await
+            .unwrap();
+        assert_eq!(s.latest_digest(G).await.unwrap().as_deref(), Some("digest"));
+        assert_eq!(s.active_turns(G).await.unwrap().len(), 1);
+        assert!(s.chunk(c).await.unwrap().unwrap().compacted);
     }
 
     #[tokio::test]

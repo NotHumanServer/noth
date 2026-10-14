@@ -59,6 +59,10 @@ impl Paths {
     pub fn logs_dir(&self) -> PathBuf {
         self.home.join("logs")
     }
+    /// Codex のトークンは更新のたびに書き換わるので、`.env` ではなくここに置く(security.md §5)
+    pub fn codex_auth(&self) -> PathBuf {
+        self.home.join("data").join("codex-auth.json")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +116,64 @@ pub struct RouterSection {
     pub conversation_window_secs: u64,
     #[serde(default)]
     pub thresholds: Thresholds,
+}
+
+/// `[worker]`。Core(同時実行数・timeout)と worker module(反復・出力上限)の両方が読む
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkerSettings {
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// キュー待ちの時間を含む。Ack は投稿済みなので、利用者が待つ時間の上限として扱う
+    #[serde(default = "default_worker_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+    #[serde(default = "default_tool_output_max_chars")]
+    pub tool_output_max_chars: usize,
+    #[serde(default = "default_approval")]
+    pub approval: String,
+    /// Ack を編集して tool の使用状況を見せるか
+    #[serde(default = "default_show_progress")]
+    pub show_progress: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactorSettings {
+    /// 人間の最終発言からの経過。Noth 自身の投稿ではアイドルを解除しない
+    #[serde(default = "default_idle_minutes")]
+    pub idle_minutes: u64,
+    #[serde(default = "default_keep_recent_turns")]
+    pub keep_recent_turns: usize,
+    #[serde(default = "default_digest_max_chars")]
+    pub digest_max_chars: usize,
+}
+
+fn default_max_concurrent() -> usize {
+    2
+}
+fn default_worker_timeout_secs() -> u64 {
+    600
+}
+fn default_max_iterations() -> u32 {
+    25
+}
+fn default_tool_output_max_chars() -> usize {
+    20_000
+}
+fn default_show_progress() -> bool {
+    true
+}
+fn default_approval() -> String {
+    "auto".into()
+}
+fn default_idle_minutes() -> u64 {
+    10
+}
+fn default_keep_recent_turns() -> usize {
+    6
+}
+fn default_digest_max_chars() -> usize {
+    12_000
 }
 
 /// 解決済みの設定。module 固有のセクションは `module_section` で生の TOML として渡す
@@ -183,6 +245,28 @@ impl Config {
             _ => self.table.get(module),
         };
         found
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()))
+    }
+
+    /// `[worker]` が無ければ既定値。無効な worker のセクションも読めるが、その値は `${VAR}` 未解決のことがある
+    pub fn worker_settings(&self) -> Result<WorkerSettings> {
+        self.module_section("worker")
+            .try_into()
+            .map_err(|e| Error::Config(format!("[worker]: {e}")))
+    }
+
+    pub fn compactor_settings(&self) -> Result<CompactorSettings> {
+        self.module_section("compactor")
+            .try_into()
+            .map_err(|e| Error::Config(format!("[compactor]: {e}")))
+    }
+
+    /// `[backend.<name>]`。tool module が `backend = "<name>"` で参照する
+    pub fn backend_section(&self, name: &str) -> toml::Value {
+        self.table
+            .get("backend")
+            .and_then(|v| v.get(name))
             .cloned()
             .unwrap_or_else(|| toml::Value::Table(toml::Table::new()))
     }
@@ -311,6 +395,9 @@ pub fn enabled_modules(paths: &Paths) -> Result<Vec<String>> {
 }
 
 /// cli.md §4.1 の表のとおり、参照されるセクションだけ `${VAR}` を解決する。残りは未解決のまま残す
+/// `[tool.web-*]` で backend を省略したときの既定値。tool 側の既定と揃える
+pub const DEFAULT_WEB_BACKEND: &str = "tinyfish";
+
 fn resolve_referenced(
     raw: &toml::Table,
     enabled: &[String],
@@ -359,13 +446,21 @@ fn resolve_referenced(
         }
     }
 
-    let backends: Vec<String> = raw
-        .get("tool")
-        .and_then(|t| t.as_table())
-        .into_iter()
-        .flatten()
-        .filter(|(name, _)| is_enabled(&format!("tool-{name}")))
-        .filter_map(|(_, v)| v.get("backend")?.as_str().map(str::to_owned))
+    // web 系 tool は `[tool.*]` が無くても既定の tinyfish を使うので、その場合も backend を参照されたものとして解決する
+    let backends: Vec<String> = enabled
+        .iter()
+        .filter_map(|m| m.strip_prefix("tool-"))
+        .filter_map(|name| {
+            match raw
+                .get("tool")
+                .and_then(|t| t.get(name))
+                .and_then(|v| v.get("backend"))
+            {
+                Some(b) => b.as_str().map(str::to_owned),
+                None if name.starts_with("web-") => Some(DEFAULT_WEB_BACKEND.to_owned()),
+                None => None,
+            }
+        })
         .collect();
     if let Some(toml::Value::Table(sections)) = out.get_mut("backend") {
         for (name, v) in sections.iter_mut() {
@@ -472,8 +567,14 @@ const TEMPLATE_CONFIG: &str = r##"[modules]
 enabled = [
   "channel-discord",
   "router-systemone",          # router はちょうど1つ
-  "provider-anthropic",        # provider はちょうど1つ
-  # worker / compactor / tool-* はまだ実装していない
+  "provider-anthropic",        # provider はちょうど1つ。本線と worker で共通
+  "worker",
+  "compactor",
+  "tool-web-search",
+  "tool-web-fetch",
+  # "tool-web-agent",
+  # 警告: tool-shell は Bot を動かすユーザーの権限で、サンドボックスなしにコマンドを実行する(security.md §4)
+  "tool-shell",
 ]
 
 [profile]
@@ -523,7 +624,34 @@ model     = "claude-opus-5-5"
 cache_ttl = "5m"                 # 5m | 1h
 effort    = "low"                # low | medium | high | xhigh | max。雑談は low で速く返す。変えると直後の1回はキャッシュが効かない
 
-# [worker] / [compactor] / [tool.*] / [backend.*] はまだ実装していない
+[worker]
+max_concurrent        = 2
+timeout_secs          = 600      # 待ち時間を含む
+max_iterations        = 25       # tool 呼び出しの反復上限
+tool_output_max_chars = 20000    # 各 tool の出力の文字数上限。超えた分は切り詰める
+approval              = "auto"   # MVP では auto のみ
+
+[compactor]
+idle_minutes      = 10           # 人間の最終発言からの経過。Noth 自身の投稿では解除しない
+keep_recent_turns = 6
+digest_max_chars  = 12000        # Layer 2 の上限。超えたら古いエピソードから削除する
+
+[tool.web-search]
+backend = "tinyfish"
+
+[tool.web-fetch]
+backend = "tinyfish"
+
+# 任意。有効にするには [modules] enabled に "tool-web-agent" を足す(このセクションは省略しても既定値で動く)
+# [tool.web-agent]
+# backend            = "tinyfish"
+# poll_interval_secs = 5
+
+# 警告: サンドボックスなし。cwd は run ごとの $NOTH_HOME/work/<run_id>/ だが、パスを辿れば外にも触れる
+[tool.shell]
+
+[backend.tinyfish]
+api_key = "${TINYFISH_API_KEY}"
 "##;
 
 const TEMPLATE_ENV: &str = "DISCORD_BOT_TOKEN=
@@ -533,6 +661,8 @@ TYPESAFE_API_KEY=
 # CF_API_TOKEN=
 # CF_ACCOUNT_ID=
 ANTHROPIC_API_KEY=
+# tool-web-search / tool-web-fetch / tool-web-agent の backend
+TINYFISH_API_KEY=
 ";
 
 const TEMPLATE_PROFILE: &str = r##"# キャラクター定義
@@ -807,6 +937,25 @@ api_key = "${{OTHER}}"
     }
 
     #[test]
+    fn web_tool_without_section_resolves_default_backend() {
+        let c = load(
+            &format!("{BASE}\n[backend.tinyfish]\napi_key = \"${{TF}}\"\n").replace(
+                "\"provider-anthropic\"",
+                "\"provider-anthropic\", \"tool-web-search\"",
+            ),
+            &format!("{ENV}TF=tf-key\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            c.backend_section("tinyfish")
+                .get("api_key")
+                .unwrap()
+                .as_str(),
+            Some("tf-key")
+        );
+    }
+
+    #[test]
     fn module_section_maps_names() {
         let c = load(
             &format!("{BASE}\n[tool.web-search]\nbackend = \"b\"\n[worker]\nmax_concurrent = 2\n"),
@@ -870,9 +1019,21 @@ api_key = "${{OTHER}}"
         let table: toml::Table = template_config().parse().unwrap();
         assert_eq!(table["context"]["max_tokens"].as_integer(), Some(2048));
         assert!(load(template_config(), "").is_err());
-        let filled = "DISCORD_BOT_TOKEN=a\nTYPESAFE_API_KEY=b\nANTHROPIC_API_KEY=d\n";
+        let filled =
+            "DISCORD_BOT_TOKEN=a\nTYPESAFE_API_KEY=b\nANTHROPIC_API_KEY=d\nTINYFISH_API_KEY=e\n";
         let c = load(template_config(), filled).unwrap();
         assert!(c.is_enabled("router-systemone"));
+        for m in [
+            "worker",
+            "compactor",
+            "tool-web-search",
+            "tool-web-fetch",
+            "tool-shell",
+        ] {
+            assert!(c.is_enabled(m), "{m}");
+        }
+        assert!(!c.is_enabled("tool-web-agent"));
+        assert!(template_config().contains("サンドボックス"));
         // template_env の変数名はすべて .env に書ける形式
         assert!(
             template_env()

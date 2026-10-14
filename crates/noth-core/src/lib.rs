@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod approval;
 pub mod bus;
 pub mod config;
 pub mod error;
@@ -6,6 +7,7 @@ pub mod heartbeat;
 pub mod ingest;
 pub mod judge;
 pub mod layers;
+pub mod progress;
 pub mod registry;
 pub mod restore;
 pub mod store;

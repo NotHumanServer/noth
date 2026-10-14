@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::traits::{Channel, Provider, Router};
+use crate::traits::{Channel, Compactor, Provider, Router, Tool, Worker};
 use crate::{Error, Result};
 
 pub struct ModuleCtx<'a> {
@@ -15,6 +15,16 @@ pub struct ModuleCtx<'a> {
 pub type ChannelFactory = fn(&ModuleCtx) -> Result<Arc<dyn Channel>>;
 pub type RouterFactory = fn(&ModuleCtx) -> Result<Arc<dyn Router>>;
 pub type ProviderFactory = fn(&ModuleCtx) -> Result<Arc<dyn Provider>>;
+pub type ToolFactory = fn(&ModuleCtx) -> Result<Arc<dyn Tool>>;
+/// 本線と同一 provider・同一 tool 定義で動かすため、Core が組み立てたものを受け取る(caching.md §2)
+pub type WorkerFactory = fn(&ModuleCtx, WorkerDeps) -> Result<Arc<dyn Worker>>;
+pub type CompactorFactory = fn(&ModuleCtx, Arc<dyn Provider>) -> Result<Arc<dyn Compactor>>;
+
+pub struct WorkerDeps {
+    pub provider: Arc<dyn Provider>,
+    /// KNOWN_MODULES の順に並ぶ。tool 定義の順序を毎回同じにしてキャッシュを保つため
+    pub tools: Vec<Arc<dyn Tool>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleKind {
@@ -54,14 +64,21 @@ pub struct Registry {
     channels: BTreeMap<&'static str, ChannelFactory>,
     routers: BTreeMap<&'static str, RouterFactory>,
     providers: BTreeMap<&'static str, ProviderFactory>,
+    tools: BTreeMap<&'static str, ToolFactory>,
+    worker: Option<WorkerFactory>,
+    compactor: Option<CompactorFactory>,
 }
 
 pub struct Modules {
     pub channel: Arc<dyn Channel>,
     pub router: Arc<dyn Router>,
     pub provider: Arc<dyn Provider>,
-    pub worker_enabled: bool,
-    pub compactor_enabled: bool,
+    /// None なら spawn_task を reply_only に読み替え、本線に tool 定義を渡さない
+    pub worker: Option<Arc<dyn Worker>>,
+    /// None ならハード上限超過時に古い TopicChunk を要約せず破棄する
+    pub compactor: Option<Arc<dyn Compactor>>,
+    /// `noth doctor` の疎通確認用。worker が None でも有効な tool は入る
+    pub tools: Vec<(&'static str, Arc<dyn Tool>)>,
 }
 
 impl Registry {
@@ -74,11 +91,23 @@ impl Registry {
     pub fn register_provider(&mut self, name: &'static str, f: ProviderFactory) {
         self.providers.insert(name, f);
     }
+    pub fn register_tool(&mut self, name: &'static str, f: ToolFactory) {
+        self.tools.insert(name, f);
+    }
+    pub fn register_worker(&mut self, f: WorkerFactory) {
+        self.worker = Some(f);
+    }
+    pub fn register_compactor(&mut self, f: CompactorFactory) {
+        self.compactor = Some(f);
+    }
 
     pub fn is_built_in(&self, name: &str) -> bool {
         self.channels.contains_key(name)
             || self.routers.contains_key(name)
             || self.providers.contains_key(name)
+            || self.tools.contains_key(name)
+            || (name == "worker" && self.worker.is_some())
+            || (name == "compactor" && self.compactor.is_some())
     }
 
     pub fn validate(&self, config: &Config) -> Result<()> {
@@ -110,12 +139,7 @@ impl Registry {
             ));
         }
         for name in enabled {
-            let implemented = self.is_built_in(name);
-            let optional = matches!(
-                kind_of(name),
-                Some(ModuleKind::Worker | ModuleKind::Compactor | ModuleKind::Tool)
-            );
-            if !implemented && !optional {
+            if !self.is_built_in(name) {
                 return Err(Error::Config(format!(
                     "module `{name}` はこのバイナリに組み込まれていません"
                 )));
@@ -152,13 +176,37 @@ impl Registry {
             .providers
             .get_key_value(pick(ModuleKind::Provider).as_str())
             .expect("validated");
+        let provider = pf(&ctx(pname))?;
+        let mut tools = Vec::new();
+        for (name, kind) in KNOWN_MODULES {
+            if *kind == ModuleKind::Tool && config.is_enabled(name) {
+                let (n, f) = self.tools.get_key_value(name).expect("validated");
+                tools.push((*n, f(&ctx(n))?));
+            }
+        }
+        let worker = match self.worker {
+            Some(f) if config.is_enabled("worker") => Some(f(
+                &ctx("worker"),
+                WorkerDeps {
+                    provider: provider.clone(),
+                    tools: tools.iter().map(|(_, t)| t.clone()).collect(),
+                },
+            )?),
+            _ => None,
+        };
+        let compactor = match self.compactor {
+            Some(f) if config.is_enabled("compactor") => {
+                Some(f(&ctx("compactor"), provider.clone())?)
+            }
+            _ => None,
+        };
         Ok(Modules {
             channel: cf(&ctx(cname))?,
             router: rf(&ctx(rname))?,
-            provider: pf(&ctx(pname))?,
-            // worker / compactor はまだ実装していないので、有効にしても無効時の動作を取る
-            worker_enabled: false,
-            compactor_enabled: false,
+            provider,
+            worker,
+            compactor,
+            tools,
         })
     }
 }

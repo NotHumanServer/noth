@@ -14,6 +14,7 @@ pub const KEY_NOISE: &str = "is_noise_or_meme";
 pub const KEY_TOPIC_SHIFT: &str = "is_topic_shift";
 pub const KEY_ACTION: &str = "intervention_action";
 pub const KEY_TASK_CATEGORY: &str = "task_category";
+pub const KEY_DELIVERY: &str = "delivery_style";
 
 /// `is_noise_or_meme` など固定の質問の数。候補チャンクの上限は `max_questions() - FIXED_QUESTIONS`
 pub const FIXED_QUESTIONS: usize = 4;
@@ -37,7 +38,7 @@ pub struct PendingMessage {
     pub author_name: String,
     pub content: String,
     pub at: Timestamp,
-    /// messages テーブルには無いので、再起動で復元した分は false
+    /// 再起動で復元した分も messages に保存した値を使うので、名指しへの応答は失われない
     pub mentions_self: bool,
     pub reply_to_self: bool,
 }
@@ -58,6 +59,28 @@ impl Action {
         }
     }
 }
+
+/// Worker 合流時の報告の仕方(§4.3)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStyle {
+    NormalReport,
+    BriefSupplement,
+    ReplyAnchor,
+    Abort,
+}
+
+impl DeliveryStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NormalReport => "normal_report",
+            Self::BriefSupplement => "brief_supplement",
+            Self::ReplyAnchor => "reply_anchor",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+const DELIVERY_STYLES: [&str; 4] = ["normal_report", "brief_supplement", "reply_anchor", "abort"];
 
 const ACTIONS: [&str; 3] = ["silent", "reply_only", "spawn_task"];
 const CATEGORIES: [&str; 4] = ["none", "web_research", "fact_check", "code_or_tool"];
@@ -170,6 +193,98 @@ pub fn build_questions(candidates: &[ChunkRow]) -> Vec<(String, Question)> {
         ));
     }
     qs
+}
+
+pub fn join_questions() -> Vec<(String, Question)> {
+    vec![(
+        KEY_DELIVERY.to_string(),
+        Question::Choice {
+            instructions: "Noth はメンバーに頼まれた調べものや作業を背景で進めていて、それが終わりました。\
+                task は依頼の内容(goal)と結果です。result が concluded なら memo は結論メモ、failed なら memo は失敗の理由です。\
+                since_fork は作業を始めてから今までに届いた全チャンネルの発言で、is_self が true のものは Noth 自身の発言です。\
+                since_fork を読んで、この結果をどう伝えるかを選んでください。\
+                依頼した人たちが自分で答えにたどり着いた、または別の人が答えたなど、人間側で自己解決しているなら brief_supplement です。\
+                task.channel の会話がすでに別の話題に移っていて、普通に報告すると流れを遮るなら reply_anchor です。\
+                依頼が取り消された、もう誰も気にしていない、結果に伝える価値がないなら abort です。\
+                調べられなかった(failed)ことも、依頼した人が答えを待っているなら伝える価値があります。\
+                どれにも当たらず、会話がまだその話題の上にあるなら normal_report です。"
+                .into(),
+            criteria: vec![
+                ("normal_report".into(), "会話の流れの中で結果を普通に報告する".into()),
+                ("brief_supplement".into(), "人間側で自己解決しているので、補足として短く伝える".into()),
+                ("reply_anchor".into(), "話題が移っているので、元の依頼へのリプライとして報告する".into()),
+                ("abort".into(), "報告しない".into()),
+            ],
+        },
+    )]
+}
+
+/// Join の判定材料。`concluded` が false なら memo は失敗理由
+pub struct JoinInput<'a> {
+    pub run_id: &'a str,
+    pub goal: &'a str,
+    pub channel: &'a str,
+    pub concluded: bool,
+    pub memo: &'a str,
+    pub since_fork: &'a [MessageRow],
+}
+
+/// `state_max_chars` を超える間は since_fork の古い発言から捨て、それでも超えるなら memo を削る
+pub fn build_join_state(input: &JoinInput, cfg: &RouterSection) -> RouterState {
+    let since_fork: Vec<Value> = input
+        .since_fork
+        .iter()
+        .map(|r| {
+            json!({
+                "channel_id": r.channel_id.to_string(),
+                "channel": r.channel_name,
+                "author": r.author_name,
+                "content": r.content,
+                "at": rfc3339(r.created_at),
+                "is_self": r.is_self,
+            })
+        })
+        .collect();
+    let mut state = json!({
+        "task": {
+            "run_id": input.run_id,
+            "goal": input.goal,
+            "channel": input.channel,
+            "result": if input.concluded { "concluded" } else { "failed" },
+            "memo": input.memo,
+        },
+        "since_fork": since_fork,
+    });
+    while char_len(&state) > cfg.state_max_chars {
+        let items = state["since_fork"]
+            .as_array_mut()
+            .expect("since_fork は配列");
+        if items.is_empty() {
+            break;
+        }
+        items.remove(0);
+    }
+    for field in ["memo", "goal"] {
+        let excess = char_len(&state).saturating_sub(cfg.state_max_chars);
+        if excess == 0 {
+            break;
+        }
+        let text = state["task"][field].as_str().unwrap_or_default();
+        let keep = text.chars().count().saturating_sub(excess);
+        let shortened: String = text.chars().take(keep).collect();
+        state["task"][field] = Value::String(shortened);
+    }
+    RouterState(state)
+}
+
+/// 回答が無い・confidence が足りないときは abort。報告しないのが安全側(§4)
+pub fn binarize_delivery(decision: &Decision, min_confidence: f32) -> DeliveryStyle {
+    match pick_choice(decision, KEY_DELIVERY, &DELIVERY_STYLES, min_confidence).as_deref() {
+        Some("normal_report") => DeliveryStyle::NormalReport,
+        Some("brief_supplement") => DeliveryStyle::BriefSupplement,
+        Some("reply_anchor") => DeliveryStyle::ReplyAnchor,
+        _ => DeliveryStyle::Abort,
+    }
 }
 
 fn rfc3339(ts: Timestamp) -> String {
@@ -503,6 +618,43 @@ mod tests {
     fn missing_answers_are_safe() {
         let b = binarize(&decision(vec![]), &[1], &Thresholds::default(), false);
         assert_eq!(b, Binarized::safe());
+    }
+
+    #[test]
+    fn delivery_style_falls_back_to_abort() {
+        let d = decision(vec![(
+            KEY_DELIVERY,
+            choice("reply_anchor", 0.9, 0.9, &DELIVERY_STYLES),
+        )]);
+        assert_eq!(binarize_delivery(&d, 0.15), DeliveryStyle::ReplyAnchor);
+        let low = decision(vec![(
+            KEY_DELIVERY,
+            choice("reply_anchor", 0.9, 0.05, &DELIVERY_STYLES),
+        )]);
+        assert_eq!(binarize_delivery(&low, 0.15), DeliveryStyle::Abort);
+        assert_eq!(
+            binarize_delivery(&decision(vec![]), 0.15),
+            DeliveryStyle::Abort
+        );
+    }
+
+    #[test]
+    fn join_state_fits_max_chars() {
+        let cfg = RouterSection {
+            state_max_chars: 400,
+            ..serde_json::from_value(json!({})).unwrap()
+        };
+        let input = JoinInput {
+            run_id: "r1",
+            goal: "天気",
+            channel: "general",
+            concluded: true,
+            memo: &"あ".repeat(2_000),
+            since_fork: &[],
+        };
+        let state = build_join_state(&input, &cfg);
+        assert!(char_len(&state.0) <= 400);
+        assert_eq!(state.0["task"]["result"], "concluded");
     }
 
     #[test]
