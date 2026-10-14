@@ -1,0 +1,404 @@
+use noth_core::traits::{Completion, LayeredPrompt};
+use noth_core::types::{CompletionParams, Role, ToolCall, Turn, Usage};
+use noth_core::{Error, Result};
+use serde_json::{Value, json};
+
+/// 先頭が assistant になるとき API が弾くため補う
+const OMITTED_NOTICE: &str = "[以前の会話は省略されています]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+impl CacheTtl {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "5m" => Ok(Self::FiveMinutes),
+            "1h" => Ok(Self::OneHour),
+            other => Err(Error::Config(format!(
+                "provider.anthropic: cache_ttl は \"5m\" か \"1h\" で指定してください(`{other}` が指定されています)"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
+
+    fn cache_control(self) -> Value {
+        json!({"type": "ephemeral", "ttl": self.as_str()})
+    }
+}
+
+/// 省略時はモデルの既定値(Sonnet 5.5 は high)になる。未知の値を API に投げて実行時に 400 で気づくより、起動時に弾く
+pub fn parse_effort(s: &str) -> Result<&'static str> {
+    match s {
+        "low" => Ok("low"),
+        "medium" => Ok("medium"),
+        "high" => Ok("high"),
+        "xhigh" => Ok("xhigh"),
+        "max" => Ok("max"),
+        other => Err(Error::Config(format!(
+            "provider.anthropic: effort は low / medium / high / xhigh / max のどれかで指定してください(`{other}` が指定されています)"
+        ))),
+    }
+}
+
+fn text_block(text: &str) -> Value {
+    json!({"type": "text", "text": text})
+}
+
+fn role_str(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
+struct Message {
+    role: Role,
+    blocks: Vec<Value>,
+}
+
+/// 連続する同 role のターンは1メッセージの複数 block に畳む。追加した block の位置を返す
+fn push_turn(messages: &mut Vec<Message>, turn: &Turn) -> Option<(usize, usize)> {
+    // 空 text の block は API が拒否する
+    if turn.text.is_empty() {
+        return None;
+    }
+    match messages.last_mut() {
+        Some(m) if m.role == turn.role => m.blocks.push(text_block(&turn.text)),
+        _ => messages.push(Message {
+            role: turn.role,
+            blocks: vec![text_block(&turn.text)],
+        }),
+    }
+    let mi = messages.len() - 1;
+    Some((mi, messages[mi].blocks.len() - 1))
+}
+
+pub fn build_request(
+    model: &str,
+    prompt: &LayeredPrompt,
+    params: &CompletionParams,
+    ttl: CacheTtl,
+) -> Result<Value> {
+    let mut system = vec![text_block(&format!(
+        "{}\n\n{}",
+        prompt.harness_rules, prompt.profile
+    ))];
+    system[0]["cache_control"] = ttl.cache_control();
+    if !prompt.episodic_digest.is_empty() {
+        let mut block = text_block(&prompt.episodic_digest);
+        block["cache_control"] = ttl.cache_control();
+        system.push(block);
+    }
+
+    let mut messages: Vec<Message> = Vec::new();
+    let mut layer3_end = None;
+    for turn in &prompt.active_log {
+        layer3_end = push_turn(&mut messages, turn).or(layer3_end);
+    }
+    for turn in &prompt.ephemeral_tail {
+        push_turn(&mut messages, turn);
+    }
+
+    match messages.last() {
+        None => return Err(Error::Other("anthropic: messages is empty".into())),
+        Some(m) if m.role != Role::User => {
+            return Err(Error::Other(
+                "anthropic: 最後のメッセージが user ではありません".into(),
+            ));
+        }
+        Some(_) => {}
+    }
+    if let Some((mi, bi)) = layer3_end {
+        messages[mi].blocks[bi]["cache_control"] = ttl.cache_control();
+    }
+    if messages[0].role == Role::Assistant {
+        messages.insert(
+            0,
+            Message {
+                role: Role::User,
+                blocks: vec![text_block(OMITTED_NOTICE)],
+            },
+        );
+    }
+
+    let messages: Vec<Value> = messages
+        .into_iter()
+        .map(|m| json!({"role": role_str(m.role), "content": m.blocks}))
+        .collect();
+    let mut body = json!({
+        "model": model,
+        "max_tokens": params.max_tokens,
+        "system": system,
+        "messages": messages,
+    });
+    if !prompt.tools.is_empty() {
+        body["tools"] = prompt
+            .tools
+            .iter()
+            .map(|t| json!({"name": t.name, "description": t.description, "input_schema": t.input_schema}))
+            .collect();
+    }
+    Ok(body)
+}
+
+pub fn parse_response(resp: &Value) -> Result<Completion> {
+    let blocks = resp
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Other("anthropic: response has no content array".into()))?;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for b in blocks {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let t = b.get("text").and_then(Value::as_str).unwrap_or_default();
+                if !t.trim().is_empty() {
+                    text.push_str(t);
+                }
+            }
+            Some("tool_use") => {
+                let field = |k: &str| {
+                    b.get(k).ok_or_else(|| {
+                        Error::Other(format!("anthropic: tool_use ブロックに `{k}` がありません"))
+                    })
+                };
+                tool_calls.push(ToolCall {
+                    id: field("id")?.as_str().unwrap_or_default().to_string(),
+                    name: field("name")?.as_str().unwrap_or_default().to_string(),
+                    input: field("input")?.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    if let Some(reason) = resp.get("stop_reason").and_then(Value::as_str) {
+        if matches!(reason, "max_tokens" | "refusal") {
+            tracing::warn!(
+                stop_reason = reason,
+                "anthropic の応答が正常終了ではありません"
+            );
+        } else {
+            tracing::debug!(stop_reason = reason, "anthropic completion");
+        }
+    }
+
+    let u = |k: &str| {
+        resp.pointer(&format!("/usage/{k}"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cache_read = u("cache_read_input_tokens");
+    // input_tokens はキャッシュ分を含まないため、プロンプト全体の上限判定用に合算する
+    let usage = Usage {
+        input_tokens: u("input_tokens") + cache_read + u("cache_creation_input_tokens"),
+        cached_tokens: cache_read,
+        output_tokens: u("output_tokens"),
+    };
+    Ok(Completion {
+        text: (!text.is_empty()).then_some(text),
+        tool_calls,
+        usage,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use noth_core::types::{ToolSpec, TurnKind};
+
+    use super::*;
+
+    fn turn(role: Role, text: &str) -> Turn {
+        Turn {
+            id: None,
+            role,
+            kind: TurnKind::Buffer,
+            text: text.into(),
+            chunk_id: None,
+        }
+    }
+
+    fn prompt() -> LayeredPrompt {
+        LayeredPrompt {
+            harness_rules: "rules".into(),
+            profile: "profile".into(),
+            episodic_digest: "digest".into(),
+            active_log: vec![turn(Role::User, "a"), turn(Role::Assistant, "b")],
+            ephemeral_tail: vec![turn(Role::User, "c")],
+            tools: vec![],
+        }
+    }
+
+    fn params() -> CompletionParams {
+        CompletionParams { max_tokens: 100 }
+    }
+
+    fn count_cache_controls(v: &Value) -> usize {
+        match v {
+            Value::Object(m) => {
+                usize::from(m.contains_key("cache_control"))
+                    + m.values().map(count_cache_controls).sum::<usize>()
+            }
+            Value::Array(a) => a.iter().map(count_cache_controls).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn system_blocks_and_breakpoints() {
+        let body = build_request("m", &prompt(), &params(), CacheTtl::OneHour).unwrap();
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2);
+        assert_eq!(sys[0]["text"], "rules\n\nprofile");
+        assert_eq!(
+            sys[0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(sys[1]["text"], "digest");
+        assert_eq!(sys[1]["cache_control"]["ttl"], "1h");
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(msgs[2]["content"][0].get("cache_control").is_none());
+        assert_eq!(count_cache_controls(&body), 3);
+        assert_eq!(body["max_tokens"], 100);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn empty_digest_gives_one_system_block() {
+        let mut p = prompt();
+        p.episodic_digest.clear();
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        assert_eq!(body["system"].as_array().unwrap().len(), 1);
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "5m");
+        assert_eq!(count_cache_controls(&body), 2);
+    }
+
+    #[test]
+    fn consecutive_users_are_merged_and_breakpoint_is_last_layer3_block() {
+        let mut p = prompt();
+        p.active_log = vec![turn(Role::User, "a"), turn(Role::User, "b")];
+        p.ephemeral_tail = vec![turn(Role::User, "c")];
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert!(content[0].get("cache_control").is_none());
+        assert!(content[1].get("cache_control").is_some());
+        assert!(content[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn empty_layer3_has_no_message_breakpoint() {
+        let mut p = prompt();
+        p.active_log.clear();
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        assert_eq!(count_cache_controls(&body["messages"]), 0);
+        assert_eq!(count_cache_controls(&body), 2);
+    }
+
+    #[test]
+    fn leading_assistant_gets_notice() {
+        let mut p = prompt();
+        p.active_log = vec![turn(Role::Assistant, "b")];
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["text"], OMITTED_NOTICE);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[2]["role"], "user");
+    }
+
+    #[test]
+    fn last_not_user_is_error() {
+        let mut p = prompt();
+        p.ephemeral_tail.clear();
+        assert!(build_request("m", &p, &params(), CacheTtl::FiveMinutes).is_err());
+        p.active_log.clear();
+        assert!(build_request("m", &p, &params(), CacheTtl::FiveMinutes).is_err());
+    }
+
+    #[test]
+    fn tools_are_passed_through() {
+        let mut p = prompt();
+        p.tools = vec![ToolSpec {
+            name: "t".into(),
+            description: "d".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        assert_eq!(body["tools"][0]["name"], "t");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn parses_text_tool_use_and_usage() {
+        let resp = json!({
+            "content": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+                {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {"q": "x"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 30,
+                "output_tokens": 5
+            }
+        });
+        let c = parse_response(&resp).unwrap();
+        assert_eq!(c.text.as_deref(), Some("hello world"));
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].id, "toolu_1");
+        assert_eq!(c.tool_calls[0].input, json!({"q": "x"}));
+        assert_eq!(
+            c.usage,
+            Usage {
+                input_tokens: 240,
+                cached_tokens: 200,
+                output_tokens: 5
+            }
+        );
+    }
+
+    #[test]
+    fn no_text_gives_none() {
+        let resp = json!({"content": [], "usage": {"input_tokens": 1, "output_tokens": 0}});
+        let c = parse_response(&resp).unwrap();
+        assert!(c.text.is_none());
+        assert_eq!(c.usage.cached_tokens, 0);
+    }
+
+    #[test]
+    fn whitespace_only_text_is_skipped() {
+        let resp = json!({"content": [{"type":"text","text":" \n"}], "usage": {}});
+        assert!(parse_response(&resp).unwrap().text.is_none());
+    }
+
+    #[test]
+    fn cache_ttl_rejects_unknown() {
+        assert!(CacheTtl::parse("5m").is_ok());
+        assert!(CacheTtl::parse("1h").is_ok());
+        assert!(matches!(CacheTtl::parse("10m"), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn effort_values() {
+        assert_eq!(parse_effort("low").unwrap(), "low");
+        assert_eq!(parse_effort("max").unwrap(), "max");
+        assert!(parse_effort("adaptive").is_err());
+        assert!(parse_effort("LOW").is_err());
+    }
+}
