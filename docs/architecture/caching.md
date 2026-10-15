@@ -6,7 +6,7 @@
 
 | provider | Layer 0〜2 | Layer 3 / 4 | キャッシュ |
 |---|---|---|---|
-| anthropic | `system` ブロック。Layer 1 末尾と Layer 2 末尾に `cache_control` | `messages`。Layer 3 末尾に `cache_control` | 明示ブレークポイント3つ(上限4。トップレベルの自動キャッシュ指定は使わない)。TTL は `cache_ttl` 設定(`5m` 既定 / `1h`) |
+| anthropic | `system` ブロック。Layer 1 末尾と Layer 2 末尾に `cache_control`(Layer 1.5 は Layer 2 と同じブロックの先頭) | `messages`。Layer 3 末尾に `cache_control` | 明示ブレークポイント3つ(上限4。トップレベルの自動キャッシュ指定は使わない)。TTL は `cache_ttl` 設定(`5m` 既定 / `1h`) |
 | openai | `system` メッセージ(結合するか、2つのメッセージに分ける) | `messages` | 自動プレフィックスキャッシュに任せる。明示的なキャッシュ指定はしない。互換サーバーでは機能しないこともある |
 | google | `systemInstruction` | `contents` | implicit caching に任せる。明示的なキャッシュ指定はしない(explicit caching は Gemini 4 Argon 以降で非対応のため使わない) |
 

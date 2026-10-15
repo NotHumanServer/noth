@@ -148,7 +148,11 @@ $NOTH_HOME/
 ├── config.toml           # 設定本体
 ├── .env                  # シークレット(API キー、Bot トークン)
 ├── profiles/
-│   └── default.md        # Layer 1 のキャラクター定義
+│   ├── default.md        # Layer 1 のキャラクター定義
+│   └── memory/
+│       ├── MEMORY.md     # Layer 1.5 の長期記憶。手で編集してもよい
+│       └── daily/
+│           └── YYYY-MM-DD.md  # Dreaming が書く日次レポート
 ├── data/
 │   └── noth.sqlite       # 全 guild 共通。各テーブルが guild_id を持つ
 ├── work/
@@ -206,7 +210,7 @@ debounce_secs = 2.0
 [router]
 recent_messages  = 30            # state.recent に入れる直近発言数
 state_max_chars  = 24000         # state 全体の文字数上限。Clef-flash(24,576 tokens)では保守的に
-candidate_chunks = 32            # 関連判定にかける候補 TopicChunk の数(上限は max_questions - 5)
+candidate_chunks = 32            # 関連判定にかける候補 TopicChunk の数(上限は max_questions - 6)
 call_names       = ["noth", "ノス", "のす"]  # 本文でこう呼ばれたら min_confidence を無視して router の判定に従う
 conversation_window_secs = 120  # Noth が応答してからこの秒数は、話していた相手の発言を呼び名と同じ扱いにする
 
@@ -216,6 +220,7 @@ is_topic_shift   = 0.6
 relevant_chunk   = 0.5
 min_confidence   = 0.15
 name_call_reply  = 0.25  # 呼び名で呼ばれたとき、reply_only と spawn_task の確率の合計がこれ以上なら応答する
+addressed_to_noth = 0.6  # 「Noth に向けた発言か」がこれ以上なら、静観を返答に引き上げる
 
 # router が選べる絵文字リアクション。話すほどではないが気になる発言に付ける。
 # 省略時は次の 8 種。`reactions = []` でリアクションしなくなる。`<:name:id>` のカスタム絵文字も使える
@@ -295,6 +300,14 @@ show_progress         = true     # Ack を編集して、Worker が使った too
 idle_minutes      = 10           # 人間の最終発言からの経過。Noth 自身の投稿では解除しない
 keep_recent_turns = 6
 digest_max_chars  = 12000        # Layer 2 の上限。超えたら古いエピソードから削除する
+
+[memory]                          # 長期記憶 MEMORY.md(Layer 1.5)と Dreaming
+memo               = true         # 本線の [Memo] 行を MEMORY.md に追記する
+memo_max_per_reply = 3
+memory_max_chars   = 6000         # 超えている間は [Memo] を追記しない。Dreaming がこの長さに整理する
+dreaming           = true         # compactor module が必要
+dreaming_hour      = 4            # ローカル時刻。この時刻を過ぎた最初のアイドルで前日分を処理する
+dream_input_max_chars = 60000     # 日次レポートに渡す発言ログの上限
 
 [tool.web-search]
 backend = "tinyfish"
