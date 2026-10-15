@@ -290,7 +290,7 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-/// Worker の tool 往復。Layer 4 の後ろに積み、本線の Layer 3 には入れない
+/// Worker の tool 往復。Layer 4 の後ろに積み、main の Layer 3 には入れない
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExchangeItem {
     Assistant {

@@ -143,7 +143,7 @@ pub enum CostGroup {
     Purpose,
     /// ローカル時刻の日付(YYYY-MM-DD)
     Day,
-    /// run_id の無い呼び出し(本線など)はキー `-` にまとめる
+    /// run_id の無い呼び出し(main など)はキー `-` にまとめる
     Run,
 }
 

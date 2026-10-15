@@ -50,7 +50,7 @@ pub fn template() -> String {
     TEMPLATE.to_string()
 }
 
-/// 本線の応答に書かれた長期記憶への追記指示
+/// main の応答に書かれた長期記憶への追記指示
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memo {
     /// `[Memo <名前>]` の名前。メンバーについての事実のとき

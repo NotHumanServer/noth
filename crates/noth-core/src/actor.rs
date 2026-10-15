@@ -27,7 +27,7 @@ use crate::{Error, Result, bus, heartbeat, ingest, memory, progress, restore, su
 
 /// typing インジケータは Discord 側で約 10 秒で消えるので、それより短い間隔で再送する
 const TYPING_INTERVAL: Duration = Duration::from_secs(8);
-/// 委譲しなかったmain の応答をログに出すときの先頭の文字数
+/// 委譲しなかった main の応答をログに出すときの先頭の文字数
 const MISMATCH_HEAD_CHARS: usize = 60;
 /// Core が依頼を作った(main が Goal を書かなかった)ときの Ack の代わり
 const ACK_REACTION: &str = "👀";
@@ -45,7 +45,7 @@ const PROGRESS_FINAL_WAIT: Duration = Duration::from_secs(10);
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// 本線 actor が 1 つずつ処理する仕事(§2.1)
+/// main actor が 1 つずつ処理する仕事(§2.1)
 #[derive(Debug)]
 pub enum Job {
     Judge(JudgeBatch),
@@ -214,7 +214,7 @@ pub struct Actor {
     compaction: Option<(Arc<dyn Compactor>, CompactorSettings)>,
     /// compactor が無効でも緊急時の切り詰めで使う
     keep_recent_turns: usize,
-    /// worker 有効時に起動時の 1 回だけ取る。呼び出しごとに変わると本線と Worker のキャッシュが外れる
+    /// worker 有効時に起動時の 1 回だけ取る。呼び出しごとに変わると main と Worker のキャッシュが外れる
     tools: Vec<ToolSpec>,
     /// Join を送るため。Worker の task にも複製して渡す
     jobs: mpsc::UnboundedSender<Job>,
@@ -227,7 +227,7 @@ pub struct Actor {
     /// コンパクションを済ませたアイドル期間。新しい人間の発言が来るまで次を積まない
     compacted_for: Option<i64>,
     harness_rules: String,
-    /// Compactor に渡す規約。Worker の節を含めない(要約に Ack や Goal を書かせない)。Layer 1 も入れないので本線とキャッシュは共有しない
+    /// Compactor に渡す規約。Worker の節を含めない(要約に Ack や Goal を書かせない)。Layer 1 も入れないので main とキャッシュは共有しない
     compactor_rules: String,
     profile: String,
     /// Layer 1.5。起動時とコンパクション後だけ読み直す。[Memo] の追記では更新しない(Layer 1.5 以降のキャッシュが全て外れるため)
@@ -238,7 +238,7 @@ pub struct Actor {
     channel_names: HashMap<ChannelId, String>,
     /// チャンネルごとに、Noth が最後に応答した時刻とそのとき話しかけてきた人。再起動で消えてよい一時的な手がかり
     conversations: HashMap<ChannelId, (Timestamp, HashSet<String>)>,
-    /// チャンネルと種別ごとの、provider 失敗を最後に投稿した時刻。Join の失敗が本線の失敗に隠れないよう種別を分ける
+    /// チャンネルと種別ごとの、provider 失敗を最後に投稿した時刻。Join の失敗が main の失敗に隠れないよう種別を分ける
     error_posted: HashMap<(ChannelId, FailureKind), Instant>,
     typing_interval: Duration,
     progress_interval: Duration,
@@ -723,7 +723,7 @@ impl Actor {
             return Ok(());
         }
 
-        // [Memo] だけの応答は何も投稿しないが、覚えた事実をmain が次のターンから知っているよう Layer 3 には残す
+        // [Memo] だけの応答は何も投稿しないが、覚えた事実を main が次のターンから知っているよう Layer 3 には残す
         if !silent_reply {
             self.note_conversation(batch);
         }
@@ -864,7 +864,7 @@ impl Actor {
             fork_message_id: self.store.max_message_id(guild).await?,
         };
         // 進捗の追記は Discord 上の見た目だけで、Layer 3 には Ack + Goal だけを残す。
-        // 進捗は tool 実行の生ログに当たるので本線に入れず(設計原則 2)、編集のたびに Layer 3 を書き換えてキャッシュを外さないため
+        // 進捗は tool 実行の生ログに当たるので main に入れず(設計原則 2)、編集のたびに Layer 3 を書き換えてキャッシュを外さないため
         self.store
             .record_task(
                 guild,
@@ -877,7 +877,7 @@ impl Actor {
             .await?;
         self.record_memos(&plan.memos).await;
         tracing::info!(run_id = %run.run_id, origin = run.origin.as_str(), "Worker を起動します");
-        // Worker の base も本線と同じ上限に収めるため、Fork より前に緊急コンパクションを済ませる
+        // Worker の base も main と同じ上限に収めるため、Fork より前に緊急コンパクションを済ませる
         self.enforce_hard_limit(chunk_id).await?;
 
         let base = self.prompt(self.store.active_turns(guild).await?, Vec::new());
@@ -946,7 +946,7 @@ impl Actor {
         })
     }
 
-    /// 本線の Layer 0〜3 と tool 定義を複製して Worker をバックグラウンドで動かし、終わったら Join を積む
+    /// main の Layer 0〜3 と tool 定義を複製して Worker をバックグラウンドで動かし、終わったら Join を積む
     fn fork(
         &mut self,
         run: NewWorkerRun,
@@ -1184,7 +1184,7 @@ impl Actor {
                     )
                     .await?;
             }
-            // 報告できなくても結論メモだけは Layer 3 に残す。Ack で待たせているので、次に本線が話すときに
+            // 報告できなくても結論メモだけは Layer 3 に残す。Ack で待たせているので、次に main が話すときに
             // 結果を踏まえられるようにするため。投稿していない応答は残さない(言っていないことを言ったと思わせない)
             // usage の無い追記なので、上限の判定は次に usage を書いたときに回す
             _ => {
@@ -1496,7 +1496,7 @@ impl Actor {
         completion
     }
 
-    /// 利用者に失敗を知らせる。Layer 3 には残さない(言っていないことや失敗の記録を本線に覚えさせない)。
+    /// 利用者に失敗を知らせる。Layer 3 には残さない(言っていないことや失敗の記録を main に覚えさせない)。
     /// 投稿の失敗は握りつぶす。知らせる手段がもう無い
     async fn report_provider_failure(
         &mut self,

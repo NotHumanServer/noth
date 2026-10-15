@@ -96,7 +96,7 @@ pub struct ContextSection {
     pub prompt_hard_limit_tokens: u64,
     #[serde(default = "default_retry_max")]
     pub retry_max: u32,
-    /// 本線の 1 応答の max_tokens
+    /// main の 1 応答の max_tokens
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
 }
@@ -743,7 +743,7 @@ const TEMPLATE_CONFIG: &str = r##"[modules]
 enabled = [
   "channel-discord",
   "router-systemone",          # router はちょうど1つ
-  "provider-anthropic",        # provider はちょうど1つ。本線と worker で共通
+  "provider-anthropic",        # provider はちょうど1つ。main と worker で共通
   "worker",
   "compactor",
   "tool-web-search",
@@ -760,7 +760,7 @@ name = "default"                 # profiles/<name>.md
 [context]
 prompt_hard_limit_tokens = 80000 # 直近レスポンスの usage.input_tokens がこれを超えたら緊急コンパクション
 retry_max                = 2     # provider の 429 / 5xx・タイムアウトの再試行回数(初回と合わせて最大 retry_max+1 回)
-max_tokens               = 2048  # 本線の 1 応答の max_tokens
+max_tokens               = 2048  # main の 1 応答の max_tokens
 
 [channel.discord]
 guild_id      = "000000000000000000"           # 参加している guild の ID に置き換える
@@ -823,7 +823,7 @@ keep_recent_turns = 6
 digest_max_chars  = 12000        # Layer 2 の上限。超えたら古いエピソードから削除する
 
 [memory]                         # 長期記憶 MEMORY.md(Layer 1.5)と Dreaming
-memo               = true        # 本線の [Memo] 行を MEMORY.md に追記する
+memo               = true        # main の [Memo] 行を MEMORY.md に追記する
 memo_max_per_reply = 3
 memory_max_chars   = 6000        # 超えている間は [Memo] を追記しない。Dreaming がこの長さに整理する
 dreaming           = true        # compactor module が必要

@@ -1,4 +1,4 @@
-//! 本線プロンプトの Layer 0〜4 の構築。context-layers.md §3
+//! main プロンプトの Layer 0〜4 の構築。context-layers.md §3
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
@@ -11,11 +11,11 @@ const HEADER_MESSAGES: &str = "[発言群]";
 const HEADER_DELIVERY: &str = "[報告の仕方]";
 const HEADER_CHANNEL: &str = "[発言先]";
 const HEADER_EPISODE: &str = "[エピソード ";
-/// 本線の応答のうち、この行から後ろが Worker への指示(Goal)。Discord には出さない
+/// main の応答のうち、この行から後ろが Worker への指示(Goal)。Discord には出さない
 pub const GOAL_MARKER: &str = "[Goal]";
 /// 本文が空の応答に添えるリアクション指定の行頭
 pub const REACT_MARKER: &str = "[React]";
-/// 本線が tool を直接呼んだときに Core が代わりに投稿する Ack。Layer 0 の worker 節でも同じ文面を示す
+/// main が tool を直接呼んだときに Core が代わりに投稿する Ack。Layer 0 の worker 節でも同じ文面を示す
 pub const FIXED_ACK: &str = "ちょっと調べてみますね。";
 
 const RULES_BASE: &str = "\
@@ -506,10 +506,10 @@ pub fn split_ack_goal(text: &str) -> Option<(String, String)> {
     None
 }
 
-/// 本線が tool を直接呼んだときの Goal。tool_calls 自体は Layer 3 に残さないので、呼び出しの中身を文章として渡す
+/// main が tool を直接呼んだときの Goal。tool_calls 自体は Layer 3 に残さないので、呼び出しの中身を文章として渡す
 pub fn goal_from_tool_calls(calls: &[ToolCall]) -> String {
     let mut s =
-        "本線が次の tool 呼び出しを求めました。これを手がかりに調べてください。".to_string();
+        "main が次の tool 呼び出しを求めました。これを手がかりに調べてください。".to_string();
     for c in calls {
         s.push_str(&format!("\n- {}: {}", c.name, c.input));
     }
@@ -535,7 +535,7 @@ pub fn conclusion_turn(
     }
 }
 
-/// Join の報告で Layer 4 にだけ置く指示。abort では本線を起動しないので呼ばない
+/// Join の報告で Layer 4 にだけ置く指示。abort では main を起動しないので呼ばない
 pub fn delivery_instruction_turn(chunk_id: i64, style: DeliveryStyle) -> Turn {
     let body = match style {
         DeliveryStyle::NormalReport | DeliveryStyle::Abort => {

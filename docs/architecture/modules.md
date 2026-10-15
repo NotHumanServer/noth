@@ -32,7 +32,7 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 
 | 種別 | module | 内容 | 無効時の動作 |
 |---|---|---|---|
-| worker | `worker` | Ephemeral Task Worker。本線から Fork した隔離コンテキストで tool を使い、結論メモだけを返す | Core は Worker を起動しない(`noth_request` は本線が返事をし、補足・訂正は静観する)。本線に tool 定義を渡さない |
+| worker | `worker` | Ephemeral Task Worker。main から Fork した隔離コンテキストで tool を使い、結論メモだけを返す | Core は Worker を起動しない(`noth_request` は main が返事をし、補足・訂正は静観する)。main に tool 定義を渡さない |
 | compactor | `compactor` | アイドル時に Layer 3 を三人称要約へ圧縮し Layer 2 へ統合する | Layer 3 がハード上限を超えたら古い TopicChunk を要約せず破棄する |
 | tool | `tool-web-search` | Web 検索。バックエンドは `tinyfish`(Search API) | 未登録なら tool 一覧に出ないので使えない。Worker は検索できない旨を結論メモに書く |
 | tool | `tool-web-fetch` | URL の本文取得。バックエンドは `tinyfish`(Fetch API) | 未登録なら tool 一覧に出ないので使えない |

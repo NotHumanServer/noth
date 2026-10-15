@@ -133,9 +133,9 @@ pub struct LayeredPrompt {
     pub episodic_digest: String,
     pub active_log: Vec<Turn>,
     pub ephemeral_tail: Vec<Turn>,
-    /// worker 有効時は本線にも Worker と同一の定義を渡す(caching.md §2)
+    /// worker 有効時は main にも Worker と同一の定義を渡す(caching.md §2)
     pub tools: Vec<ToolSpec>,
-    /// Worker の tool 往復。ephemeral_tail の後ろに置く。本線では常に空
+    /// Worker の tool 往復。ephemeral_tail の後ろに置く。main では常に空
     pub tool_exchange: Vec<ExchangeItem>,
     /// Worker の呼び出し。末尾のキャッシュ境界を Layer 3 末尾ではなくコンテキスト末尾に置く(caching.md §3)
     pub cache_to_end: bool,
@@ -194,7 +194,7 @@ pub struct WorkerProgress {
     pub summary: String,
 }
 
-/// Fork 時に Core が渡す。`base` は本線の Layer 0〜3 と tool 定義をそのまま複製したもの
+/// Fork 時に Core が渡す。`base` は main の Layer 0〜3 と tool 定義をそのまま複製したもの
 #[derive(Debug, Clone)]
 pub struct WorkerTask {
     pub run_id: String,
@@ -220,7 +220,7 @@ pub enum WorkerOutcome {
 
 #[async_trait]
 pub trait Worker: Send + Sync {
-    /// 本線にも同じものを渡す。順序も含めて呼び出しごとに同一であること(キャッシュ共有のため)
+    /// main にも同じものを渡す。順序も含めて呼び出しごとに同一であること(キャッシュ共有のため)
     fn tool_specs(&self) -> Vec<ToolSpec>;
     async fn run(&self, task: WorkerTask) -> WorkerOutcome;
 }

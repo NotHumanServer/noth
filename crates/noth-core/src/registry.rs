@@ -16,7 +16,7 @@ pub type ChannelFactory = fn(&ModuleCtx) -> Result<Arc<dyn Channel>>;
 pub type RouterFactory = fn(&ModuleCtx) -> Result<Arc<dyn Router>>;
 pub type ProviderFactory = fn(&ModuleCtx) -> Result<Arc<dyn Provider>>;
 pub type ToolFactory = fn(&ModuleCtx) -> Result<Arc<dyn Tool>>;
-/// 本線と同一 provider・同一 tool 定義で動かすため、Core が組み立てたものを受け取る(caching.md §2)
+/// main と同一 provider・同一 tool 定義で動かすため、Core が組み立てたものを受け取る(caching.md §2)
 pub type WorkerFactory = fn(&ModuleCtx, WorkerDeps) -> Result<Arc<dyn Worker>>;
 pub type CompactorFactory = fn(&ModuleCtx, Arc<dyn Provider>) -> Result<Arc<dyn Compactor>>;
 
@@ -77,7 +77,7 @@ pub struct Modules {
     pub channel: Arc<dyn Channel>,
     pub router: Arc<dyn Router>,
     pub provider: Arc<dyn Provider>,
-    /// None なら spawn_task を reply_only に読み替え、本線に tool 定義を渡さない
+    /// None なら spawn_task を reply_only に読み替え、main に tool 定義を渡さない
     pub worker: Option<Arc<dyn Worker>>,
     /// None ならハード上限超過時に古い TopicChunk を要約せず破棄する
     pub compactor: Option<Arc<dyn Compactor>>,

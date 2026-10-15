@@ -186,7 +186,7 @@ $NOTH_HOME/
 enabled = [
   "channel-discord",
   "router-systemone",          # router はちょうど1つ
-  "provider-anthropic",        # provider はちょうど1つ。本線と worker で共通
+  "provider-anthropic",        # provider はちょうど1つ。main と worker で共通
   "worker",
   "compactor",
   "tool-web-search",
@@ -325,7 +325,7 @@ keep_recent_turns = 6
 digest_max_chars  = 12000        # Layer 2 の上限。超えたら古いエピソードから削除する
 
 [memory]                          # 長期記憶 MEMORY.md(Layer 1.5)と Dreaming
-memo               = true         # 本線の [Memo] 行を MEMORY.md に追記する
+memo               = true         # main の [Memo] 行を MEMORY.md に追記する
 memo_max_per_reply = 3
 memory_max_chars   = 6000         # 超えている間は [Memo] を追記しない。Dreaming がこの長さに整理する
 dreaming           = true         # compactor module が必要

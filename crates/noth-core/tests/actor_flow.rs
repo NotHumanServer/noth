@@ -1136,7 +1136,7 @@ async fn spawn_task_posts_ack_and_records_goal_before_fork() {
         turns[1].text,
         "ちょっと調べるね\n[Goal]\n東京の明日の天気を調べる"
     );
-    // 本線にも Worker と同じ tool 定義を渡す
+    // main にも Worker と同じ tool 定義を渡す
     let main = &h.prompts()[0];
     assert_eq!(main.tools.len(), 2);
     assert!(main.harness_rules.contains("[Goal]"));
@@ -1346,7 +1346,7 @@ async fn second_run_waits_when_max_concurrent_is_one() {
     assert_eq!(h.worker.started(), 1);
     assert_eq!(runs(&h.store, RunStatus::Queued).await[0].goal, "二つ目");
     assert_eq!(h.actor.in_flight(), 2);
-    // 本線は Worker の実行中も Judge を処理できる
+    // main は Worker の実行中も Judge を処理できる
     h.router.set(answers("reply_only", 0.0, 0.0));
     h.say(GENERAL, "ところで").await;
     assert_eq!(h.sent().len(), 3);
@@ -1369,7 +1369,7 @@ async fn tool_calls_become_fixed_ack_and_goal() {
         ..Setup::default()
     })
     .await;
-    // router は reply_only でも、本線が tool を呼んだら Worker に回す
+    // router は reply_only でも、main が tool を呼んだら Worker に回す
     h.router.set(answers("reply_only", 0.0, 0.0));
     h.provider.scripted.lock().unwrap().push_back(Completion {
         text: None,

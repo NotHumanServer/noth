@@ -126,7 +126,7 @@ impl Drop for FileLock {
     }
 }
 
-/// worker と本線が同じトークンを共有するため、更新はロックして1回にまとめる
+/// worker と main が同じトークンを共有するため、更新はロックして1回にまとめる
 pub struct TokenStore {
     path: PathBuf,
     client: reqwest::Client,

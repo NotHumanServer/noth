@@ -78,7 +78,7 @@ pub trait Router: Send + Sync {
 
 確率を閾値で二値化し、`addressee` などの回答から動き方を決めるのは Core の責務です([context-layers.md §4.3](../context-layers.md#43-core-の決め方))。`choice` の同点は選択肢の先頭を採るため、Core は安全な側を先頭にして渡します。`router-mention` は `decide` の中で API を呼ばずにルールで `Decision` を組み立て、確率は 0.0 / 1.0 の二値になります。
 
-Core は **provider(LLM)に JSON を生成させる汎用 router を提供しません。** 文字列生成を伴うので遅くコストも高いうえ、判定のためだけに生ログを LLM に入れることになり、[設計原則2](../context-layers.md#1-目的と設計原則)(本線にノイズと生ログを入れない)に反するからです。
+Core は **provider(LLM)に JSON を生成させる汎用 router を提供しません。** 文字列生成を伴うので遅くコストも高いうえ、判定のためだけに生ログを LLM に入れることになり、[設計原則2](../context-layers.md#1-目的と設計原則)(main にノイズと生ログを入れない)に反するからです。
 
 ## 4. `Provider`(LLM)
 
@@ -91,12 +91,12 @@ pub struct LayeredPrompt {
     pub episodic_digest: String,      // Layer 2
     pub active_log: Vec<Turn>,        // Layer 3
     pub ephemeral_tail: Vec<Turn>,    // Layer 4
-    pub tools: Vec<ToolSpec>,         // worker が有効なら本線にも同じ定義を渡す(caching.md §2)
+    pub tools: Vec<ToolSpec>,         // worker が有効なら main にも同じ定義を渡す(caching.md §2)
 }
 
 pub struct Completion {
     pub text: Option<String>,
-    pub tool_calls: Vec<ToolCall>,    // 本線がこれを返したら Core が Worker に回す指示(Goal)として扱う
+    pub tool_calls: Vec<ToolCall>,    // main がこれを返したら Core が Worker に回す指示(Goal)として扱う
     pub usage: Usage,                 // input_tokens / cached_tokens / output_tokens。プロンプト全体の上限判定に使う
 }
 
@@ -111,7 +111,7 @@ pub trait Provider: Send + Sync {
 }
 ```
 
-provider のエラー(429 / 5xx・タイムアウト・止まったストリーム・本文の受信失敗)は `retry_max` 回(既定 2。初回と合わせて最大 3 回)まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。ストリーミング(Codex の SSE)は `idle_timeout_secs`(既定 45 秒)の間 SSE のバイトが何も届かなければその試行を捨てて再試行します。長い推論の間も流れるよう、Codex には `reasoning.summary = "auto"` を要求します(要約は本文に含めません)。`request_timeout_secs`(Codex 既定 300 秒、他は 120 秒)は試行全体の上限で、進んでいるが遅いストリームも切って再試行します。失敗の通知文は原因(通信・認証・利用上限・その他)で変わります。本線と Join の報告はチャンネルに失敗を投稿してそのターンを終了し、トリガー発言をバッファに戻します(Layer 3 には入れません)。各 provider は完了ごとに INFO(provider・model・purpose・elapsed_ms・attempts)、再試行ごとに WARN を記録します。
+provider のエラー(429 / 5xx・タイムアウト・止まったストリーム・本文の受信失敗)は `retry_max` 回(既定 2。初回と合わせて最大 3 回)まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。ストリーミング(Codex の SSE)は `idle_timeout_secs`(既定 45 秒)の間 SSE のバイトが何も届かなければその試行を捨てて再試行します。長い推論の間も流れるよう、Codex には `reasoning.summary = "auto"` を要求します(要約は本文に含めません)。`request_timeout_secs`(Codex 既定 300 秒、他は 120 秒)は試行全体の上限で、進んでいるが遅いストリームも切って再試行します。失敗の通知文は原因(通信・認証・利用上限・その他)で変わります。main と Join の報告はチャンネルに失敗を投稿してそのターンを終了し、トリガー発言をバッファに戻します(Layer 3 には入れません)。各 provider は完了ごとに INFO(provider・model・purpose・elapsed_ms・attempts)、再試行ごとに WARN を記録します。
 
 ## 5. `Tool`
 
@@ -125,7 +125,7 @@ pub trait Tool: Send + Sync {
 }
 ```
 
-tool の出力は Worker のコンテキストにだけ入り、本線には届きません。出力は `tool_output_max_chars` で切り詰めてから Worker に返します。
+tool の出力は Worker のコンテキストにだけ入り、main には届きません。出力は `tool_output_max_chars` で切り詰めてから Worker に返します。
 
 `ToolContext` は `audience: Audience { requesters: Vec<UserId>, channel_id: Option<ChannelId>, channel_name: Option<String> }` も持ちます。Worker を起動させた発言者とトリガーのチャンネルで、actor が `WorkerTask::audience` に詰め、Worker が `ToolContext` に写します。tool が「出力が届く先の全員に見えるものだけ」を返すための情報です。届く先は、依頼した人、トリガーのチャンネルを見られる `allowed_users` 全員、`@everyone` がそのチャンネルを見られるなら `@everyone`、の和集合です([security.md §2](security.md#2-discord-側の対策))。
 
@@ -165,4 +165,4 @@ pub trait Compactor: Send + Sync {
 }
 ```
 
-要約の生成には本線と同じ provider を使いますが、Layer 1(Profile)を入れず、Layer 0 の「要約は三人称の事実記述にする」規約だけを与えます。キャラクターの文体が要約に混ざるのを防ぐためです。
+要約の生成には main と同じ provider を使いますが、Layer 1(Profile)を入れず、Layer 0 の「要約は三人称の事実記述にする」規約だけを与えます。キャラクターの文体が要約に混ざるのを防ぐためです。

@@ -32,7 +32,7 @@ fn factory(ctx: &ModuleCtx, deps: WorkerDeps) -> Result<Arc<dyn Worker>> {
 pub struct AgentWorker {
     provider: Arc<dyn Provider>,
     tools: Vec<Arc<dyn Tool>>,
-    /// 本線とキャッシュを共有するため、順序込みで一度だけ計算して使い回す
+    /// main とキャッシュを共有するため、順序込みで一度だけ計算して使い回す
     specs: Vec<ToolSpec>,
     settings: WorkerSettings,
     max_tokens: u32,
@@ -204,7 +204,7 @@ fn truncate(text: String, max_chars: usize) -> String {
     }
 }
 
-/// 指示は Layer 4 にだけ置く。system に足すと本線とのキャッシュ共有が崩れる(caching.md §3)。
+/// 指示は Layer 4 にだけ置く。system に足すと main とのキャッシュ共有が崩れる(caching.md §3)。
 /// effort が低いと tool を呼ばずに結論しがちなので、手順を必須として書く
 fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Turn {
     let has = |name: &str| specs.iter().any(|s| s.name == name);
@@ -321,7 +321,7 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
         .unwrap_or_default();
     let text = format!(
         "あなたは Goal を達成するための汎用エージェントとして、バックグラウンドで作業します。あなたの出力は Discord には表示されません。\n\
-         system の「自律タスク(Ack と Goal)」「Worker に頼めること」は本線向けの規約です(キャッシュを共有するため同じ system を使っています)。あなたは Worker なので、Ack や `[Goal]` は書かずに作業してください。\n\
+         system の「自律タスク(Ack と Goal)」「Worker に頼めること」は main 向けの規約です(キャッシュを共有するため同じ system を使っています)。あなたは Worker なので、Ack や `[Goal]` は書かずに作業してください。\n\
          origin: {}\n\
          {place}\
          Goal: {}\n\n\
