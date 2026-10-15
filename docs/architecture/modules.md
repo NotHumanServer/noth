@@ -12,9 +12,9 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 
 | 種別 | module | 内容 |
 |---|---|---|
-| channel | `channel-discord` | Discord への接続、発言の受信とデバウンス、Bot からの投稿 |
-| router | `router-systemone` | System One API(Jev / Clef)で介入判定・ノイズ判定・話題区切り・関連チャンク選択・合流判定を行う |
-| router | `router-mention` | ルールベース。メンション・リプライ・キーワード一致時のみ `reply_only`、他は `silent`。話題区切りは「前の発言から一定時間空いた、またはチャンネルが変わった」で判定し、関連チャンクは常に空。System One を契約していなくても起動でき、テストにも使う |
+| channel | `channel-discord` | Discord への接続、発言の受信とデバウンス、Bot からの投稿。Noth 以外の Bot(`author.bot`。webhook は除く)の発言は本文を入れない目印だけを流す |
+| router | `router-systemone` | System One API(Jev / Clef)で発言の性質(宛先 `addressee`、外部作業の要否、訂正、補足の価値)・ノイズ判定・話題区切り・合流判定を行う。関連チャンク選択は評価で残すか決める。動き方は Core が決める |
+| router | `router-mention` | ルールベース。メンション・リプライ・キーワード一致時のみ `addressee = noth_request`、他は `other`。外部作業・訂正・補足の問いは常に 0.0(Worker は起動しない)。話題区切りは「前の発言から一定時間空いた、またはチャンネルが変わった」で判定し、関連チャンクは常に空。System One を契約していなくても起動でき、テストにも使う |
 | provider | `provider-openai` | OpenAI Chat Completions 形式。Responses 形式も同 module 内で選べる |
 | provider | `provider-anthropic` | Anthropic Messages API |
 | provider | `provider-google` | Gemini `generateContent`。認証は API キー(AI Studio)か OAuth2(Agent Platform) |
@@ -32,12 +32,12 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 
 | 種別 | module | 内容 | 無効時の動作 |
 |---|---|---|---|
-| worker | `worker` | Ephemeral Task Worker。本線から Fork した隔離コンテキストで tool を使い、結論メモだけを返す | router の `spawn_task` 判定を `reply_only` として扱う。本線に tool 定義を渡さない |
+| worker | `worker` | Ephemeral Task Worker。本線から Fork した隔離コンテキストで tool を使い、結論メモだけを返す | Core は Worker を起動しない(`noth_request` は本線が返事をし、補足・訂正は静観する)。本線に tool 定義を渡さない |
 | compactor | `compactor` | アイドル時に Layer 3 を三人称要約へ圧縮し Layer 2 へ統合する | Layer 3 がハード上限を超えたら古い TopicChunk を要約せず破棄する |
 | tool | `tool-web-search` | Web 検索。バックエンドは `tinyfish`(Search API) | 未登録なら tool 一覧に出ないので使えない。Worker は検索できない旨を結論メモに書く |
 | tool | `tool-web-fetch` | URL の本文取得。バックエンドは `tinyfish`(Fetch API) | 未登録なら tool 一覧に出ないので使えない |
 | tool | `tool-web-agent` | 自然言語の目標で実サイトを操作。バックエンドは `tinyfish`(Agent API `run-async` + ポーリング) | 未登録なら tool 一覧に出ないので使えない |
-| tool | `tool-discord` | 読み取り専用の Discord 参照。サーバー内チャンネルの REST 取得(`fetch_messages` / `list_pins` / `list_channels` など)と、Noth が記録済みの発言の検索(`search_messages`)。`fetch_messages` は `channel_id` を省略するとトリガーのチャンネルを取り、`search_messages` はチャンネルを指定しないとトリガーのチャンネルだけを検索する(サーバー全体は `scope: "guild"`)。Bot トークンと `guild_id` は `[channel.discord]` を流用し、読めるのは依頼した人全員に見えるチャンネルだけで、操作は `[channel.discord] guild_id` のサーバーに限る([security.md §2](security.md#2-discord-側の対策)) | Worker が過去ログやサーバー構成を参照できない旨を結論メモに書く。`channel-discord` が有効でないと起動しない(トークンを共有するため) |
+| tool | `tool-discord` | 読み取り専用の Discord 参照。サーバー内チャンネルの REST 取得(`fetch_messages` / `list_pins` / `list_channels` など)と、Noth が記録済みの発言の検索(`search_messages`)。`fetch_messages` は `message_id` を `before` / `after` / `around` で指定でき(Noth 以外の Bot の本文も content と embed のテキストで読める。目印の message_id から読む用途)、`channel_id` を省略するとトリガーのチャンネルを取り、`search_messages` はチャンネルを指定しないとトリガーのチャンネルだけを検索する(サーバー全体は `scope: "guild"`。Bot の目印は対象外)。Bot トークンと `guild_id` は `[channel.discord]` を流用し、読めるのは依頼した人全員に見えるチャンネルだけで、操作は `[channel.discord] guild_id` のサーバーに限る([security.md §2](security.md#2-discord-側の対策)) | Worker が過去ログやサーバー構成を参照できない旨を結論メモに書く。`channel-discord` が有効でないと起動しない(トークンを共有するため) |
 | tool | `tool-shell` | ホスト上でのコマンド実行。サンドボックスなし([security.md](security.md)) | 未登録なら tool 一覧に出ないので使えない。Worker は実行できない旨を結論メモに書く |
 
 tool module は `worker` が有効なときだけ意味を持ちます。`worker` 無効で tool が有効な構成は `noth doctor` が警告します。

@@ -18,7 +18,7 @@ Anthropic の TTL は既定で5分です。サーバーが5分以上静かにな
 
 本線と Worker は **同一 provider・同一モデル・同一 tool 定義・同一 `tool_choice`(未指定)** を使います。Anthropic のキャッシュは `tools → system → messages` の順に前方一致を見るため、Worker だけが tool を持つと先頭で不一致になり、Fork しても本線のキャッシュを引き継げません。OpenAI 互換も tool 定義を含むプロンプト全体の一致が必要です。
 
-そのため `worker` が有効な構成では **本線にも同じ tool 定義を渡します**。本線が tool を呼ぶことは Layer 0 で禁じ、それでも `tool_calls` が返ってきたら Core がそれを `spawn_task` 相当として扱い、Worker に回します。本線のコンテキストには Layer 0 の定型 Ack と tool 呼び出しから組み立てた Goal をテキストの assistant メッセージとして記録し、`tool_calls` 自体は残しません。残すと `tool_result` が必須になり、消すと assistant が空になるためです。こうして本線は tool 定義を持ちながら、実行は常に Worker が担う形になり、[設計原則2](../context-layers.md#1-目的と設計原則)(本線にノイズと生ログを入れない)を守ります。
+そのため `worker` が有効な構成では **本線にも同じ tool 定義を渡します**。本線が tool を呼ぶことは Layer 0 で禁じ、それでも `tool_calls` が返ってきたら Core がそれを Worker に回す指示(`[Goal]` 相当)として扱います。本線のコンテキストには Layer 0 の定型 Ack と tool 呼び出しから組み立てた Goal をテキストの assistant メッセージとして記録し、`tool_calls` 自体は残しません。残すと `tool_result` が必須になり、消すと assistant が空になるためです。こうして本線は tool 定義を持ちながら、実行は常に Worker が担う形になり、[設計原則2](../context-layers.md#1-目的と設計原則)(本線にノイズと生ログを入れない)を守ります。
 
 ## 3. Worker 固有の指示の置き場
 

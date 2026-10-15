@@ -47,11 +47,11 @@ Noth は少人数の Discord サーバーに常駐する AI エージェント�
 | router と provider は「ちょうど1つ」有効 | 本線と Worker が同一 provider・モデルを使う前提を単純に保つ | 複数 provider のフォールバック | キャッシュ共有が崩れる | [modules §2](architecture/modules.md#2-必須だが差し替え可能) |
 | preset は provider module 内のテーブル | 接続先の切り替えは認証とベース URL の差でしかなく、module に分ける粒度ではない | `[preset.*]` セクションや preset module | | [modules §2](architecture/modules.md#2-必須だが差し替え可能) |
 | Router 抽象は System One API の形(`Noul` / `Choice` / `Score`)、二値化は Core | 判定の質問セットを Core が持ち、router は問い合わせ方だけを担う | provider(LLM)に JSON を生成させる汎用 router | 遅く、コストが高く、生ログを本線系に入れる | [traits §3](architecture/traits.md#3-routersystem-one) |
-| 本線にも Worker と同じ tool 定義を渡し、本線の `tool_calls` は `spawn_task` 扱い | Anthropic は `tools → system → messages` の前方一致なので、tool 定義が違うと Fork でキャッシュを引き継げない | Worker だけが tool を持つ | Worker を起動するたびにキャッシュ書き込みが発生する | [caching §2](architecture/caching.md#2-本線と-worker-のキャッシュ共有) |
+| 本線にも Worker と同じ tool 定義を渡し、本線の `tool_calls` は Worker への指示扱い | Anthropic は `tools → system → messages` の前方一致なので、tool 定義が違うと Fork でキャッシュを引き継げない | Worker だけが tool を持つ | Worker を起動するたびにキャッシュ書き込みが発生する | [caching §2](architecture/caching.md#2-本線と-worker-のキャッシュ共有) |
 | Worker 固有の指示は最初の user メッセージに置く | `system` が1文字でも違えば Layer 3 のキャッシュが全部外れる | `system` に追記 | | [caching §3](architecture/caching.md#3-worker-固有の指示の置き場) |
 | Anthropic はブレークポイント3つ、OpenAI / Google は自動キャッシュに任せる | Layer 2 更新時に Layer 0〜1 を保ち、バッファ一括追記の lookback 超過に備える | Gemini の explicit caching | Gemini 4 Argon 以降で非対応 | [caching §1](architecture/caching.md#1-provider-ごとの-layer-の載せ方) |
 | キャッシュの keep-alive は MVP 外 | 効果の検証を MVP 後に回す。trait メソッド(`keep_alive()`)だけ用意 | 常時 keep-alive | | [caching §5](architecture/caching.md#5-keep-alivemvp-外) |
-| Discord は `allowed_users` の発言だけ通し、リストに含まれないユーザーと他 Bot の発言は保存もしない。読むのは `content` だけ | 信頼境界の外の文字列をプロセスに入れない | 全部保存して router で捨てる | SQLite と router の入力に未信頼の文字列が残る | [security §2](architecture/security.md#2-discord-側の対策) |
+| Discord は `allowed_users` の発言だけ通し、リストに含まれないユーザーの発言は保存もしない。他 Bot の発言は本文を読まず目印だけを残す。読むのは `content` だけ | 信頼境界の外の文字列をプロセスに入れない | 全部保存して router で捨てる | SQLite と router の入力に未信頼の文字列が残る | [security §2](architecture/security.md#2-discord-側の対策) |
 | `approval = "auto"` は有効な tool をどの run でも承認なしで呼べる。サンドボックスなし | Worker を普通の AI エージェントとして使えるようにする。残るリスク(Web / Discord 経由のプロンプトインジェクションで shell が動き得る)は `allowed_users` を信頼できる人に限って受ける | run の種類で shell を絞る | Web や Discord の文字列に紛れた指示で shell が動き得る | [security §3, §4](architecture/security.md#3-web-側の対策と承認ポリシー) |
 | Compactor は人間の最終発言から 10 分で通常圧縮、ハード上限超過で TopicChunk 単位の緊急退避 | 会話中に Layer 3 を書き換えず、Append-only を保つ | ターンごとの圧縮 | | [context-layers §5 パターン D](context-layers.md#パターン-d-アイドル時コンパクション) |
 | 本線への書き込みは1つの actor に直列化 | 複数チャンネルの発言が交錯しても Layer 3 の追記順を一意にする | チャンネルごとの並列処理 | | [context-layers §2.1](context-layers.md#21-本線-actor-と処理単位) |

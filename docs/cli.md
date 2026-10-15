@@ -211,17 +211,20 @@ debounce_secs = 2.0
 [router]
 recent_messages  = 30            # state.recent に入れる直近発言数
 state_max_chars  = 24000         # state 全体の文字数上限。Clef-flash(24,576 tokens)では保守的に
-candidate_chunks = 32            # 関連判定にかける候補 TopicChunk の数(上限は max_questions - 6)
-call_names       = ["noth", "ノス", "のす"]  # 本文でこう呼ばれたら min_confidence を無視して router の判定に従う
-conversation_window_secs = 120  # Noth が応答してからこの秒数は、話していた相手の発言を呼び名と同じ扱いにする
+candidate_chunks = 32            # 関連判定にかける候補 TopicChunk の数(上限は max_questions - 7)。関連チャンクの問いを減らすか外すかは評価で決める
+call_names       = ["noth", "ノス", "のす"]  # 本文でこう呼ばれたことを router に伝える(calls_noth_by_name)。決定的に noth_request とするのはメンションとリプライだけ
+conversation_window_secs = 120  # Noth が応答してからこの秒数は、話していた相手の発言を noth_request として扱う。窓は外さず残す(評価で addressee だけでは 57 行中 39 行しか拾えなかった)
+supplement_min_interval_secs = 300  # 黙って補足の Worker を起動する、チャンネルごとの最短間隔(秒)。訂正の Worker には適用しない
+supplement_max_per_day       = 50   # 同じ起動の 1 日の上限回数(guild 全体。訂正は数えない)
 
-[router.thresholds]              # noul の二値化閾値と choice の最低 confidence
+[router.thresholds]              # noul の二値化閾値。v2 の質問の値は評価で決める
 is_noise_or_meme = 0.5
 is_topic_shift   = 0.6
-relevant_chunk   = 0.5
-min_confidence   = 0.15
-name_call_reply  = 0.25  # 呼び名で呼ばれたとき、reply_only と spawn_task の確率の合計がこれ以上なら応答する
-addressed_to_noth = 0.6  # 「Noth に向けた発言か」がこれ以上なら、静観を返答に引き上げる
+relevant_chunk   = 0.5  # 関連チャンクの問いを外したら不要
+needs_outside_work = 0.5  # noth_request でこれ以上なら Worker に回す。取りこぼさない側に倒す
+# corrects_noth      = 評価で決める  # Noth の誤りの指摘とみなす(訂正)
+# worth_supplement   = 評価で決める  # 低めにして広く拾う
+min_confidence   = 0.15  # 合流判定の abort だけに使う。効かなければ外す(評価で決める)
 
 # router が選べる絵文字リアクション。話すほどではないが気になる発言に付ける。
 # 省略時は次の 8 種。`reactions = []` でリアクションしなくなる。`<:name:id>` のカスタム絵文字も使える
@@ -234,7 +237,7 @@ meaning = "同意・了解"
 [router.systemone]
 preset     = "jev"               # jev | clef | custom。省略時も jev
 api_key    = "${TYPESAFE_API_KEY}"
-# model    = "jev-latest"        # body の model。clef preset では URL の末尾もこの値で決まる(例: "clef-flash")
+# model    = "<版を固定した名前>"  # body の model。jev-latest などの別名は中身が変わるので避ける。clef preset では URL の末尾もこの値で決まる(例: "clef-flash")
 # account_id = "${CF_ACCOUNT_ID}"  # clef のとき必須(api_key は "${CF_API_TOKEN}")
 # endpoint = "..."               # custom のとき必須
 

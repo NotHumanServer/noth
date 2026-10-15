@@ -9,11 +9,11 @@ trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`as
 | 型 | 内容 |
 |---|---|
 | `Member` | `user_id`、表示名、ロール名の一覧 |
-| `IncomingMessage` | `guild_id`、`channel_id`、チャンネル名、`message_id`、`user_id`、投稿者の表示名、本文(`content` のみ)、時刻、`is_self`、Noth 宛てのメンションか、Noth の発言へのリプライか。チャンネル名と表示名は router の state に入れるため、メンション・リプライの有無は `router-mention` が使うため |
+| `IncomingMessage` | `guild_id`、`channel_id`、チャンネル名、`message_id`、`user_id`、投稿者の表示名、本文(`content` のみ)、時刻、`is_self`、Noth 宛てのメンションか、Noth の発言へのリプライか、Noth 以外の Bot の目印か(`bot_marker`。本文の代わりに目印の文字列を持つ)。チャンネル名と表示名は router の state に入れるため、メンション・リプライの有無は `router-mention` が使うため |
 | `Turn` | Layer 3 / 4 の1ブロック。`role`(user / assistant)、本文、種別(バッファ / トリガー / 応答 / 結論メモ / 関連チャンク)、`chunk_id` |
-| `RouterState` | [context-layers.md §4.1](../context-layers.md#41-state-の組み立て) の JSON |
+| `RouterState` | [context-layers.md §4.1](../context-layers.md#41-state-の組み立て) の JSON。`recent` には Bot の目印も同じ並びで入る |
 | `CompletionParams` | `max_tokens`。effort のようにモデルに依存する生成パラメータは provider の設定(例: `[provider.anthropic] effort`)に置き、Core は関与しない |
-| `ToolContext` | `run_id`、`task_category`、作業ディレクトリ、承認ポリシーへの参照 |
+| `ToolContext` | `run_id`、`origin`(`request` / `supplement` / `correction`)、作業ディレクトリ、承認ポリシーへの参照 |
 
 ## 2. `Channel`
 
@@ -22,7 +22,7 @@ trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`as
 pub trait Channel: Send + Sync {
     /// 担当する guild。Core はこれで SQLite の行を分ける
     fn guild_id(&self) -> GuildId;
-    /// 接続し、受信した発言を Event Bus に流す。allowed_users 以外と Bot の発言はここで捨てる
+    /// 接続し、受信した発言を Event Bus に流す。allowed_users 以外の発言はここで捨てる。Noth 以外の Bot は本文を読まず目印だけを流す
     async fn run(&self, bus: BusHandle) -> Result<()>;
     /// 発言を投稿する。2,000 文字を超えれば分割し、最後の MessageId を返す。
     /// reply_to があれば元発言へのリプライとして投稿する。allowed_mentions は常に空
@@ -70,15 +70,15 @@ pub struct Decision {
 #[async_trait]
 pub trait Router: Send + Sync {
     async fn decide(&self, state: &RouterState, questions: &[(String, Question)]) -> Result<Decision>;
-    /// 1リクエストに載せられる質問数。候補チャンクの数を決めるのに使う(Clef は 64)
+    /// 1リクエストに載せられる質問数。候補チャンクの数を決めるのに使う(Clef は 64。他の質問が 7 問なので候補は最大 57)
     fn max_questions(&self) -> usize;
-    /// `decisions.model` に記録する識別子(例: `jev/jev-latest`)。モデルごとの判定傾向を比べるため
+    /// `decisions.model` に記録する識別子(例: `jev/<版を固定した名前>`)。モデルごとの判定傾向を比べるため
     fn model_label(&self) -> String;
     async fn health_check(&self) -> Result<String>;
 }
 ```
 
-確率を閾値で二値化するのは Core の責務です。`router-mention` は `decide` の中で API を呼ばずにルールで `Decision` を組み立て、確率は 0.0 / 1.0 の二値になります。
+確率を閾値で二値化し、`addressee` などの回答から動き方を決めるのは Core の責務です([context-layers.md §4.3](../context-layers.md#43-core-の決め方))。`choice` の同点は選択肢の先頭を採るため、Core は安全な側を先頭にして渡します。`router-mention` は `decide` の中で API を呼ばずにルールで `Decision` を組み立て、確率は 0.0 / 1.0 の二値になります。
 
 Core は **provider(LLM)に JSON を生成させる汎用 router を提供しません。** 文字列生成を伴うので遅くコストも高いうえ、判定のためだけに生ログを LLM に入れることになり、[設計原則2](../context-layers.md#1-目的と設計原則)(本線にノイズと生ログを入れない)に反するからです。
 
@@ -98,7 +98,7 @@ pub struct LayeredPrompt {
 
 pub struct Completion {
     pub text: Option<String>,
-    pub tool_calls: Vec<ToolCall>,    // 本線がこれを返したら Core が spawn_task として扱う
+    pub tool_calls: Vec<ToolCall>,    // 本線がこれを返したら Core が Worker に回す指示(Goal)として扱う
     pub usage: Usage,                 // input_tokens / cached_tokens / output_tokens。プロンプト全体の上限判定に使う
 }
 
@@ -131,7 +131,7 @@ tool の出力は Worker のコンテキストにだけ入り、本線には届�
 
 `ToolContext` は `audience: Audience { requesters: Vec<UserId>, channel_id: Option<ChannelId>, channel_name: Option<String> }` も持ちます。Worker を起動させた発言者とトリガーのチャンネルで、actor が `WorkerTask::audience` に詰め、Worker が `ToolContext` に写します。tool が「出力が届く先の全員に見えるものだけ」を返すための情報です。届く先は、依頼した人、トリガーのチャンネルを見られる `allowed_users` 全員、`@everyone` がそのチャンネルを見られるなら `@everyone`、の和集合です([security.md §2](security.md#2-discord-側の対策))。
 
-`ToolContext` は `run_id` / `task_category` / `work_dir` / `meter` に加え、記録済みの発言を読み取り専用で引く `history: Option<Arc<dyn MessageHistory>>` を持ちます。tool crate が `noth-core` の trait だけで SQLite の `messages` を検索できるようにするためで、実体は Core の `Store` です(Worker が `WorkerTask::history` から渡す。None なら検索できない)。
+`ToolContext` は `run_id` / `origin` / `work_dir` / `meter` に加え、記録済みの発言を読み取り専用で引く `history: Option<Arc<dyn MessageHistory>>` を持ちます。tool crate が `noth-core` の trait だけで SQLite の `messages` を検索できるようにするためで、実体は Core の `Store` です(Worker が `WorkerTask::history` から渡す。None なら検索できない)。
 
 ```rust
 pub struct HistoryQuery {
@@ -150,7 +150,7 @@ pub struct HistoryQuery {
 
 #[async_trait]
 pub trait MessageHistory: Send + Sync + Debug {
-    /// 新しい順。`allowed_users` と Noth の発言だけが記録されているので、返る行に追加のマスクは要らない
+    /// 新しい順。`allowed_users` と Noth の発言だけを返す(Bot の目印は対象外)ので、返る行に追加のマスクは要らない
     async fn search(&self, q: &HistoryQuery) -> Result<Vec<MessageRow>>;
 }
 ```
