@@ -1,6 +1,6 @@
 //! sh -c でコマンドを実行する tool。実行の可否は ApprovalPolicy(Core)が判断する
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -10,16 +10,14 @@ use noth_core::traits::Tool;
 use noth_core::types::{ToolContext, ToolOutput, ToolSpec};
 use noth_core::{Error, Result};
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
-/// 各ストリームで先頭と末尾をそれぞれこの量だけ残し、間を捨てる。エラーは末尾に出ることが多い
-const KEEP_HEAD_BYTES: usize = 32 * 1024;
-const KEEP_TAIL_BYTES: usize = 32 * 1024;
-/// sh が終了した後、背景プロセスが握っているパイプの EOF を待つ上限
-const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+mod capture;
+
+use capture::spawn_capture;
 
 pub fn register(reg: &mut Registry) {
     reg.register_tool("tool-shell", factory);
@@ -141,74 +139,6 @@ impl Drop for GroupKiller {
     }
 }
 
-#[derive(Default)]
-struct Capture {
-    head: Vec<u8>,
-    tail: Vec<u8>,
-    omitted: usize,
-}
-
-impl Capture {
-    fn push(&mut self, chunk: &[u8]) {
-        let take = KEEP_HEAD_BYTES
-            .saturating_sub(self.head.len())
-            .min(chunk.len());
-        self.head.extend_from_slice(&chunk[..take]);
-        self.tail.extend_from_slice(&chunk[take..]);
-        if self.tail.len() > KEEP_TAIL_BYTES {
-            let excess = self.tail.len() - KEEP_TAIL_BYTES;
-            self.tail.drain(..excess);
-            self.omitted += excess;
-        }
-    }
-
-    fn render(&self) -> String {
-        let mut s = String::from_utf8_lossy(&self.head).into_owned();
-        if self.omitted > 0 {
-            s.push_str(&format!("\n...(中略: {} バイト省略)...\n", self.omitted));
-        }
-        s.push_str(&String::from_utf8_lossy(&self.tail));
-        s
-    }
-}
-
-struct Reader {
-    capture: Arc<Mutex<Capture>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-fn spawn_capture<R>(pipe: Option<R>) -> Reader
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let capture = Arc::new(Mutex::new(Capture::default()));
-    let task = pipe.map(|mut pipe| {
-        let capture = capture.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 8192];
-            while let Ok(n) = pipe.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-                capture.lock().unwrap().push(&buf[..n]);
-            }
-        })
-    });
-    Reader { capture, task }
-}
-
-impl Reader {
-    /// setsid などでグループを抜けた子がパイプを握っていても、猶予を過ぎたら打ち切って集めた分を返す
-    async fn finish(self) -> String {
-        if let Some(mut task) = self.task
-            && tokio::time::timeout(DRAIN_GRACE, &mut task).await.is_err()
-        {
-            task.abort();
-        }
-        self.capture.lock().unwrap().render()
-    }
-}
-
 fn error_output(text: &str) -> ToolOutput {
     ToolOutput {
         text: text.to_string(),
@@ -233,168 +163,4 @@ fn create_work_dir(dir: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use noth_core::types::TaskCategory;
-
-    use super::*;
-
-    fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext {
-            run_id: "r".into(),
-            task_category: TaskCategory::CodeOrTool,
-            work_dir: dir.to_path_buf(),
-            meter: None,
-        }
-    }
-
-    fn scratch(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("noth-shell-test-{name}-{}", std::process::id()))
-    }
-
-    #[test]
-    fn spec_name_is_shell() {
-        let spec = ShellTool.spec();
-        assert_eq!(spec.name, "shell");
-        assert_eq!(spec.input_schema["required"], json!(["command"]));
-    }
-
-    #[tokio::test]
-    async fn echo_runs_in_work_dir() {
-        let dir = scratch("echo");
-        let out = ShellTool
-            .call(json!({"command": "echo hello; pwd"}), &ctx(&dir))
-            .await
-            .unwrap();
-        assert!(!out.is_error, "{}", out.text);
-        assert!(out.text.contains("hello"));
-        let real = std::fs::canonicalize(&dir).unwrap();
-        assert!(out.text.contains(real.to_str().unwrap()), "{}", out.text);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn nonzero_exit_is_error() {
-        let dir = scratch("exit");
-        let out = ShellTool
-            .call(json!({"command": "echo oops >&2; exit 3"}), &ctx(&dir))
-            .await
-            .unwrap();
-        assert!(out.is_error);
-        assert!(out.text.contains("終了コード: 3"));
-        assert!(out.text.contains("oops"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn timeout_kills_process() {
-        let dir = scratch("timeout");
-        let started = std::time::Instant::now();
-        let out = ShellTool
-            .call(
-                json!({"command": "sleep 30", "timeout_secs": 1}),
-                &ctx(&dir),
-            )
-            .await
-            .unwrap();
-        assert!(out.is_error);
-        assert!(out.text.contains("タイムアウト"));
-        assert!(started.elapsed() < Duration::from_secs(10));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn missing_command_is_error_output() {
-        let dir = scratch("nocmd");
-        let out = ShellTool.call(json!({}), &ctx(&dir)).await.unwrap();
-        assert!(out.is_error);
-    }
-
-    fn alive(pid: i32) -> bool {
-        unsafe { libc::kill(pid, 0) == 0 }
-    }
-
-    async fn pid_from(dir: &std::path::Path, file: &str) -> i32 {
-        std::fs::read_to_string(dir.join(file))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
-    }
-
-    async fn assert_dies(pid: i32) {
-        for _ in 0..40 {
-            if !alive(pid) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("pid {pid} が残っています");
-    }
-
-    #[tokio::test]
-    async fn timeout_kills_grandchildren() {
-        let dir = scratch("orphan");
-        let out = ShellTool
-            .call(
-                json!({"command": "sleep 60 & echo $! > pid; sleep 60", "timeout_secs": 1}),
-                &ctx(&dir),
-            )
-            .await
-            .unwrap();
-        assert!(out.is_error);
-        assert_dies(pid_from(&dir, "pid").await).await;
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn background_start_returns_quickly_and_kills_it() {
-        let dir = scratch("bg");
-        let started = std::time::Instant::now();
-        let out = ShellTool
-            .call(
-                json!({"command": "sleep 60 & echo $! > pid; echo started"}),
-                &ctx(&dir),
-            )
-            .await
-            .unwrap();
-        assert!(!out.is_error, "{}", out.text);
-        assert!(out.text.contains("started"));
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert_dies(pid_from(&dir, "pid").await).await;
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn large_output_is_bounded() {
-        let dir = scratch("big");
-        let out = ShellTool
-            .call(
-                json!({"command": "yes | head -c 5000000; echo err-line >&2"}),
-                &ctx(&dir),
-            )
-            .await
-            .unwrap();
-        assert!(!out.is_error);
-        assert!(out.text.len() < 100 * 1024, "{}", out.text.len());
-        assert!(out.text.contains("省略"));
-        assert!(out.text.contains("err-line"));
-        assert!(out.text.find("[stderr]").unwrap() < out.text.find("[stdout]").unwrap());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn timeout_returns_partial_output() {
-        let dir = scratch("partial");
-        let out = ShellTool
-            .call(
-                json!({"command": "echo partial-out; echo partial-err >&2; sleep 30", "timeout_secs": 1}),
-                &ctx(&dir),
-            )
-            .await
-            .unwrap();
-        assert!(out.is_error);
-        assert!(out.text.contains("partial-out"));
-        assert!(out.text.contains("partial-err"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
+mod tests;
