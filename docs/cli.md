@@ -320,7 +320,7 @@ OPENCODE_GO_API_KEY=
 TINYFISH_API_KEY=
 ```
 
-`noth init` は有効にした module に必要な変数だけを書き出します。
+`noth init` は有効にした module に必要な変数だけを書き出します。どの module がどの変数を使うかは、リポジトリ直下の `.env.example` にまとめてあります。
 
 ### 4.4 profile ファイル
 
