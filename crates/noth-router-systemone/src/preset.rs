@@ -55,8 +55,9 @@ pub(crate) fn from_section(s: &toml::Value) -> Result<Arc<dyn Router>> {
             )));
         }
     };
+    // 別名(latest/preview)は中身が変わるため版を固定する
     let default_model = if preset == Preset::Jev {
-        "jev-latest"
+        "jev-1.14.0"
     } else {
         "clef"
     };
