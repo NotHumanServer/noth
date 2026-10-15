@@ -94,6 +94,7 @@ impl Channel for MockChannel {
 #[derive(Default)]
 struct MockRouter {
     answers: Mutex<HashMap<String, Answer>>,
+    states: Mutex<Vec<RouterState>>,
     fail: AtomicBool,
 }
 
@@ -110,9 +111,10 @@ impl MockRouter {
 impl Router for MockRouter {
     async fn decide(
         &self,
-        _state: &RouterState,
+        state: &RouterState,
         _questions: &[(String, Question)],
     ) -> Result<Decision> {
+        self.states.lock().unwrap().push(state.clone());
         if self.fail.load(Ordering::SeqCst) {
             return Err(Error::Api {
                 status: 500,
@@ -357,6 +359,7 @@ fn config(hard_limit: u64, table: toml::Table) -> Config {
                 meaning: "気になる".into(),
             }],
         },
+        memory: MemorySettings::default(),
         table,
         env: Default::default(),
     }
@@ -386,6 +389,7 @@ struct Setup {
     worker_permits: usize,
     keep_recent_turns: usize,
     show_progress: bool,
+    memo: bool,
 }
 
 impl Default for Setup {
@@ -399,6 +403,7 @@ impl Default for Setup {
             worker_permits: 100,
             keep_recent_turns: 2,
             show_progress: true,
+            memo: true,
         }
     }
 }
@@ -459,7 +464,8 @@ impl Harness {
             setup.max_concurrent, setup.timeout_secs, setup.show_progress, setup.keep_recent_turns
         ))
         .unwrap();
-        let config = config(setup.hard_limit, table);
+        let mut config = config(setup.hard_limit, table);
+        config.memory.memo = setup.memo;
         let home = config.paths.home.clone();
         let (jobs_tx, jobs) = tokio::sync::mpsc::unbounded_channel();
         let actor = Actor::new(
@@ -2035,4 +2041,228 @@ async fn run_saves_meter_events_before_exit() {
     let limits = store.rate_limits(GUILD).await.unwrap();
     assert_eq!(limits.len(), 1);
     assert_eq!(limits[0].0.remaining, 99);
+}
+
+fn memory_file(h: &Harness) -> PathBuf {
+    h.home.join("profiles").join("memory").join("MEMORY.md")
+}
+
+#[tokio::test]
+async fn memo_line_is_stripped_from_post_kept_in_layer3_and_written_to_file() {
+    let mut h = Harness::setup(Setup {
+        compactor: true,
+        keep_recent_turns: 2,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider
+        .script_text("了解です\n[Memo] alice は猫が好き\n[Memo] 文中ではなく行頭の2件目");
+    h.say(GENERAL, "質問1").await;
+
+    assert_eq!(h.sent(), vec![(GENERAL, "了解です".to_string())]);
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert_eq!(
+        turns[1].text,
+        "了解です\n[Memo] alice は猫が好き\n[Memo] 文中ではなく行頭の2件目"
+    );
+    let file = std::fs::read_to_string(memory_file(&h)).unwrap();
+    assert!(file.contains("- ("));
+    assert!(file.contains(") alice は猫が好き"));
+    assert!(file.contains(") 文中ではなく行頭の2件目"));
+    let versions = h.store.memory_versions(GUILD).await.unwrap();
+    assert_eq!(versions, vec![("memo".to_string(), String::new())]);
+
+    // 追記しても Layer 1.5 は差し替えない(キャッシュ保護)
+    h.say(GENERAL, "質問2").await;
+    h.say(GENERAL, "質問3").await;
+    let prompts = h.prompts();
+    assert!(prompts.iter().all(|p| p.memory.is_empty()));
+    assert!(prompts[0].harness_rules.contains("[Memo]"));
+
+    // コンパクション後に読み直す
+    let later = Timestamp::now() + jiff::SignedDuration::from_mins(11);
+    h.actor.check_idle(later).await.unwrap();
+    assert_eq!(h.process_next_job().await, "compact");
+    h.say(GENERAL, "質問4").await;
+    let last = h.prompts().last().unwrap().clone();
+    assert!(last.memory.starts_with("# Noth の記憶"));
+    assert!(last.memory.contains("alice は猫が好き"));
+}
+
+#[tokio::test]
+async fn memo_only_reply_posts_nothing_but_is_remembered() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider.script_text("[Memo] bob は夜型");
+    h.say(GENERAL, "Noth、bob は夜型らしいよ").await;
+
+    assert!(h.sent().is_empty());
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[1].text, "[Memo] bob は夜型");
+    assert!(
+        std::fs::read_to_string(memory_file(&h))
+            .unwrap()
+            .contains("bob は夜型")
+    );
+}
+
+#[tokio::test]
+async fn memo_limits_and_disabled_setting() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider
+        .script_text("返事\n[Memo] a\n[Memo] b\n[Memo] c\n[Memo] d");
+    h.say(GENERAL, "質問1").await;
+    assert_eq!(h.sent(), vec![(GENERAL, "返事".to_string())]);
+    let file = std::fs::read_to_string(memory_file(&h)).unwrap();
+    assert_eq!(file.matches("- (").count(), 3);
+    assert!(!file.contains(") d"));
+}
+
+#[tokio::test]
+async fn memo_in_ack_is_stripped_and_goal_keeps_its_own_memo_lines() {
+    let mut h = Harness::setup(Setup {
+        worker: true,
+        worker_permits: 0,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(spawn_answers("web_research"));
+    h.provider.script_text(
+        "調べるね\n[Memo] carol は Rust 勉強中\n[Goal]\n調査\n[Memo] これは Goal の一部",
+    );
+    h.say(GENERAL, "Rust の最新版を調べて").await;
+
+    assert_eq!(h.sent(), vec![(GENERAL, "調べるね".to_string())]);
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert_eq!(
+        turns[1].text,
+        "調べるね\n[Memo] carol は Rust 勉強中\n[Goal]\n調査\n[Memo] これは Goal の一部"
+    );
+    let file = std::fs::read_to_string(memory_file(&h)).unwrap();
+    assert!(file.contains("carol は Rust 勉強中"));
+    assert!(!file.contains("これは Goal の一部"));
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    assert_eq!(
+        h.worker.tasks.lock().unwrap()[0].goal,
+        "調査\n[Memo] これは Goal の一部"
+    );
+    h.worker.release.add_permits(1);
+}
+
+#[tokio::test]
+async fn router_state_carries_noth_and_members_from_memory_file() {
+    let mut h = Harness::new().await;
+    let path = memory_file(&h);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "## Noth について\nNoth は Discord の Bot\n\n## メンバー\n- alice: 開発者\n\n## その他\n\n## メモ\n",
+    )
+    .unwrap();
+    h.router.set(answers("silent", 0.0, 0.0));
+    h.say(GENERAL, "雑談").await;
+
+    let state = h.router.states.lock().unwrap()[0].0.clone();
+    assert_eq!(state["noth"], "Noth は Discord の Bot");
+    assert_eq!(state["members"]["memory"], "- alice: 開発者");
+    assert_eq!(
+        state["members"]["list"],
+        serde_json::json!([{"name": "alice", "roles": ["admin"]}])
+    );
+}
+
+#[tokio::test]
+async fn addressed_to_noth_lifts_silent_to_reply() {
+    let mut h = Harness::new().await;
+    let mut a = answers("silent", 0.0, 0.0);
+    a.push(("addressed_to_noth", noul(0.9)));
+    h.router.set(a);
+    h.say(GENERAL, "この Bot の設定ってどこにあるの?").await;
+    assert_eq!(h.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn memo_disabled_leaves_text_untouched_and_writes_nothing() {
+    let mut h = Harness::setup(Setup {
+        memo: false,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider.script_text("返事\n[Memo] alice は猫好き");
+    h.say(GENERAL, "質問1").await;
+
+    assert_eq!(
+        h.sent(),
+        vec![(GENERAL, "返事\n[Memo] alice は猫好き".to_string())]
+    );
+    assert!(!memory_file(&h).exists());
+    assert!(h.store.memory_versions(GUILD).await.unwrap().is_empty());
+    assert!(!h.prompts()[0].harness_rules.contains("[Memo]"));
+}
+
+#[tokio::test]
+async fn memo_only_join_report_is_not_posted_but_is_remembered() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(with_delivery(
+        spawn_answers("web_research"),
+        "normal_report",
+    ));
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.provider.script_text("[Memo] 東京は雨が多い");
+    h.say(GENERAL, "天気調べて").await;
+    assert_eq!(h.process_next_job().await, "join");
+
+    // Ack だけが投稿され、Layer 3 には結論メモだけが残る(投稿していない応答は残さない)
+    assert_eq!(h.sent().len(), 1);
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert_eq!(turns.len(), 3);
+    assert_eq!(turns[2].kind, TurnKind::Conclusion);
+    assert!(
+        std::fs::read_to_string(memory_file(&h))
+            .unwrap()
+            .contains("東京は雨が多い")
+    );
+}
+
+#[tokio::test]
+async fn memo_in_plain_reply_with_worker_enabled_is_stripped() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider.script_text("そうなんですね\n[Memo] dave は朝型");
+    h.say(GENERAL, "私は朝型です").await;
+
+    assert_eq!(h.sent(), vec![(GENERAL, "そうなんですね".to_string())]);
+    assert!(
+        std::fs::read_to_string(memory_file(&h))
+            .unwrap()
+            .contains("dave は朝型")
+    );
+}
+
+#[tokio::test]
+async fn posted_join_report_strips_memo_and_appends_it() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(with_delivery(
+        spawn_answers("web_research"),
+        "normal_report",
+    ));
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.provider.script_text("晴れでした\n[Memo] 東京は今日晴れ");
+    h.say(GENERAL, "天気調べて").await;
+    assert_eq!(h.process_next_job().await, "join");
+
+    let sent = h.sent();
+    assert_eq!(sent[1].1, "晴れでした");
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert_eq!(turns[3].text, "晴れでした\n[Memo] 東京は今日晴れ");
+    assert!(
+        std::fs::read_to_string(memory_file(&h))
+            .unwrap()
+            .contains("東京は今日晴れ")
+    );
 }

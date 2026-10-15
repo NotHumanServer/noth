@@ -130,6 +130,8 @@ pub trait Router: Send + Sync {
 pub struct LayeredPrompt {
     pub harness_rules: String,
     pub profile: String,
+    /// Layer 1.5。見出し付きで Core が整形済み。空なら出さない。provider は Layer 2 の直前に置く
+    pub memory: String,
     pub episodic_digest: String,
     pub active_log: Vec<Turn>,
     pub ephemeral_tail: Vec<Turn>,

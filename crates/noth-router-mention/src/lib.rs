@@ -114,6 +114,9 @@ impl MentionRouter {
             "is_topic_shift" => Answer::Noul {
                 p: if self.topic_shift(state) { 1.0 } else { 0.0 },
             },
+            "addressed_to_noth" => Answer::Noul {
+                p: if self.addressed(state) { 1.0 } else { 0.0 },
+            },
             "task_category" => choice(q, "none"),
             _ => match q {
                 Question::Noul { .. } => Answer::Noul { p: 0.0 },
@@ -384,6 +387,32 @@ mod tests {
         assert!(
             matches!(&d.answers["mystery_score"], Answer::Score { score, .. } if *score == 0.0)
         );
+    }
+
+    #[tokio::test]
+    async fn addressed_to_noth_follows_mentions_replies_and_keywords() {
+        let ask = |trigger: serde_json::Value| async move {
+            let d = run(
+                &router(&["noth"]),
+                json!({ "trigger": [trigger] }),
+                vec![("addressed_to_noth", noul())],
+            )
+            .await;
+            let Answer::Noul { p } = d.answers["addressed_to_noth"] else {
+                panic!("noul ではない");
+            };
+            p
+        };
+        assert_eq!(
+            ask(json!({"content": "こんにちは", "mentions_self": true})).await,
+            1.0
+        );
+        assert_eq!(
+            ask(json!({"content": "はい", "reply_to_self": true})).await,
+            1.0
+        );
+        assert_eq!(ask(json!({"content": "noth、いる?"})).await, 1.0);
+        assert_eq!(ask(json!({"content": "ただの雑談"})).await, 0.0);
     }
 
     #[tokio::test]

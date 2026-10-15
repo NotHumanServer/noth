@@ -751,6 +751,38 @@ impl Store {
         Ok(r.last_insert_rowid())
     }
 
+    // --- memory_versions ---
+    /// `content` は書き換える前の MEMORY.md
+    pub async fn insert_memory_version(
+        &self,
+        guild: GuildId,
+        reason: &str,
+        content: &str,
+    ) -> Result<i64> {
+        let r = sqlx::query(
+            "INSERT INTO memory_versions (guild_id, reason, content, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(guild as i64)
+        .bind(reason)
+        .bind(content)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.last_insert_rowid())
+    }
+    /// 新しい順の (reason, content)
+    pub async fn memory_versions(&self, guild: GuildId) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT reason, content FROM memory_versions WHERE guild_id = ? ORDER BY id DESC",
+        )
+        .bind(guild as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get("reason")?, r.try_get("content")?)))
+            .collect()
+    }
+
     // --- worker_runs ---
     pub async fn abort_pending_runs(&self, guild: GuildId) -> Result<u64> {
         let r = sqlx::query(
@@ -1621,6 +1653,22 @@ mod tests {
         }
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_versions_newest_first() {
+        let s = Store::open_memory().await.unwrap();
+        s.insert_memory_version(G, "memo", "v1").await.unwrap();
+        s.insert_memory_version(G, "dreaming", "v2").await.unwrap();
+        let got = s.memory_versions(G).await.unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("dreaming".to_string(), "v2".to_string()),
+                ("memo".to_string(), "v1".to_string())
+            ]
+        );
+        assert!(s.memory_versions(G + 1).await.unwrap().is_empty());
     }
 
     #[tokio::test]

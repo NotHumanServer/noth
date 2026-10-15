@@ -127,6 +127,7 @@ pub fn build_request(
     let system = [
         &prompt.harness_rules,
         &prompt.profile,
+        &prompt.memory,
         &prompt.episodic_digest,
     ]
     .into_iter()
@@ -463,6 +464,17 @@ mod tests {
             "HIGH"
         );
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn memory_sits_between_profile_and_digest() {
+        let mut p = prompt();
+        p.memory = "memory".into();
+        let body = build_request(&p, &params(), None).unwrap();
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "rules\n\nprofile\n\nmemory\n\ndigest"
+        );
     }
 
     #[test]

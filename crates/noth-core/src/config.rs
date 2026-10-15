@@ -63,6 +63,16 @@ impl Paths {
     pub fn logs_dir(&self) -> PathBuf {
         self.home.join("logs")
     }
+    pub fn memory_dir(&self) -> PathBuf {
+        self.home.join("profiles").join("memory")
+    }
+    /// Layer 1.5 の長期記憶。人が直接編集してもよい
+    pub fn memory_file(&self) -> PathBuf {
+        self.memory_dir().join("MEMORY.md")
+    }
+    pub fn daily_dir(&self) -> PathBuf {
+        self.memory_dir().join("daily")
+    }
     /// Codex のトークンは更新のたびに書き換わるので、`.env` ではなくここに置く(security.md §5)
     pub fn codex_auth(&self) -> PathBuf {
         self.home.join("data").join("codex-auth.json")
@@ -103,6 +113,9 @@ pub struct Thresholds {
     pub min_confidence: f32,
     #[serde(default = "d025")]
     pub name_call_reply: f32,
+    /// Noth 宛てと判定する確率。以上なら静観を返答に引き上げる
+    #[serde(default = "d06")]
+    pub addressed_to_noth: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -162,6 +175,55 @@ pub struct CompactorSettings {
     pub digest_max_chars: usize,
 }
 
+/// これより小さいと雛形の 4 見出しすら収まらず、Dreaming も記憶を整理できない
+const MIN_MEMORY_MAX_CHARS: usize = 500;
+
+/// 長期記憶 MEMORY.md(Layer 1.5)と Dreaming
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemorySettings {
+    #[serde(default = "default_true")]
+    pub memo: bool,
+    #[serde(default = "default_memo_max_per_reply")]
+    pub memo_max_per_reply: usize,
+    #[serde(default = "default_memory_max_chars")]
+    pub memory_max_chars: usize,
+    #[serde(default = "default_true")]
+    pub dreaming: bool,
+    #[serde(default = "default_dreaming_hour")]
+    pub dreaming_hour: u8,
+    #[serde(default = "default_dream_input_max_chars")]
+    pub dream_input_max_chars: usize,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            memo: true,
+            memo_max_per_reply: default_memo_max_per_reply(),
+            memory_max_chars: default_memory_max_chars(),
+            dreaming: true,
+            dreaming_hour: default_dreaming_hour(),
+            dream_input_max_chars: default_dream_input_max_chars(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_memo_max_per_reply() -> usize {
+    3
+}
+fn default_memory_max_chars() -> usize {
+    6_000
+}
+fn default_dreaming_hour() -> u8 {
+    4
+}
+fn default_dream_input_max_chars() -> usize {
+    60_000
+}
+
 fn default_max_concurrent() -> usize {
     2
 }
@@ -198,6 +260,7 @@ pub struct Config {
     pub profile: ProfileSection,
     pub context: ContextSection,
     pub router: RouterSection,
+    pub memory: MemorySettings,
     /// `${VAR}` 解決後の全体。無効 module のセクションは未解決のまま
     pub table: toml::Table,
     /// `.env` の中身。プロセス環境変数には入れない
@@ -213,6 +276,7 @@ impl std::fmt::Debug for Config {
             .field("profile", &self.profile)
             .field("context", &self.context)
             .field("router", &self.router)
+            .field("memory", &self.memory)
             .field("table", &"<redacted>")
             .field("env", &"<redacted>")
             .finish()
@@ -235,6 +299,25 @@ impl Config {
         let profile = section(&table, "profile")?.unwrap_or_else(|| empty_section("profile"));
         let context = section(&table, "context")?.unwrap_or_else(|| empty_section("context"));
         let router = section(&table, "router")?.unwrap_or_else(|| empty_section("router"));
+        let memory: MemorySettings =
+            section(&table, "memory")?.unwrap_or_else(|| empty_section("memory"));
+        if memory.memory_max_chars < MIN_MEMORY_MAX_CHARS {
+            return Err(Error::Config(format!(
+                "[memory] memory_max_chars は {MIN_MEMORY_MAX_CHARS} 以上: {}",
+                memory.memory_max_chars
+            )));
+        }
+        if memory.memo && memory.memo_max_per_reply == 0 {
+            return Err(Error::Config(
+                "[memory] memo = true のとき memo_max_per_reply は 1 以上".into(),
+            ));
+        }
+        if memory.dreaming_hour > 23 {
+            return Err(Error::Config(format!(
+                "[memory] dreaming_hour は 0〜23: {}",
+                memory.dreaming_hour
+            )));
+        }
 
         Ok(Self {
             paths,
@@ -242,6 +325,7 @@ impl Config {
             profile,
             context,
             router,
+            memory,
             table,
             env,
         })
@@ -421,7 +505,7 @@ fn resolve_referenced(
     let is_enabled = |m: &str| enabled.iter().any(|e| e == m);
     let mut out = raw.clone();
 
-    for name in ["modules", "profile", "context"] {
+    for name in ["modules", "profile", "context", "memory"] {
         if let Some(v) = out.get_mut(name) {
             resolve_value(v, name, env, missing);
         }
@@ -618,6 +702,7 @@ is_topic_shift   = 0.6
 relevant_chunk   = 0.5
 min_confidence   = 0.15
 name_call_reply  = 0.25  # 呼び名で呼ばれたとき、reply_only と spawn_task の確率の合計がこれ以上なら応答する
+addressed_to_noth = 0.6  # 「Noth に向けた発言か」がこれ以上なら、静観を返答に引き上げる
 
 [router.systemone]
 preset     = "jev"               # jev | clef | custom
@@ -649,6 +734,14 @@ approval              = "auto"   # MVP では auto のみ
 idle_minutes      = 10           # 人間の最終発言からの経過。Noth 自身の投稿では解除しない
 keep_recent_turns = 6
 digest_max_chars  = 12000        # Layer 2 の上限。超えたら古いエピソードから削除する
+
+[memory]                         # 長期記憶 MEMORY.md(Layer 1.5)と Dreaming
+memo               = true        # 本線の [Memo] 行を MEMORY.md に追記する
+memo_max_per_reply = 3
+memory_max_chars   = 6000        # 超えている間は [Memo] を追記しない。Dreaming がこの長さに整理する
+dreaming           = true        # compactor module が必要
+dreaming_hour      = 4           # ローカル時刻。この時刻を過ぎた最初のアイドルで前日分を処理する
+dream_input_max_chars = 60000    # 日次レポートに渡す発言ログの上限
 
 [tool.web-search]
 backend = "tinyfish"
@@ -775,6 +868,7 @@ impl Default for Thresholds {
             relevant_chunk: d05(),
             min_confidence: d015(),
             name_call_reply: d025(),
+            addressed_to_noth: d06(),
         }
     }
 }
@@ -1036,6 +1130,69 @@ api_key = "${{OTHER}}"
         assert!(out.contains("****"));
         assert!(out.contains("debounce_secs = 2.5"));
         assert!(out.contains("plain"));
+    }
+
+    #[test]
+    fn memory_defaults_and_paths() {
+        let c = load("[modules]\nenabled = []\n", "").unwrap();
+        assert!(c.memory.memo && c.memory.dreaming);
+        assert_eq!(c.memory.memo_max_per_reply, 3);
+        assert_eq!(c.memory.memory_max_chars, 6000);
+        assert_eq!(c.memory.dreaming_hour, 4);
+        assert_eq!(c.memory.dream_input_max_chars, 60_000);
+        assert_eq!(c.router.thresholds.addressed_to_noth, 0.6);
+        let home = &c.paths.home;
+        assert_eq!(c.paths.memory_dir(), home.join("profiles/memory"));
+        assert_eq!(
+            c.paths.memory_file(),
+            home.join("profiles/memory/MEMORY.md")
+        );
+        assert_eq!(c.paths.daily_dir(), home.join("profiles/memory/daily"));
+    }
+
+    #[test]
+    fn memory_section_is_read_and_hour_is_validated() {
+        let c = load(
+            "[modules]\nenabled = []\n[memory]\nmemo = false\ndreaming_hour = 23\nmemory_max_chars = 500\n",
+            "",
+        )
+        .unwrap();
+        assert!(!c.memory.memo);
+        assert_eq!(c.memory.dreaming_hour, 23);
+        assert_eq!(c.memory.memory_max_chars, 500);
+        let err = load(
+            "[modules]\nenabled = []\n[memory]\ndreaming_hour = 24\n",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dreaming_hour"), "{err}");
+        assert!(
+            load(
+                "[modules]\nenabled = []\n[memory]\ndreaming_hour = -1\n",
+                ""
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn memory_limits_are_validated() {
+        let err = |memory: &str| {
+            load(&format!("[modules]\nenabled = []\n[memory]\n{memory}"), "")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("memory_max_chars = 499\n").contains("memory_max_chars"));
+        assert!(err("memo_max_per_reply = 0\n").contains("memo_max_per_reply"));
+        // memo を無効にしていれば件数の検査はしない
+        assert!(
+            load(
+                "[modules]\nenabled = []\n[memory]\nmemo = false\nmemo_max_per_reply = 0\n",
+                ""
+            )
+            .is_ok()
+        );
     }
 
     #[test]

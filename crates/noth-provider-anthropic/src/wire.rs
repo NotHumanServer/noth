@@ -197,8 +197,15 @@ pub fn build_request(
         prompt.harness_rules, prompt.profile
     ))];
     system[0]["cache_control"] = ttl.cache_control();
-    if !prompt.episodic_digest.is_empty() {
-        let mut block = text_block(&prompt.episodic_digest);
+    // Layer 1.5 は Layer 2 と同じブロックの先頭に置く。ブレークポイントは Layer 2 末尾の 1 つのまま
+    let layer2 = [&prompt.memory, &prompt.episodic_digest]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !layer2.is_empty() {
+        let mut block = text_block(&layer2);
         block["cache_control"] = ttl.cache_control();
         system.push(block);
     }
@@ -448,6 +455,25 @@ mod tests {
         assert_eq!(body["max_tokens"], 100);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn memory_leads_layer2_block_without_extra_breakpoint() {
+        let mut p = prompt();
+        p.memory = "memory".into();
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2);
+        assert_eq!(sys[1]["text"], "memory\n\ndigest");
+        assert_eq!(count_cache_controls(&body), 3);
+
+        // Layer 2 が空でも記憶だけで 1 ブロックを作り、境界はそこに置く
+        p.episodic_digest.clear();
+        let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys[1]["text"], "memory");
+        assert!(sys[1].get("cache_control").is_some());
+        assert_eq!(count_cache_controls(&body), 3);
     }
 
     #[test]

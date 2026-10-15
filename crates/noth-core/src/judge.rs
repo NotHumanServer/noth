@@ -12,13 +12,14 @@ use crate::types::*;
 
 pub const KEY_NOISE: &str = "is_noise_or_meme";
 pub const KEY_TOPIC_SHIFT: &str = "is_topic_shift";
+pub const KEY_ADDRESSED: &str = "addressed_to_noth";
 pub const KEY_ACTION: &str = "intervention_action";
 pub const KEY_TASK_CATEGORY: &str = "task_category";
 pub const KEY_DELIVERY: &str = "delivery_style";
 pub const KEY_REACTION: &str = "reaction";
 
 /// `is_noise_or_meme` など固定の質問の数。候補チャンクの上限は `max_questions() - FIXED_QUESTIONS`
-pub const FIXED_QUESTIONS: usize = 5;
+pub const FIXED_QUESTIONS: usize = 6;
 
 pub fn relevant_key(chunk_id: i64) -> String {
     format!("relevant_chunk_{chunk_id}")
@@ -185,6 +186,16 @@ pub fn build_questions(candidates: &[ChunkRow], reactions: &[Reaction]) -> Vec<(
                 instructions: "今回のトリガー発言群が、同じチャンネルの直前の会話(recent のうち同じ channel_id の発言)から\
                     話題が切り替わったかを判定してください。同じ話題の続きや、少し脱線しただけの発言は切り替わりではありません。\
                     別のチャンネルの発言は無関係として扱い、そのチャンネルに直前の発言がなければ切り替わりではないとしてください。"
+                    .into(),
+            },
+        ),
+        (
+            KEY_ADDRESSED.to_string(),
+            Question::Noul {
+                instructions: "今回のトリガー発言群が、Noth に向けたものかを判定してください。\
+                    Noth への質問や依頼、Noth 自身(その仕組みや設定、できることを含む)についての問いかけ、\
+                    Noth の発言への返事は、Noth に向けたものです。Noth が何者かは state.noth を参考にしてください。\
+                    人間同士が Noth を話題にしているだけで、Noth に話しかけていない発言は含みません。"
                     .into(),
             },
         ),
@@ -357,12 +368,25 @@ fn insert_reply_to(v: &mut Value, reply_to: Option<&ReplyTo>) {
     }
 }
 
-/// recent は trigger を除いて直近 `recent_messages` 件に絞り、`state_max_chars` を超える間は古い方から捨てる
+/// state の `noth` と `members` に入れる、router に Noth と仲間を教える材料
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Roster<'a> {
+    /// MEMORY.md の `## Noth について` の本文
+    pub noth: &'a str,
+    /// Layer 1 のメンバー一覧
+    pub members: &'a [Member],
+    /// MEMORY.md の `## メンバー` の本文
+    pub members_memory: &'a str,
+}
+
+/// recent は trigger を除いて直近 `recent_messages` 件に絞り、`state_max_chars` を超える間は古い方から捨てる。
+/// それでも超えるときは `members` の記憶、`noth` の順に削る
 pub fn build_state(
     batch: &JudgeBatch,
     recent: &[MessageRow],
     candidates: &[ChunkRow],
     channel_names: &HashMap<ChannelId, String>,
+    roster: &Roster,
     cfg: &RouterSection,
 ) -> RouterState {
     let trigger_ids: HashSet<i64> = batch.messages.iter().map(|m| m.row_id).collect();
@@ -416,13 +440,36 @@ pub fn build_state(
         })
         .collect();
 
-    let mut state = json!({ "trigger": trigger, "recent": recent, "candidates": candidates });
+    let mut state = json!({});
+    if !roster.noth.is_empty() {
+        state["noth"] = json!(roster.noth);
+    }
+    if !roster.members.is_empty() || !roster.members_memory.is_empty() {
+        let list: Vec<Value> = roster
+            .members
+            .iter()
+            .map(|m| json!({ "name": m.display_name, "roles": m.roles }))
+            .collect();
+        state["members"] = json!({ "list": list });
+        if !roster.members_memory.is_empty() {
+            state["members"]["memory"] = json!(roster.members_memory);
+        }
+    }
+    state["trigger"] = json!(trigger);
+    state["recent"] = json!(recent);
+    state["candidates"] = json!(candidates);
     while char_len(&state) > cfg.state_max_chars {
         let recent = state["recent"].as_array_mut().expect("recent は配列");
         if recent.is_empty() {
             break;
         }
         recent.remove(0);
+    }
+    for path in [&["members", "memory"][..], &["noth"][..]] {
+        let excess = char_len(&state).saturating_sub(cfg.state_max_chars);
+        if excess > 0 {
+            shrink_text_at(&mut state, path, excess);
+        }
     }
     // recent を空にしても収まらないのは、trigger か候補要約が単独で大きいとき。router に上限を超えて渡さない
     loop {
@@ -432,6 +479,31 @@ pub fn build_state(
         }
     }
     RouterState(state)
+}
+
+/// `path` の文字列を末尾から `excess` 文字ぶん削る。空になったら key ごと外す
+fn shrink_text_at(state: &mut Value, path: &[&str], excess: usize) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut parent = &mut *state;
+    for key in parents {
+        let Some(next) = parent.get_mut(*key) else {
+            return;
+        };
+        parent = next;
+    }
+    let Some(text) = parent.get(*last).and_then(Value::as_str) else {
+        return;
+    };
+    let keep = text.chars().count().saturating_sub(excess);
+    if keep == 0 {
+        if let Some(map) = parent.as_object_mut() {
+            map.remove(*last);
+        }
+    } else {
+        parent[*last] = Value::String(text.chars().take(keep).collect());
+    }
 }
 
 /// trigger の本文と候補の要約のうち最長のものを `excess` 文字ぶん削る。削れるものが無ければ false
@@ -544,7 +616,7 @@ pub fn binarize(
             Some("code_or_tool") => TaskCategory::CodeOrTool,
             _ => TaskCategory::None,
         };
-    Binarized {
+    let mut binarized = Binarized {
         is_noise: noul(KEY_NOISE, th.is_noise_or_meme),
         is_topic_shift: noul(KEY_TOPIC_SHIFT, th.is_topic_shift),
         action,
@@ -555,7 +627,12 @@ pub fn binarize(
             .filter(|id| noul(&relevant_key(*id), th.relevant_chunk))
             .collect(),
         reaction,
+    };
+    // 「誰に向けた発言か」と「割り込むべきか」を 1 問で聞くと Noth の仕組みの質問が静観されやすいので、宛先だけを別に聞く
+    if noul(KEY_ADDRESSED, th.addressed_to_noth) {
+        binarized.answer_direct_call();
     }
+    binarized
 }
 
 /// `decisions.answers` に入れる JSON。閾値の調整や分析のため、二値化前の確率と confidence をそのまま残す
@@ -688,7 +765,7 @@ mod tests {
                 reply_to: None,
             }],
         };
-        let state = build_state(&batch, &[], &[], &HashMap::new(), &cfg);
+        let state = build_state(&batch, &[], &[], &HashMap::new(), &Roster::default(), &cfg);
         assert!(char_len(&state.0) <= 500);
         assert!(
             !state.0["trigger"][0]["content"]
@@ -828,7 +905,7 @@ mod tests {
             messages: vec![pending(1, Some(reply)), pending(2, None)],
         };
         let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
-        let state = build_state(&batch, &[], &[], &HashMap::new(), &cfg);
+        let state = build_state(&batch, &[], &[], &HashMap::new(), &Roster::default(), &cfg);
         assert_eq!(
             state.0["trigger"][0]["reply_to"],
             json!({"author": "bob", "is_self": true, "excerpt": "元の発言"})
@@ -851,6 +928,163 @@ mod tests {
                 reply_to: None,
             }],
         }
+    }
+
+    fn member(name: &str, roles: &[&str]) -> Member {
+        Member {
+            user_id: 1,
+            display_name: name.into(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn state_carries_noth_and_members() {
+        let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
+        let members = [member("alice", &["admin"]), member("bob", &[])];
+        let roster = Roster {
+            noth: "Noth は Bot",
+            members: &members,
+            members_memory: "- alice: 開発者",
+        };
+        let state = build_state(
+            &one_message_batch(),
+            &[],
+            &[],
+            &HashMap::new(),
+            &roster,
+            &cfg,
+        );
+        assert_eq!(state.0["noth"], "Noth は Bot");
+        assert_eq!(
+            state.0["members"],
+            json!({
+                "list": [
+                    {"name": "alice", "roles": ["admin"]},
+                    {"name": "bob", "roles": []},
+                ],
+                "memory": "- alice: 開発者",
+            })
+        );
+
+        // 記憶もメンバーも無ければ key ごと省く
+        let state = build_state(
+            &one_message_batch(),
+            &[],
+            &[],
+            &HashMap::new(),
+            &Roster::default(),
+            &cfg,
+        );
+        assert!(state.0.get("noth").is_none());
+        assert!(state.0.get("members").is_none());
+    }
+
+    #[test]
+    fn state_truncates_recent_then_members_memory_then_noth() {
+        let recent: Vec<MessageRow> = (1..=3)
+            .map(|i| MessageRow {
+                id: 100 + i,
+                guild_id: 1,
+                channel_id: 1,
+                channel_name: "general".into(),
+                message_id: i as u64,
+                user_id: 1,
+                author_name: "bob".into(),
+                is_self: false,
+                mentions_self: false,
+                reply_to_self: false,
+                reply_to: None,
+                content: "い".repeat(100),
+                created_at: Timestamp::UNIX_EPOCH,
+                chunk_id: None,
+                is_noise: None,
+                decision_id: None,
+                promoted_turn_id: None,
+            })
+            .collect();
+        let members = [member("alice", &[])];
+        let roster = Roster {
+            noth: &"n".repeat(300),
+            members: &members,
+            members_memory: &"m".repeat(300),
+        };
+        let build = |max: usize, recent: &[MessageRow]| {
+            let cfg = RouterSection {
+                state_max_chars: max,
+                ..serde_json::from_value(json!({})).unwrap()
+            };
+            build_state(
+                &one_message_batch(),
+                recent,
+                &[],
+                &HashMap::new(),
+                &roster,
+                &cfg,
+            )
+            .0
+        };
+        let full = char_len(&build(usize::MAX, &recent));
+        let base = char_len(&build(usize::MAX, &[]));
+        let len = |v: &Value, path: &[&str]| {
+            path.iter()
+                .try_fold(v, |v, k| v.get(*k))
+                .and_then(Value::as_str)
+                .map(|s| s.chars().count())
+        };
+
+        // 少し超えるだけなら recent だけが減る
+        let v = build(full - 50, &recent);
+        assert!(v["recent"].as_array().unwrap().len() < 3);
+        assert_eq!(len(&v, &["members", "memory"]), Some(300));
+        assert_eq!(len(&v, &["noth"]), Some(300));
+
+        // recent を空にしても超えるなら members の記憶が削れ、noth は残る
+        let v = build(base - 100, &recent);
+        assert!(v["recent"].as_array().unwrap().is_empty());
+        assert_eq!(len(&v, &["members", "memory"]), Some(200));
+        assert_eq!(len(&v, &["noth"]), Some(300));
+
+        // それでも超えるなら noth が削れる
+        let v = build(base - 400, &recent);
+        assert!(char_len(&v) <= base - 400);
+        assert!(len(&v, &["members", "memory"]).is_none());
+        assert!(len(&v, &["noth"]).unwrap() < 300);
+        assert_eq!(v["members"]["list"][0]["name"], "alice");
+    }
+
+    #[test]
+    fn addressed_to_noth_lifts_silent_to_reply() {
+        let th = Thresholds::default();
+        let silent = || (KEY_ACTION, choice("silent", 0.9, 0.9, &ACTIONS));
+        let b = binarize(
+            &decision(vec![silent(), (KEY_ADDRESSED, Answer::Noul { p: 0.6 })]),
+            &[],
+            &[],
+            &th,
+            false,
+        );
+        assert_eq!(b.action, Action::ReplyOnly);
+
+        let b = binarize(
+            &decision(vec![silent(), (KEY_ADDRESSED, Answer::Noul { p: 0.59 })]),
+            &[],
+            &[],
+            &th,
+            false,
+        );
+        assert_eq!(b.action, Action::Silent);
+
+        // ノイズ判定より優先し、react はそのまま残す
+        let d = decision(vec![
+            (KEY_NOISE, Answer::Noul { p: 0.9 }),
+            (KEY_ADDRESSED, Answer::Noul { p: 0.9 }),
+            (KEY_ACTION, choice("react", 0.9, 0.9, &ACTIONS)),
+            (KEY_REACTION, choice("r0", 0.9, 0.9, &["r0", "r1"])),
+        ]);
+        let b = binarize(&d, &[], &reactions(), &th, false);
+        assert!(!b.is_noise);
+        assert_eq!(b.action, Action::React);
     }
 
     #[test]
@@ -882,11 +1116,41 @@ mod tests {
         };
         let recent = [row(101, Some(reply)), row(102, None)];
         let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
-        let state = build_state(&one_message_batch(), &recent, &[], &HashMap::new(), &cfg);
+        let state = build_state(
+            &one_message_batch(),
+            &recent,
+            &[],
+            &HashMap::new(),
+            &Roster::default(),
+            &cfg,
+        );
         assert_eq!(
             state.0["recent"][0]["reply_to"],
             json!({"author": "alice", "is_self": false, "excerpt": "元"})
         );
         assert!(state.0["recent"][1].get("reply_to").is_none());
+    }
+
+    #[test]
+    fn shrinking_does_not_invent_missing_keys() {
+        let cfg = RouterSection {
+            state_max_chars: 600,
+            ..serde_json::from_value(json!({})).unwrap()
+        };
+        let mut batch = one_message_batch();
+        batch.messages[0].content = "あ".repeat(2000);
+        let state = build_state(&batch, &[], &[], &HashMap::new(), &Roster::default(), &cfg);
+        assert!(state.0.get("members").is_none());
+        assert!(state.0.get("noth").is_none());
+        assert!(char_len(&state.0) <= 600);
+    }
+
+    #[test]
+    fn addressed_question_is_a_noul() {
+        let qs = build_questions(&[], &[]);
+        assert!(matches!(
+            qs.iter().find(|(k, _)| k == KEY_ADDRESSED),
+            Some((_, Question::Noul { .. }))
+        ));
     }
 }

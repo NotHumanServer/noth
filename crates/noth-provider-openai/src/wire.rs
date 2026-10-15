@@ -45,9 +45,11 @@ pub fn parse_effort(s: &str) -> Result<&'static str> {
 /// Layer 0→1→2→3→4 の順を崩さないことだけがキャッシュヒットの条件になる
 fn system_text(prompt: &LayeredPrompt) -> String {
     let mut s = format!("{}\n\n{}", prompt.harness_rules, prompt.profile);
-    if !prompt.episodic_digest.is_empty() {
-        s.push_str("\n\n");
-        s.push_str(&prompt.episodic_digest);
+    for layer in [&prompt.memory, &prompt.episodic_digest] {
+        if !layer.is_empty() {
+            s.push_str("\n\n");
+            s.push_str(layer);
+        }
     }
     s
 }
@@ -683,6 +685,17 @@ mod tests {
         assert_eq!(
             body["tools"][0],
             json!({"type": "function", "function": {"name": "web_search", "description": "検索", "parameters": {"type": "object"}}})
+        );
+    }
+
+    #[test]
+    fn memory_sits_between_profile_and_digest() {
+        let mut p = prompt();
+        p.memory = "memory".into();
+        let body = build_chat_request("m", &p, &params(), None, true).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"],
+            "rules\n\nprofile\n\nmemory\n\ndigest"
         );
     }
 

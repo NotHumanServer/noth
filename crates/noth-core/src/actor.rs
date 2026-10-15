@@ -20,7 +20,7 @@ use crate::traits::{
     WorkerTask,
 };
 use crate::types::*;
-use crate::{Error, Result, bus, heartbeat, ingest, progress, restore};
+use crate::{Error, Result, bus, heartbeat, ingest, memory, progress, restore};
 
 /// typing インジケータは Discord 側で約 10 秒で消えるので、それより短い間隔で再送する
 const TYPING_INTERVAL: Duration = Duration::from_secs(8);
@@ -219,6 +219,10 @@ pub struct Actor {
     compacted_for: Option<i64>,
     harness_rules: String,
     profile: String,
+    /// Layer 1.5。起動時とコンパクション後だけ読み直す。[Memo] の追記では更新しない(Layer 1.5 以降のキャッシュが全て外れるため)
+    memory: String,
+    /// router の state に渡す。Layer 1 と同じく起動時に取った一覧
+    members: Vec<Member>,
     digest: String,
     channel_names: HashMap<ChannelId, String>,
     /// チャンネルごとに、Noth が最後に応答した時刻とそのとき話しかけてきた人。再起動で消えてよい一時的な手がかり
@@ -229,9 +233,20 @@ pub struct Actor {
 
 /// 本線が Worker に任せると決めた内容
 struct TaskPlan {
+    /// Discord に投稿する Ack。[Memo] 行を除いてある
     ack: String,
+    /// Layer 3 に残す Ack。[Memo] 行を含む
+    log_ack: String,
+    memos: Vec<String>,
     goal: String,
     category: TaskCategory,
+}
+
+/// 本線の応答から [Memo] 行を分けたもの
+struct Reply {
+    /// Discord に投稿する本文。空なら投稿しない
+    post: String,
+    memos: Vec<String>,
 }
 
 impl Actor {
@@ -270,8 +285,13 @@ impl Actor {
                 .map_or(FALLBACK_KEEP_RECENT_TURNS, |s| s.keep_recent_turns),
         };
         Ok(Self {
-            harness_rules: layers::harness_rules(worker.is_some()),
+            harness_rules: layers::harness_rules(worker.is_some(), &config.memory),
             profile: layers::profile_layer(&config, members),
+            memory: memory::layer_text(
+                &memory::read(&config.paths.memory_file()),
+                config.memory.memory_max_chars,
+            ),
+            members: members.to_vec(),
             digest,
             config,
             guild,
@@ -368,11 +388,19 @@ impl Actor {
                 .or_insert_with(|| r.channel_name.clone());
         }
 
+        // 手で直した内容がすぐ判定に効くよう、state 用には毎回ディスクから読む(router の入力はキャッシュに影響しない)
+        let memory_text = memory::read(&self.config.paths.memory_file());
+        let roster = judge::Roster {
+            noth: &memory::section(&memory_text, memory::HEADING_NOTH),
+            members: &self.members,
+            members_memory: &memory::section(&memory_text, memory::HEADING_MEMBERS),
+        };
         let state = judge::build_state(
             &batch,
             &recent,
             &candidates,
             &self.channel_names,
+            &roster,
             &self.config.router,
         );
         let questions = judge::build_questions(&candidates, &self.config.router.reactions);
@@ -550,12 +578,22 @@ impl Actor {
             tracing::info!("本線の応答が空でした。投稿せずバッファに残します");
             return Ok(());
         };
-        if let Err(e) = self.channel.send(batch.channel_id, text, None).await {
+        let reply = self.split_reply(text);
+        if reply.post.is_empty() && reply.memos.is_empty() {
+            tracing::info!("本線の応答が空でした。投稿せずバッファに残します");
+            return Ok(());
+        }
+        if !reply.post.is_empty()
+            && let Err(e) = self.channel.send(batch.channel_id, &reply.post, None).await
+        {
             tracing::warn!(error = %e, "応答を投稿できませんでした。バッファに残します");
             return Ok(());
         }
 
-        self.note_conversation(batch);
+        // [Memo] だけの応答は何も投稿しないが、覚えた事実を本線が次のターンから知っているよう Layer 3 には残す
+        if !reply.post.is_empty() {
+            self.note_conversation(batch);
+        }
         let row_ids: Vec<i64> = batch.messages.iter().map(|m| m.row_id).collect();
         self.store
             .record_reply(
@@ -566,7 +604,44 @@ impl Actor {
                 &completion.usage,
             )
             .await?;
+        self.record_memos(&reply.memos).await;
         self.enforce_hard_limit(chunk_id).await
+    }
+
+    /// `memo` が無効なら本文に手を付けない
+    fn split_reply(&self, text: &str) -> Reply {
+        if !self.config.memory.memo {
+            return Reply {
+                post: text.to_string(),
+                memos: Vec::new(),
+            };
+        }
+        let (kept, memos) = memory::extract_memos(text);
+        Reply {
+            post: kept.trim().to_string(),
+            memos: memory::normalize_memos(memos, self.config.memory.memo_max_per_reply),
+        }
+    }
+
+    /// 追記に失敗しても会話は止めない。覚え損ねるだけで、応答は投稿済み
+    async fn record_memos(&self, memos: &[String]) {
+        if memos.is_empty() {
+            return;
+        }
+        match memory::append_memos(
+            &self.store,
+            self.guild,
+            &self.config.paths.memory_file(),
+            self.config.memory.memory_max_chars,
+            memos,
+            Timestamp::now(),
+        )
+        .await
+        {
+            Ok(0) => tracing::info!("MEMORY.md には追記しませんでした(重複、または上限超過)"),
+            Ok(n) => tracing::info!(memos = n, "MEMORY.md に追記しました"),
+            Err(e) => tracing::warn!(error = %e, "MEMORY.md に追記できませんでした"),
+        }
     }
 
     /// 本線の応答が Worker への委譲かどうか。router が reply_only と判定していても、本線が `[Goal]` を書いたか
@@ -576,15 +651,25 @@ impl Actor {
         if !completion.tool_calls.is_empty() {
             return Some(TaskPlan {
                 ack: layers::FIXED_ACK.to_string(),
+                log_ack: layers::FIXED_ACK.to_string(),
+                memos: Vec::new(),
                 goal: layers::goal_from_tool_calls(&completion.tool_calls),
                 category: category_for_tools(&completion.tool_calls, category),
             });
         }
         // `[Goal]` 行が無いのは、本線が調べなくても答えられると判断したか書式を守らなかったとき。
         // Goal の無い Worker には任せる内容が無いので、spawn_task でも普通の返事として投稿する
-        let (ack, goal) = layers::split_ack_goal(completion.text.as_deref()?)?;
+        let (log_ack, goal) = layers::split_ack_goal(completion.text.as_deref()?)?;
+        let reply = self.split_reply(&log_ack);
         Some(TaskPlan {
-            ack,
+            // Ack が [Memo] だけなら、何も言わずに作業を始めないよう定型 Ack にする
+            ack: if reply.post.is_empty() {
+                layers::FIXED_ACK.to_string()
+            } else {
+                reply.post
+            },
+            log_ack,
+            memos: reply.memos,
             goal,
             // router が作業不要と見ていた場合は shell を許さない側に倒す(security.md §3)
             category: match category {
@@ -633,12 +718,13 @@ impl Actor {
             .record_task(
                 guild,
                 &trigger,
-                &layers::task_response_turn(chunk_id, &plan.ack, &plan.goal),
+                &layers::task_response_turn(chunk_id, &plan.log_ack, &plan.goal),
                 &row_ids,
                 usage,
                 &run,
             )
             .await?;
+        self.record_memos(&plan.memos).await;
         tracing::info!(run_id = %run.run_id, category = crate::store::category_str(run.task_category), "Worker を起動します");
         // Worker の base も本線と同じ上限に収めるため、Fork より前に緊急コンパクションを済ませる
         self.enforce_hard_limit(chunk_id).await?;
@@ -825,13 +911,32 @@ impl Actor {
             .filter(|_| style == DeliveryStyle::ReplyAnchor);
         let posted = match &completion {
             Ok(c) => match c.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                Some(text) => match self.channel.send(run.channel_id, text, reply_to).await {
-                    Ok(_) => Some(text.to_string()),
-                    Err(e) => {
-                        tracing::warn!(error = %e, run_id, "報告を投稿できませんでした");
+                Some(text) => {
+                    let reply = self.split_reply(text);
+                    if reply.post.is_empty() {
+                        // 投稿していない応答は Layer 3 に残さない。覚えた事実だけは書く
+                        self.record_memos(&reply.memos).await;
+                        tracing::info!(run_id, "報告の応答が空でした");
                         None
+                    } else {
+                        match self
+                            .channel
+                            .send(run.channel_id, &reply.post, reply_to)
+                            .await
+                        {
+                            Ok(_) => {
+                                self.record_memos(&reply.memos).await;
+                                Some(text.to_string())
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, run_id, "報告を投稿できませんでした");
+                                // Join は再試行しないので、覚えた事実だけは残す
+                                self.record_memos(&reply.memos).await;
+                                None
+                            }
+                        }
                     }
-                },
+                }
                 None => {
                     tracing::info!(run_id, "報告の応答が空でした");
                     None
@@ -955,6 +1060,11 @@ impl Actor {
             .replace_with_digest(self.guild, &digest, turn_ids, compacted_chunks)
             .await?;
         self.digest = digest;
+        // キャッシュはコンパクションで切れるので、この機会に Layer 1.5 も読み直す
+        self.memory = memory::layer_text(
+            &memory::read(&self.config.paths.memory_file()),
+            self.config.memory.memory_max_chars,
+        );
         Ok(())
     }
 
@@ -962,6 +1072,7 @@ impl Actor {
         layers::assemble(
             &self.harness_rules,
             &self.profile,
+            &self.memory,
             &self.digest,
             active_log,
             tail,

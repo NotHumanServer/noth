@@ -23,6 +23,7 @@ pub async fn run(cfg: Option<&Path>, non_interactive: bool) -> Result<ExitCode> 
         // シークレットを置くので他ユーザーから読めないようにする
         write_new(&p.env, template_env(), 0o600)?;
         write_new(&p.profile("default"), template_profile(), 0o644)?;
+        write_new(&p.memory_file(), &noth_core::memory::template(), 0o600)?;
 
         println!();
         println!("次の手順:");
@@ -50,6 +51,7 @@ fn create_dirs(p: &Paths) -> Result<()> {
     for dir in [
         p.home.clone(),
         p.home.join("profiles"),
+        p.memory_dir(),
         p.home.join("data"),
         p.home.join("work"),
         p.logs_dir(),
@@ -448,6 +450,8 @@ async fn interactive(cfg: Option<&Path>, p: &Paths) -> Result<ExitCode> {
     if write_profile {
         write_overwrite(&p.profile("default"), template_profile(), 0o644)?;
     }
+    // 会話で貯まった記憶を含むので、再実行しても上書きしない
+    write_new(&p.memory_file(), &noth_core::memory::template(), 0o600)?;
     println!(
         "profile は {} を編集してキャラクターを調整できます",
         p.profile("default").display()
@@ -527,5 +531,29 @@ mod tests {
         let list = edit::enabled_list(&doc);
         assert!(list.iter().all(|m| !m.starts_with("tool-")), "{list:?}");
         assert!(list.contains(&"worker".to_string()));
+    }
+
+    #[tokio::test]
+    async fn non_interactive_creates_memory_template_and_keeps_existing() {
+        let home =
+            std::env::temp_dir().join(format!("noth-init-memory-test-{}", std::process::id()));
+        let config = home.join("config.toml");
+        run(Some(&config), true).await.unwrap();
+        let p = Paths::resolve(Some(&config)).unwrap();
+        let text = fs::read_to_string(p.memory_file()).unwrap();
+        assert!(text.contains("## Noth について") && text.contains("## メモ"));
+        assert_eq!(
+            fs::metadata(p.memory_file()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // 再実行しても、貯まった記憶を雛形で上書きしない
+        fs::write(p.memory_file(), "## メモ\n- 記憶\n").unwrap();
+        run(Some(&config), true).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(p.memory_file()).unwrap(),
+            "## メモ\n- 記憶\n"
+        );
+        let _ = fs::remove_dir_all(&home);
     }
 }
