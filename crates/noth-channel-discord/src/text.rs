@@ -4,6 +4,12 @@ use noth_core::types::UserId;
 
 use crate::MESSAGE_LIMIT;
 
+/// `!` で始まる発言は Noth に向けない独り言・メモとして扱い、判定にも記録にも回さない。
+/// 日本語入力のまま打つと全角になるので `！` も同じに扱う
+pub(crate) fn is_aside(content: &str) -> bool {
+    content.trim_start().starts_with(['!', '！'])
+}
+
 pub(crate) fn replace_mentions(
     content: &str,
     self_id: UserId,

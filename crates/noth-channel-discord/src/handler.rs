@@ -8,7 +8,7 @@ use serenity::all as sn;
 use serenity::prelude::{Context, EventHandler};
 
 use crate::state::{Names, SharedState, from_stage};
-use crate::text::replace_mentions;
+use crate::text::{is_aside, replace_mentions};
 
 pub(crate) struct Handler {
     pub(crate) bus: BusHandle,
@@ -47,7 +47,10 @@ impl EventHandler for Handler {
         let author_id = msg.author.id.get();
         let is_self = author_id == self.self_id;
         if !is_self
-            && (msg.author.bot || msg.webhook_id.is_some() || !self.allowed.contains(&author_id))
+            && (msg.author.bot
+                || msg.webhook_id.is_some()
+                || !self.allowed.contains(&author_id)
+                || is_aside(&msg.content))
         {
             return;
         }

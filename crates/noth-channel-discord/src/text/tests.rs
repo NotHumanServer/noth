@@ -9,6 +9,14 @@ fn replace(s: &str) -> String {
 }
 
 #[test]
+fn aside_prefix_is_half_or_full_width_bang_after_whitespace() {
+    assert!(is_aside("!メモ"));
+    assert!(is_aside("  ！テスト"));
+    assert!(!is_aside("のす！"));
+    assert!(!is_aside("これは!"));
+}
+
+#[test]
 fn mention_allowed_user_uses_display_name() {
     assert_eq!(replace("hi <@1> and <@!1>"), "hi alice and alice");
 }
