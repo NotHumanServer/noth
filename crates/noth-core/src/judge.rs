@@ -375,12 +375,12 @@ pub struct Roster<'a> {
     pub noth: &'a str,
     /// Layer 1 のメンバー一覧
     pub members: &'a [Member],
-    /// MEMORY.md の `## メンバー` の本文
-    pub members_memory: &'a str,
+    /// MEMORY.md の `## メンバー` の小見出しごとの本文(ユーザー ID と本文)。小見出しの外の項目は誰のものか決められないので含めない
+    pub member_memory: &'a [(UserId, String)],
 }
 
 /// recent は trigger を除いて直近 `recent_messages` 件に絞り、`state_max_chars` を超える間は古い方から捨てる。
-/// それでも超えるときは `members` の記憶、`noth` の順に削る
+/// それでも超えるときは各メンバーの記憶(長いものから)、`noth` の順に削る
 pub fn build_state(
     batch: &JudgeBatch,
     recent: &[MessageRow],
@@ -444,16 +444,26 @@ pub fn build_state(
     if !roster.noth.is_empty() {
         state["noth"] = json!(roster.noth);
     }
-    if !roster.members.is_empty() || !roster.members_memory.is_empty() {
+    if !roster.members.is_empty() {
         let list: Vec<Value> = roster
             .members
             .iter()
-            .map(|m| json!({ "name": m.display_name, "roles": m.roles }))
+            .map(|m| {
+                let mut v = json!({ "name": m.display_name, "roles": m.roles });
+                // 同じ id の小見出しが複数あっても、その人の記憶としてまとめる
+                let memory: Vec<&str> = roster
+                    .member_memory
+                    .iter()
+                    .filter(|(id, body)| *id == m.user_id && !body.is_empty())
+                    .map(|(_, body)| body.as_str())
+                    .collect();
+                if !memory.is_empty() {
+                    v["memory"] = json!(memory.join("\n"));
+                }
+                v
+            })
             .collect();
         state["members"] = json!({ "list": list });
-        if !roster.members_memory.is_empty() {
-            state["members"]["memory"] = json!(roster.members_memory);
-        }
     }
     state["trigger"] = json!(trigger);
     state["recent"] = json!(recent);
@@ -465,11 +475,15 @@ pub fn build_state(
         }
         recent.remove(0);
     }
-    for path in [&["members", "memory"][..], &["noth"][..]] {
+    loop {
         let excess = char_len(&state).saturating_sub(cfg.state_max_chars);
-        if excess > 0 {
-            shrink_text_at(&mut state, path, excess);
+        if excess == 0 || !shrink_longest_member_memory(&mut state, excess) {
+            break;
         }
+    }
+    let excess = char_len(&state).saturating_sub(cfg.state_max_chars);
+    if excess > 0 {
+        shrink_text_at(&mut state, &["noth"], excess);
     }
     // recent を空にしても収まらないのは、trigger か候補要約が単独で大きいとき。router に上限を超えて渡さない
     loop {
@@ -504,6 +518,42 @@ fn shrink_text_at(state: &mut Value, path: &[&str], excess: usize) {
     } else {
         parent[*last] = Value::String(text.chars().take(keep).collect());
     }
+}
+
+/// メンバーの `memory` のうち最長のものを `excess` 文字ぶん削る。空になったら key ごと外す。削れるものが無ければ false
+fn shrink_longest_member_memory(state: &mut Value, excess: usize) -> bool {
+    // IndexMut で引くと無い key を作ってしまうので get_mut で辿る
+    let Some(list) = state
+        .get_mut("members")
+        .and_then(|m| m.get_mut("list"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let longest = list
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (i, m["memory"].as_str().map_or(0, |t| t.chars().count())))
+        .filter(|(_, len)| *len > 0)
+        .max_by_key(|(_, len)| *len);
+    let Some((i, len)) = longest else {
+        return false;
+    };
+    let keep = len.saturating_sub(excess);
+    if keep == 0 {
+        if let Some(map) = list[i].as_object_mut() {
+            map.remove("memory");
+        }
+    } else {
+        let text: String = list[i]["memory"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(keep)
+            .collect();
+        list[i]["memory"] = Value::String(text);
+    }
+    true
 }
 
 /// trigger の本文と候補の要約のうち最長のものを `excess` 文字ぶん削る。削れるものが無ければ false
@@ -932,7 +982,11 @@ mod tests {
 
     fn member(name: &str, roles: &[&str]) -> Member {
         Member {
-            user_id: 1,
+            user_id: match name {
+                "alice" => 1,
+                "bob" => 2,
+                _ => 9,
+            },
             display_name: name.into(),
             roles: roles.iter().map(|r| r.to_string()).collect(),
         }
@@ -945,7 +999,11 @@ mod tests {
         let roster = Roster {
             noth: "Noth は Bot",
             members: &members,
-            members_memory: "- alice: 開発者",
+            member_memory: &[
+                (1, "- 開発者".into()),
+                (1, "- 猫好き".into()),
+                (3, "- 他人".into()),
+            ],
         };
         let state = build_state(
             &one_message_batch(),
@@ -960,10 +1018,9 @@ mod tests {
             state.0["members"],
             json!({
                 "list": [
-                    {"name": "alice", "roles": ["admin"]},
+                    {"name": "alice", "roles": ["admin"], "memory": "- 開発者\n- 猫好き"},
                     {"name": "bob", "roles": []},
                 ],
-                "memory": "- alice: 開発者",
             })
         );
 
@@ -981,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn state_truncates_recent_then_members_memory_then_noth() {
+    fn state_truncates_recent_then_longest_member_memory_then_noth() {
         let recent: Vec<MessageRow> = (1..=3)
             .map(|i| MessageRow {
                 id: 100 + i,
@@ -1003,11 +1060,12 @@ mod tests {
                 promoted_turn_id: None,
             })
             .collect();
-        let members = [member("alice", &[])];
+        let members = [member("alice", &[]), member("bob", &[])];
+        let memory = [(1, "a".repeat(300)), (2, "b".repeat(200))];
         let roster = Roster {
             noth: &"n".repeat(300),
             members: &members,
-            members_memory: &"m".repeat(300),
+            member_memory: &memory,
         };
         let build = |max: usize, recent: &[MessageRow]| {
             let cfg = RouterSection {
@@ -1033,22 +1091,30 @@ mod tests {
                 .map(|s| s.chars().count())
         };
 
+        let mem = |v: &Value, i: usize| {
+            v["members"]["list"][i]["memory"]
+                .as_str()
+                .map(|s| s.chars().count())
+        };
+
         // 少し超えるだけなら recent だけが減る
         let v = build(full - 50, &recent);
         assert!(v["recent"].as_array().unwrap().len() < 3);
-        assert_eq!(len(&v, &["members", "memory"]), Some(300));
+        assert_eq!(mem(&v, 0), Some(300));
+        assert_eq!(mem(&v, 1), Some(200));
         assert_eq!(len(&v, &["noth"]), Some(300));
 
-        // recent を空にしても超えるなら members の記憶が削れ、noth は残る
+        // recent を空にしても超えるなら、最長のメンバーの記憶から削れ、noth は残る
         let v = build(base - 100, &recent);
         assert!(v["recent"].as_array().unwrap().is_empty());
-        assert_eq!(len(&v, &["members", "memory"]), Some(200));
+        assert_eq!(mem(&v, 0), Some(200));
+        assert_eq!(mem(&v, 1), Some(200));
         assert_eq!(len(&v, &["noth"]), Some(300));
 
-        // それでも超えるなら noth が削れる
-        let v = build(base - 400, &recent);
-        assert!(char_len(&v) <= base - 400);
-        assert!(len(&v, &["members", "memory"]).is_none());
+        // 記憶が尽きるまで削っても超えるなら noth が削れる
+        let v = build(base - 600, &recent);
+        assert!(char_len(&v) <= base - 600);
+        assert!(mem(&v, 0).is_none() && mem(&v, 1).is_none());
         assert!(len(&v, &["noth"]).unwrap() < 300);
         assert_eq!(v["members"]["list"][0]["name"], "alice");
     }

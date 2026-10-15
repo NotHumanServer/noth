@@ -2067,9 +2067,8 @@ async fn memo_line_is_stripped_from_post_kept_in_layer3_and_written_to_file() {
         "了解です\n[Memo] alice は猫が好き\n[Memo] 文中ではなく行頭の2件目"
     );
     let file = std::fs::read_to_string(memory_file(&h)).unwrap();
-    assert!(file.contains("- ("));
-    assert!(file.contains(") alice は猫が好き"));
-    assert!(file.contains(") 文中ではなく行頭の2件目"));
+    assert!(file.contains("- alice は猫が好き <!-- observed: 20"));
+    assert!(file.contains("- 文中ではなく行頭の2件目 <!-- observed: 20"));
     let versions = h.store.memory_versions(GUILD).await.unwrap();
     assert_eq!(versions, vec![("memo".to_string(), String::new())]);
 
@@ -2109,6 +2108,21 @@ async fn memo_only_reply_posts_nothing_but_is_remembered() {
 }
 
 #[tokio::test]
+async fn member_memo_goes_under_the_member_subsection() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider
+        .script_text("返事\n[Memo alice] 猫が好き\n[Memo 知らない人] 謎\n[Memo] Noth は Bot");
+    h.say(GENERAL, "質問1").await;
+
+    assert_eq!(h.sent(), vec![(GENERAL, "返事".to_string())]);
+    let file = std::fs::read_to_string(memory_file(&h)).unwrap();
+    assert!(file.contains("### alice <!-- id: 1 -->\n- 猫が好き <!-- observed: 20"));
+    assert!(file.contains("- [知らない人] 謎 <!-- observed: 20"));
+    assert!(file.contains("- Noth は Bot <!-- observed: 20"));
+}
+
+#[tokio::test]
 async fn memo_limits_and_disabled_setting() {
     let mut h = Harness::new().await;
     h.router.set(answers("reply_only", 0.0, 0.0));
@@ -2117,8 +2131,8 @@ async fn memo_limits_and_disabled_setting() {
     h.say(GENERAL, "質問1").await;
     assert_eq!(h.sent(), vec![(GENERAL, "返事".to_string())]);
     let file = std::fs::read_to_string(memory_file(&h)).unwrap();
-    assert_eq!(file.matches("- (").count(), 3);
-    assert!(!file.contains(") d"));
+    assert_eq!(file.matches("<!-- observed:").count(), 3);
+    assert!(!file.contains("- d "));
 }
 
 #[tokio::test]
@@ -2160,7 +2174,7 @@ async fn router_state_carries_noth_and_members_from_memory_file() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         &path,
-        "## Noth について\nNoth は Discord の Bot\n\n## メンバー\n- alice: 開発者\n\n## その他\n\n## メモ\n",
+        "## Noth について\nNoth は Discord の Bot\n\n## メンバー\n- 小見出しの外\n\n### alice <!-- id: 1 -->\n- 開発者 <!-- observed: 2026-10-01 -->\n\n## サーバー\n\n## メモ\n",
     )
     .unwrap();
     h.router.set(answers("silent", 0.0, 0.0));
@@ -2168,10 +2182,10 @@ async fn router_state_carries_noth_and_members_from_memory_file() {
 
     let state = h.router.states.lock().unwrap()[0].0.clone();
     assert_eq!(state["noth"], "Noth は Discord の Bot");
-    assert_eq!(state["members"]["memory"], "- alice: 開発者");
+    // 小見出しの外の項目は state に入れない
     assert_eq!(
         state["members"]["list"],
-        serde_json::json!([{"name": "alice", "roles": ["admin"]}])
+        serde_json::json!([{"name": "alice", "roles": ["admin"], "memory": "- 開発者"}])
     );
 }
 

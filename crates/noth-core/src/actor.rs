@@ -237,7 +237,7 @@ struct TaskPlan {
     ack: String,
     /// Layer 3 に残す Ack。[Memo] 行を含む
     log_ack: String,
-    memos: Vec<String>,
+    memos: Vec<memory::Memo>,
     goal: String,
     category: TaskCategory,
 }
@@ -246,7 +246,7 @@ struct TaskPlan {
 struct Reply {
     /// Discord に投稿する本文。空なら投稿しない
     post: String,
-    memos: Vec<String>,
+    memos: Vec<memory::Memo>,
 }
 
 impl Actor {
@@ -390,10 +390,16 @@ impl Actor {
 
         // 手で直した内容がすぐ判定に効くよう、state 用には毎回ディスクから読む(router の入力はキャッシュに影響しない)
         let memory_text = memory::read(&self.config.paths.memory_file());
+        // id の無い小見出しは誰のものか決められないので渡さない
+        let member_memory: Vec<(UserId, String)> = memory::member_sections(&memory_text)
+            .into_iter()
+            .filter_map(|s| Some((s.user_id?, s.body)))
+            .filter(|(_, body)| !body.is_empty())
+            .collect();
         let roster = judge::Roster {
             noth: &memory::section(&memory_text, memory::HEADING_NOTH),
             members: &self.members,
-            members_memory: &memory::section(&memory_text, memory::HEADING_MEMBERS),
+            member_memory: &member_memory,
         };
         let state = judge::build_state(
             &batch,
@@ -616,7 +622,7 @@ impl Actor {
                 memos: Vec::new(),
             };
         }
-        let (kept, memos) = memory::extract_memos(text);
+        let (kept, memos) = memory::extract_memos(text, &self.members);
         Reply {
             post: kept.trim().to_string(),
             memos: memory::normalize_memos(memos, self.config.memory.memo_max_per_reply),
@@ -624,7 +630,7 @@ impl Actor {
     }
 
     /// 追記に失敗しても会話は止めない。覚え損ねるだけで、応答は投稿済み
-    async fn record_memos(&self, memos: &[String]) {
+    async fn record_memos(&self, memos: &[memory::Memo]) {
         if memos.is_empty() {
             return;
         }
@@ -633,6 +639,7 @@ impl Actor {
             self.guild,
             &self.config.paths.memory_file(),
             self.config.memory.memory_max_chars,
+            &self.members,
             memos,
             Timestamp::now(),
         )

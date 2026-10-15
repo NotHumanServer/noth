@@ -150,7 +150,7 @@ $NOTH_HOME/
 ├── profiles/
 │   ├── default.md        # Layer 1 のキャラクター定義
 │   └── memory/
-│       ├── MEMORY.md     # Layer 1.5 の長期記憶。手で編集してもよい
+│       ├── MEMORY.md     # Layer 1.5 の長期記憶(雛形は noth init が作る)。手で編集してもよい
 │       └── daily/
 │           └── YYYY-MM-DD.md  # Dreaming が書く日次レポート
 ├── data/
