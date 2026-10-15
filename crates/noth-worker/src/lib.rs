@@ -258,16 +258,19 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
         }
         if search {
             steps.push(
-                "Goal に URL が書かれていても、言語(日本語・英語)や言い回し、公式名称+機能・料金・制限などを変えて 2〜4 回検索してください。"
+                "Web で調べる Goal なら、Goal に URL が書かれていても、言語(日本語・英語)や言い回し、公式名称+機能・料金・制限などを変えて 2〜4 回検索するのが目安です。"
                     .to_string(),
             );
         }
         if search && fetch {
-            steps.push("web_search のスニペットだけで結論しないでください。".to_string());
+            steps.push(
+                "Web で調べるときは、web_search のスニペットだけで結論しないでください。"
+                    .to_string(),
+            );
         }
         if fetch {
             steps.push(
-                "公式サイト、ドキュメント、料金ページ、告知などの一次情報を中心に、3〜5 ページの本文を web_fetch で読んでください。必要なら読んだページのリンクをたどってください。"
+                "Web で調べるときは、公式サイト、ドキュメント、料金ページ、告知などの一次情報を中心に、3〜5 ページの本文を web_fetch で読むのが目安です。必要なら読んだページのリンクをたどってください。"
                     .to_string(),
             );
         }
@@ -280,6 +283,18 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
                     .to_string(),
             );
         }
+        if has("shell") {
+            steps.push(
+                "shell はホスト上で実行されます。実行したら終了コードと出力を確認し、期待どおりに動いたか確かめてください。ファイルの削除や上書きなど破壊的な操作は、Goal が明示的に求めた場合だけにしてください。作業ディレクトリは run ごとに分かれています。"
+                    .to_string(),
+            );
+        }
+        if has("discord") {
+            steps.push(
+                "discord は読み取り専用です。Goal が Discord 上の過去の発言やチャンネル構成に関わるときに使ってください。"
+                    .to_string(),
+            );
+        }
         steps.push(
             "1 回の応答で複数の tool を同時に呼べます。並列に呼ぶと速く終わります。".to_string(),
         );
@@ -287,7 +302,7 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
             "この run には往復回数の上限({max_iterations} 回)と時間制限があります。余裕を持って結論を書いてください。"
         ));
         steps.push(
-            "tool を 1 回も呼ばずに結論メモを書かないでください。tool が失敗した場合は、その旨を明記してください。"
+            "Goal の達成に tool が必要なら、呼ばずに結論メモを書かないでください。tool が失敗した場合は、その旨を明記してください。"
                 .to_string(),
         );
     }
@@ -298,14 +313,14 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
         .join("\n");
 
     let text = format!(
-        "これはバックグラウンドの調査作業です。あなたの出力は Discord には表示されません。\n\
+        "あなたは Goal を達成するための汎用エージェントとして、バックグラウンドで作業します。あなたの出力は Discord には表示されません。\n\
          task_category: {}\n\
          Goal: {}\n\n\
          手順(必須):\n{steps}\n\n\
-         調査が終わったら、結論メモだけを最終回答として書いてください。このとき tool は呼ばないでください。\n\
+         作業が終わったら、結論メモだけを最終回答として書いてください。このとき tool は呼ばないでください。\n\
          結論メモは数百トークンの構造化メモで、次を含めます。\n\
-         - 分かったこと\n\
-         - 出典(URL)\n\
+         - 分かったこと・やったこと\n\
+         - 出典(URL。Web を使った場合)\n\
          - 不確かな点(確認できなかったことは必ずここに書く)\n\
          tool の生の出力はメモに含めないでください。",
         category_label(task.task_category),
@@ -577,9 +592,16 @@ mod tests {
         assert!(both.contains("2〜4 回検索"));
         assert!(both.contains("3〜5 ページ"));
         assert!(both.contains("突き合わせ"));
-        assert!(both.contains("1 回も呼ばず"));
+        assert!(both.contains("tool が必要なら、呼ばずに"));
         assert!(both.contains("上限(3 回)"));
         assert!(!both.contains("web_agent"));
+        assert!(!both.contains("shell は"));
+        assert!(!both.contains("discord は"));
+
+        let with_local = instruction_text(&["shell", "discord"]).await;
+        assert!(with_local.contains("shell はホスト上で実行"));
+        assert!(with_local.contains("discord は読み取り専用"));
+        assert!(!with_local.contains("2〜4 回検索"));
 
         let search_only = instruction_text(&["web_search"]).await;
         assert!(!search_only.contains("web_fetch"));
@@ -638,16 +660,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_rejected_for_web_research() {
-        let t = tool("shell", Ok("実行された".into()));
-        let p = MockProvider::new(vec![call("shell"), text("メモ")]);
-        let w = worker(p.clone(), vec![t.clone()], settings(3, 100));
-        w.run(task(TaskCategory::WebResearch)).await;
-        assert_eq!(*t.called.lock().unwrap(), 0);
-        let prompts = p.prompts.lock().unwrap();
-        let r = results_of(&prompts[1]);
-        assert!(r[0].is_error);
-        assert!(r[0].output.contains("code_or_tool"));
+    async fn every_tool_is_callable_in_every_category() {
+        for c in [
+            TaskCategory::None,
+            TaskCategory::WebResearch,
+            TaskCategory::FactCheck,
+            TaskCategory::CodeOrTool,
+        ] {
+            let tools: Vec<_> = ["shell", "web_search", "discord"]
+                .into_iter()
+                .map(|n| tool(n, Ok("実行された".into())))
+                .collect();
+            let p = MockProvider::new(vec![
+                call("shell"),
+                call("web_search"),
+                call("discord"),
+                text("メモ"),
+            ]);
+            let w = worker(p.clone(), tools.clone(), settings(5, 100));
+            w.run(task(c)).await;
+            for t in &tools {
+                assert_eq!(*t.called.lock().unwrap(), 1, "{c:?}");
+            }
+            let prompts = p.prompts.lock().unwrap();
+            assert!(!results_of(&prompts[3])[0].is_error, "{c:?}");
+        }
     }
 
     #[tokio::test]

@@ -677,7 +677,7 @@ impl Actor {
                 log_ack: layers::FIXED_ACK.to_string(),
                 memos: Vec::new(),
                 goal: layers::goal_from_tool_calls(&completion.tool_calls),
-                category: category_for_tools(&completion.tool_calls, category),
+                category: spawn_category(category),
             });
         }
         // `[Goal]` 行が無いのは、本線が調べなくても答えられると判断したか書式を守らなかったとき。
@@ -694,11 +694,7 @@ impl Actor {
             log_ack,
             memos: reply.memos,
             goal,
-            // router が作業不要と見ていた場合は shell を許さない側に倒す(security.md §3)
-            category: match category {
-                TaskCategory::None => TaskCategory::WebResearch,
-                c => c,
-            },
+            category: spawn_category(category),
         })
     }
 
@@ -1429,15 +1425,12 @@ fn next_run_id() -> String {
     )
 }
 
-/// shell を許す code_or_tool は、router もそう判定し、かつ本線が shell だけを呼んだときに限る。
-/// 本線の tool 選びだけで shell が通るようにしないため。1 つの run は Web か shell のどちらかしか使えないので(approval.rs)、それ以外は web_research
-fn category_for_tools(calls: &[ToolCall], router_category: TaskCategory) -> TaskCategory {
-    if router_category == TaskCategory::CodeOrTool
-        && calls.iter().all(|c| c.name == crate::approval::SHELL_TOOL)
-    {
-        TaskCategory::CodeOrTool
-    } else {
-        TaskCategory::WebResearch
+/// router が作業不要(none)と見ていても Worker を起こした以上、run のラベルは none にしない。
+/// ラベルは記録とプロンプト用で、tool の可否には使わない(approval.rs)
+fn spawn_category(router_category: TaskCategory) -> TaskCategory {
+    match router_category {
+        TaskCategory::None => TaskCategory::WebResearch,
+        c => c,
     }
 }
 

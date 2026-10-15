@@ -729,7 +729,7 @@ max_concurrent        = 2
 timeout_secs          = 600      # 待ち時間を含む
 max_iterations        = 25       # tool 呼び出しの反復上限
 tool_output_max_chars = 20000    # 各 tool の出力の文字数上限。超えた分は切り詰める
-approval              = "auto"   # MVP では auto のみ
+approval              = "auto"   # MVP では auto のみ。有効な tool はどの run でも承認なしで呼べる(security.md §3)
 
 [compactor]
 idle_minutes      = 10           # 人間の最終発言からの経過。Noth 自身の投稿では解除しない

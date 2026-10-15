@@ -25,9 +25,14 @@
 
 ## 3. Web 側の対策と承認ポリシー
 
-Worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。MVP の実装は `auto` で、次の1つだけを固定の規則として持ちます。
+Worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。MVP の実装は `auto` で、有効な tool(`tool-shell`、`tool-discord`、Web 系)をどの run でも承認なしで呼べます。`task_category` は run のラベルで、tool の可否には使いません。tool 定義は全 run で同一です([caching.md §2](caching.md#2-本線と-worker-のキャッシュ共有))。
 
-- `tool-shell` は `task_category == code_or_tool` の run でだけ許可し、逆に `code_or_tool` の run では Web 系の tool を拒否する。1 つの run では Web か shell のどちらかしか使えない。shell を許す run で Web を読めると、取得したページに書かれた指示で shell を動かされる経路が残るため。`web_research` / `fact_check` の run は Web から取得した文字列を読むので、そこに書かれた指示でシェルを実行させない(間接プロンプトインジェクション → RCE の経路を断つ)。tool 定義自体は全 run で同一のまま([caching.md §2](caching.md#2-本線と-worker-のキャッシュ共有))なので、拒否は `tool_result` のエラーとして Worker に返る
+残るリスクは次のとおりです。
+
+- サンドボックスはない。`tool-shell` は Bot を動かすユーザーの権限でコマンドを実行する
+- Web(`web_search` / `web_fetch` / `web_agent`)や `discord` から読み込んだ文章に紛れた指示(間接プロンプトインジェクション)で、shell が動き得る。`discord` が返す Noth 自身の過去の発言には Web ページの要約が、`allowed_users` の発言には貼り付けられた外部の文章が含まれ得る
+- shell から `.env` や SQLite を読んだり Discord API を直接呼んだりできるので、§2 の閲覧権限の制限は迂回できる
+- そのため `allowed_users` は信頼できる人に限る前提になる(§4 と同じ)
 
 tool の出力は Worker のコンテキストにだけ入り、本線には届きません。将来 Discord のボタン承認などを追加できるよう、承認を差し込むインターフェースは Core に置きます。tool のサンドボックスと対話的な承認は MVP に含めません([overview.md §5](overview.md#5-mvp-に含めないもの))。
 

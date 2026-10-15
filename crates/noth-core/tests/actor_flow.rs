@@ -1619,7 +1619,7 @@ fn shell_call() -> Completion {
 }
 
 #[tokio::test]
-async fn shell_call_is_code_or_tool_only_when_router_agrees() {
+async fn run_category_follows_router_regardless_of_tools() {
     let mut h = Harness::setup(Setup {
         worker: true,
         worker_permits: 0,
@@ -1629,7 +1629,7 @@ async fn shell_call_is_code_or_tool_only_when_router_agrees() {
     .await;
     let worker = h.worker.clone();
 
-    // router が作業不要と見ているのに本線が shell を呼んでも、shell は許さない
+    // router が作業不要と見ていても Worker を起こしたら none にはしない
     h.router.set(answers("reply_only", 0.0, 0.0));
     h.provider.scripted.lock().unwrap().push_back(shell_call());
     h.say(GENERAL, "ls して").await;
@@ -1640,7 +1640,7 @@ async fn shell_call_is_code_or_tool_only_when_router_agrees() {
     h.say(GENERAL, "ls して").await;
     wait_until(|| worker.started() == 2).await;
 
-    // router が code_or_tool でも、Web の tool を呼んだら web_research
+    // tool の種類でラベルは変えない。router が code_or_tool なら Web の tool を呼んでも code_or_tool
     h.provider.scripted.lock().unwrap().push_back(Completion {
         text: None,
         tool_calls: vec![ToolCall {
@@ -1666,7 +1666,7 @@ async fn shell_call_is_code_or_tool_only_when_router_agrees() {
         vec![
             TaskCategory::WebResearch,
             TaskCategory::CodeOrTool,
-            TaskCategory::WebResearch
+            TaskCategory::CodeOrTool
         ]
     );
     h.worker.release.add_permits(3);

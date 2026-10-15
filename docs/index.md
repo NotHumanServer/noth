@@ -52,7 +52,7 @@ Noth は少人数の Discord サーバーに常駐する AI エージェント�
 | Anthropic はブレークポイント3つ、OpenAI / Google は自動キャッシュに任せる | Layer 2 更新時に Layer 0〜1 を保ち、バッファ一括追記の lookback 超過に備える | Gemini の explicit caching | Gemini 4 Argon 以降で非対応 | [caching §1](architecture/caching.md#1-provider-ごとの-layer-の載せ方) |
 | キャッシュの keep-alive は MVP 外 | 効果の検証を MVP 後に回す。trait メソッド(`keep_alive()`)だけ用意 | 常時 keep-alive | | [caching §5](architecture/caching.md#5-keep-alivemvp-外) |
 | Discord は `allowed_users` の発言だけ通し、リストに含まれないユーザーと他 Bot の発言は保存もしない。読むのは `content` だけ | 信頼境界の外の文字列をプロセスに入れない | 全部保存して router で捨てる | SQLite と router の入力に未信頼の文字列が残る | [security §2](architecture/security.md#2-discord-側の対策) |
-| `tool-shell` はサンドボックスなし。`code_or_tool` の run でだけ許可 | Web 由来の文字列を読む run からシェルを動かさない(間接プロンプトインジェクション → RCE の遮断) | run ごとに tool 定義を変える | キャッシュ共有が崩れる | [security §3, §4](architecture/security.md#3-web-側の対策と承認ポリシー) |
+| `approval = "auto"` は有効な tool をどの run でも承認なしで呼べる。サンドボックスなし | Worker を普通の AI エージェントとして使えるようにする。残るリスク(Web / Discord 経由のプロンプトインジェクションで shell が動き得る)は `allowed_users` を信頼できる人に限って受ける | run の種類で shell を絞る | Web や Discord の文字列に紛れた指示で shell が動き得る | [security §3, §4](architecture/security.md#3-web-側の対策と承認ポリシー) |
 | Compactor は人間の最終発言から 10 分で通常圧縮、ハード上限超過で TopicChunk 単位の緊急退避 | 会話中に Layer 3 を書き換えず、Append-only を保つ | ターンごとの圧縮 | | [context-layers §5 パターン D](context-layers.md#パターン-d-アイドル時コンパクション) |
 | 本線への書き込みは1つの actor に直列化 | 複数チャンネルの発言が交錯しても Layer 3 の追記順を一意にする | チャンネルごとの並列処理 | | [context-layers §2.1](context-layers.md#21-本線-actor-と処理単位) |
 | SQLite 1ファイル、全テーブルに `guild_id`、MVP の実装は1 guild | 将来の複数 guild に備えつつ MVP を単純にする | guild ごとのファイル | | [context-layers §6](context-layers.md#6-sqlite-に持つデータ) |

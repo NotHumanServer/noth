@@ -297,8 +297,8 @@ model   = "..."
 max_concurrent        = 2
 timeout_secs          = 600      # 待ち時間を含む
 max_iterations        = 25       # tool 呼び出しの反復上限
-tool_output_max_chars = 20000    # 各 tool の出力の文字数上限。超えた分は切り詰める
-approval              = "auto"   # MVP では auto のみ。tool-shell は code_or_tool の run に限る
+tool_output_max_chars = 20000    # 各 tool の出力の文字数上限。超えた分は切り詰める。tool-discord は約 12000 文字で項目単位に収めるので、12000 以上を推奨
+approval              = "auto"   # MVP では auto のみ。有効な tool はどの run でも承認なしで呼べる(security.md §3)
 show_progress         = true     # Ack を編集して、Worker が使った tool(検索語や URL)を表示する
 
 [compactor]
