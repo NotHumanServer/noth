@@ -88,7 +88,45 @@ pub(crate) fn replace_mentions(
     out
 }
 
-/// 本文を読んでよいのは allowed_users と Noth 自身の発言だけ。引用・転送・埋め込み・添付は読まない
+/// embed の title / description / fields を 1 つのテキストにする。Bot の通知は本文が embed にあることが多い
+fn embed_text(msg: &Value) -> String {
+    let text = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    msg.get("embeds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            let mut parts: Vec<String> = ["title", "description"]
+                .iter()
+                .filter_map(|k| text(e, k))
+                .collect();
+            parts.extend(
+                e.get("fields")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|f| {
+                        format!(
+                            "{}: {}",
+                            text(f, "name").unwrap_or_default(),
+                            text(f, "value").unwrap_or_default()
+                        )
+                    }),
+            );
+            parts.join("\n")
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// 本文を読んでよいのは allowed_users・Noth 自身・他の Bot の発言だけ。引用・転送・添付は読まない。
+/// Bot の embed だけは本文として読む(Bot の本文は文脈に入れず、Worker がここで読む設計のため)
 pub(crate) fn message_summary(msg: &Value, viewer: &Viewer, content_max: usize) -> Value {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let at = msg
@@ -98,8 +136,11 @@ pub(crate) fn message_summary(msg: &Value, viewer: &Viewer, content_max: usize) 
     let author = msg.get("author").unwrap_or(&Value::Null);
     let author_id = author.get("id").and_then(id_of);
     let readable = author_id.is_some_and(|a| a == viewer.self_id || viewer.allowed.contains(&a));
-    // bot 判定は id に任せる。webhook は id が Noth や allowed_users と一致しないので伏せられる
-    if !readable {
+    // webhook の発言も author.bot が true になるが、誰でも名乗れるので Bot としては扱わず伏せる
+    let is_bot = author_id != Some(viewer.self_id)
+        && author.get("bot").and_then(Value::as_bool) == Some(true)
+        && msg.get("webhook_id").is_none_or(Value::is_null);
+    if !readable && !is_bot {
         return json!({"id": id, "author": MASKED_AUTHOR, "at": at});
     }
 
@@ -130,6 +171,18 @@ pub(crate) fn message_summary(msg: &Value, viewer: &Viewer, content_max: usize) 
         "content": content,
     });
     let obj = out.as_object_mut().expect("object");
+    if is_bot {
+        obj.insert("bot".into(), json!(true));
+        let embed = embed_text(msg);
+        if !embed.is_empty() {
+            let (embed, embed_truncated) =
+                cap_content(&replace_mentions(&embed, viewer, &names), content_max);
+            obj.insert("embed".into(), json!(embed));
+            if embed_truncated {
+                obj.insert("embed_truncated".into(), json!(true));
+            }
+        }
+    }
     if truncated {
         obj.insert("truncated".into(), json!(true));
     }

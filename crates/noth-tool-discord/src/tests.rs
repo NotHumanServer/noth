@@ -353,16 +353,20 @@ async fn fetch_masks_unallowed_authors_and_replaces_mentions() {
     assert_eq!(m[0]["content"], "こんにちは");
     assert_eq!(m[0]["author"], "User1");
     assert_eq!(m[0]["at"], "2026-10-01T09:00:00+09:00");
-    for masked in [&m[1], &m[2]] {
-        assert_eq!(
-            masked.as_object().unwrap().keys().collect::<Vec<_>>(),
-            ["at", "author", "id"]
-        );
-        assert_eq!(masked["author"], "<user>");
-    }
+    assert_eq!(
+        m[1].as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["at", "author", "id"]
+    );
+    assert_eq!(m[1]["author"], "<user>");
+    assert_eq!(m[2]["content"], "bot says hi");
+    assert_eq!(m[2]["author"], "User3");
+    assert_eq!(m[2]["bot"], true);
+    assert_eq!(m[2]["embed"], "secret embed");
+    assert!(m[0].get("bot").is_none() && m[0].get("embed").is_none());
     assert_eq!(m[3]["content"], "Alice と <user> と @noth");
     assert_eq!(m[3]["reply_to"], "11");
-    assert!(!v.to_string().contains("secret"));
+    assert!(!v.to_string().contains("secret quote"));
+    assert_eq!(v.to_string().matches("secret embed").count(), 1);
 }
 
 #[tokio::test]
@@ -1882,4 +1886,92 @@ mod permissions {
             &bad("x", "0")
         )));
     }
+}
+
+#[tokio::test]
+async fn bot_embed_is_flattened_and_webhook_stays_masked() {
+    let mut bot = message(21, BOT, true, "");
+    bot["embeds"] = json!([
+        {"title": "Deploy", "description": "done", "fields": [{"name": "env", "value": "prod"}]},
+        {"description": "second"}
+    ]);
+    let mut webhook = message(22, 77, true, "from webhook");
+    webhook["webhook_id"] = json!("77");
+    let api = FakeApi::with(vec![
+        ("/channels/7", Ok(in_guild_channel(7))),
+        ("/channels/7/messages", Ok(json!([webhook, bot]))),
+    ]);
+    let tool = tool_with(api, &[]);
+    let v = json_of(
+        &run(
+            &tool,
+            json!({"action": "fetch_messages", "channel_id": "7"}),
+        )
+        .await,
+    );
+    let m = v["messages"].as_array().unwrap();
+    assert_eq!(m[0]["bot"], true);
+    assert_eq!(m[0]["embed"], "Deploy\ndone\nenv: prod\n\nsecond");
+    assert_eq!(m[1]["author"], "<user>");
+    assert!(!v.to_string().contains("from webhook"));
+}
+
+#[tokio::test]
+async fn fetch_by_message_id_reads_one_message_through_channel_check() {
+    let api = FakeApi::with(vec![
+        ("/channels/7", Ok(in_guild_channel(7))),
+        (
+            "/channels/7/messages/13",
+            Ok(message(13, BOT, true, "bot says hi")),
+        ),
+    ]);
+    let tool = tool_with(api, &[]);
+    let v = json_of(
+        &run(
+            &tool,
+            json!({"action": "fetch_messages", "channel_id": "7", "message_id": "13"}),
+        )
+        .await,
+    );
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["messages"][0]["content"], "bot says hi");
+    assert_eq!(v["messages"][0]["bot"], true);
+
+    for other in ["before", "after", "around"] {
+        let out = run(
+            &tool,
+            json!({"action": "fetch_messages", "channel_id": "7", "message_id": "13", other: "5"}),
+        )
+        .await;
+        assert!(
+            out.is_error && out.text.contains("message_id"),
+            "{}",
+            out.text
+        );
+    }
+}
+
+#[tokio::test]
+async fn fetch_by_message_id_still_requires_channel_permission() {
+    let api = FakeApi::with(vec![
+        (
+            "/channels/7",
+            Err(api::ApiError {
+                status: 403,
+                body: String::new(),
+                retry_after: None,
+            }),
+        ),
+        (
+            "/channels/7/messages/13",
+            Ok(message(13, BOT, true, "leak")),
+        ),
+    ]);
+    let tool = tool_with(api, &[]);
+    let out = run(
+        &tool,
+        json!({"action": "fetch_messages", "channel_id": "7", "message_id": "13"}),
+    )
+    .await;
+    assert!(out.is_error && !out.text.contains("leak"), "{}", out.text);
 }

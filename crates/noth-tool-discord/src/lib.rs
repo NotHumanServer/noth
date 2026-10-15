@@ -314,6 +314,7 @@ impl DiscordTool {
         let channel_id = id_arg(input, "channel_id")?
             .or(ctx.audience.channel_id)
             .ok_or("channel_id は必須です")?;
+        let single = id_arg(input, "message_id")?;
         let mut query = vec![("limit", clamp_limit(input, FETCH_DEFAULT_LIMIT).to_string())];
         let anchors: Vec<(&str, u64)> = ["before", "after", "around"]
             .into_iter()
@@ -322,9 +323,24 @@ impl DiscordTool {
         if anchors.len() > 1 {
             return Err("before / after / around は 1 つだけ指定できます".into());
         }
+        if single.is_some() && !anchors.is_empty() {
+            return Err("message_id は before / after / around と同時に指定できません".into());
+        }
         query.extend(anchors.into_iter().map(|(k, id)| (k, id.to_string())));
         self.readable_channel(ACTION, channel_id, &ctx.audience)
             .await?;
+        if let Some(message_id) = single {
+            let raw = self
+                .get(
+                    ACTION,
+                    &format!("/channels/{channel_id}/messages/{message_id}"),
+                    &[],
+                )
+                .await?;
+            let viewer = self.viewer(ACTION).await?;
+            let messages = vec![message_summary(&raw, &viewer, CONTENT_MAX_CHARS)];
+            return Ok(listing("messages", messages, 0));
+        }
         let raw = self
             .get(ACTION, &format!("/channels/{channel_id}/messages"), &query)
             .await?;
