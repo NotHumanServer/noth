@@ -105,7 +105,21 @@ noth auth codex                       # ChatGPT のサブスクリプション�
 
 ### `noth status`
 
-常駐プロセスの状態を表示します。SQLite の `heartbeat` テーブルと各テーブルを参照するので、プロセスへの IPC は不要です。表示するのは最終 heartbeat 時刻と接続状態、接続中の guild、有効な module、直近の router 判定、進行中の Worker、直近ターンのプロンプト全体のトークン数(`usage.input_tokens`)です。heartbeat が一定時間更新されていなければ「停止中」と判断します。
+常駐プロセスの状態を表示します。SQLite の `heartbeat` テーブルと各テーブルを参照するので、プロセスへの IPC は不要です。表示するのは最終 heartbeat 時刻と接続状態、接続中の guild、有効な module、直近の router 判定、進行中の Worker、直近ターンのプロンプト全体のトークン数(`usage.input_tokens`)、今日のコスト(`今日のコスト: $0.0123(LLM 42 回、TinyFish 5 回)`)です。heartbeat が一定時間更新されていなければ「停止中」と判断します。
+
+### `noth cost`
+
+LLM と外部 API の利用量とコストを、SQLite の `costs` テーブルから集計して表示します。対象の guild は `channel.discord.guild_id` です。
+
+```text
+noth cost [--since <期間>] [--by source|model|purpose|day|run] [--offline]
+```
+
+- `--since`: `today`(ローカル時間の 0 時から)、`24h`、`7d`(既定)、`30d`、`all`。`<数値>h` / `<数値>d` も使える
+- `--by`: 集計の単位。既定は `model`
+- 表の列は、キー・回数・入力・cache 読み・cache 書き・出力・単位(`12 step` など、トークン以外の課金単位)・コスト。トークンは桁区切り、金額は `$0.0123` 形式。単価が分からない呼び出しがあれば `+不明 N 件` を付け、最後に合計行を出す
+- 表のあとに、外部 API が返した直近のレート制限(source・bucket・残り/上限・リセットまでの時間・記録からの経過)と、有効な tool の課金先アカウントの状態(TinyFish の残高など。状態を返す tool だけ)を出す
+- アカウントの状態は外部 API を呼んで取得する。`--offline` で省略できる
 
 ### `noth doctor`
 
@@ -222,6 +236,13 @@ effort    = "low"                # low | medium | high | xhigh | max。雑談は
 # OpenCode Go の Messages 形式モデルを使うときは preset を指定し、api_key にそのキーを書く
 # preset  = "opencode-go"
 # api_key = "${OPENCODE_GO_API_KEY}"
+# 内蔵の単価表($/MTok)を上書きする。指定したキーだけが優先される。表にないモデルは金額が記録されない
+# [provider.anthropic.pricing]
+# input          = 4.0
+# cache_write_5m = 5.0
+# cache_write_1h = 8.0
+# cache_read     = 0.2
+# output         = 20.0
 
 [provider.openai]
 api_key  = "${OPENAI_API_KEY}"
@@ -231,6 +252,14 @@ format   = "chat"                # chat | responses
 # preset   = "opencode-go"       # このとき api_key は ${OPENCODE_GO_API_KEY}
 # preset   = "codex"             # ChatGPT のサブスクリプションで Codex を使う。api_key は不要で、先に `noth auth codex` を実行する。format は responses に固定
 # effort   = "low"               # none | minimal | low | medium | high | xhigh | max(モデル依存)
+# 内蔵の単価表($/MTok)を上書きする。指定したキーだけが優先される。表にないモデルは金額が記録されない。
+# preset / base_url の先は表を使わず、input と output を両方指定したときだけ金額が出る(cached_input と cache_write は未指定なら input と同額)。
+# preset = "codex" は定額プランの枠を消費するため金額を記録しない
+# [provider.openai.pricing]
+# input        = 2.5
+# cached_input = 0.25
+# cache_write  = 2.5
+# output       = 15.0
 
 [provider.google]
 api_key = "${GOOGLE_AI_STUDIO_API_KEY}"
@@ -239,6 +268,12 @@ model   = "..."
 # project          = "my-project"
 # location         = "us-central1"
 # credentials_file = "${GOOGLE_APPLICATION_CREDENTIALS}"   # サービスアカウント JSON のパス
+# 内蔵の単価表($/MTok)を上書きする。指定したキーだけが優先される。
+# 表にないモデルと agent-platform / opencode-go は、3 キーすべて指定したときだけ金額が記録される
+# [provider.google.pricing]
+# input        = 0.3
+# cached_input = 0.03
+# output       = 2.5            # thinking 込み
 
 [worker]
 max_concurrent        = 2
