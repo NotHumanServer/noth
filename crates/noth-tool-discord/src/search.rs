@@ -12,10 +12,13 @@ const DEFAULT_LIMIT: usize = 30;
 /// Discord の snowflake はこれより長い。短い数字列(「2025」など)はチャンネル名として扱う
 const MIN_SNOWFLAKE_DIGITS: usize = 15;
 
+/// `default_channel` はトリガーのチャンネル。チャンネルを指定せず `scope: "guild"` も付けない検索は、そこに絞る。
+/// 省略をギルド全体にすると、「このチャンネル」の依頼に別チャンネルの発言が混ざる
 pub(crate) fn build_query(
     input: &Value,
     guild_id: GuildId,
     tz: &TimeZone,
+    default_channel: Option<u64>,
 ) -> Result<HistoryQuery, String> {
     let mut q = HistoryQuery {
         guild_id,
@@ -34,10 +37,20 @@ pub(crate) fn build_query(
     if let Some(ch) = channel {
         let name = ch.trim_start_matches('#').trim();
         if name.len() >= MIN_SNOWFLAKE_DIGITS && name.bytes().all(|b| b.is_ascii_digit()) {
-            q.channel_id = name.parse().ok();
+            // 桁あふれを名前扱いや省略扱いにすると、別のチャンネルを黙って検索してしまう
+            q.channel_id = Some(
+                name.parse()
+                    .map_err(|_| "channel_id は数字の ID で指定してください".to_string())?,
+            );
         } else if !name.is_empty() {
             q.channel_name = Some(name.to_string());
         }
+    }
+    if q.channel_id.is_none()
+        && q.channel_name.is_none()
+        && text_arg(input, "scope").as_deref() != Some("guild")
+    {
+        q.channel_id = default_channel;
     }
     if let Some(s) = text_arg(input, "since") {
         q.since = Some(parse_time(&s, tz, false).map_err(|e| format!("since: {e}"))?);

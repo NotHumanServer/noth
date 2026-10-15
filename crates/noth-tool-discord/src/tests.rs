@@ -164,6 +164,7 @@ fn ctx(history: Option<Arc<dyn noth_core::history::MessageHistory>>) -> ToolCont
         audience: Audience {
             requesters: vec![ALICE],
             channel_id: Some(DEFAULT_TRIGGER),
+            channel_name: None,
         },
     }
 }
@@ -190,6 +191,7 @@ fn ctx_raw(
         audience: Audience {
             requesters: requesters.to_vec(),
             channel_id,
+            channel_name: None,
         },
         ..ctx(history)
     }
@@ -413,8 +415,58 @@ async fn fetch_limit_is_clamped_and_anchor_is_exclusive() {
         "{}",
         out.text
     );
-    let out = run(&tool, json!({"action": "fetch_messages"})).await;
+    let no_trigger = ctx_raw(None, &[ALICE], None);
+    let out = tool
+        .call(json!({"action": "fetch_messages"}), &no_trigger)
+        .await
+        .unwrap();
     assert!(out.is_error && out.text.contains("channel_id"));
+}
+
+#[tokio::test]
+async fn fetch_defaults_to_the_trigger_channel() {
+    let api = FakeApi::with(vec![
+        (
+            &format!("/channels/{DEFAULT_TRIGGER}/messages"),
+            Ok(json!([message(1, ALICE, false, "こんにちは")])),
+        ),
+        ("/channels/7", Ok(in_guild_channel(7))),
+        ("/channels/7/messages", Ok(json!([]))),
+    ]);
+    let tool = tool_with(api.clone(), &[]);
+    let v = json_of(&run(&tool, json!({"action": "fetch_messages"})).await);
+    assert_eq!(v["messages"][0]["content"], "こんにちは");
+    // 明示した channel_id が優先される
+    let v = json_of(
+        &run(
+            &tool,
+            json!({"action": "fetch_messages", "channel_id": "7"}),
+        )
+        .await,
+    );
+    assert_eq!(v["count"], 0);
+}
+
+#[tokio::test]
+async fn search_defaults_to_the_trigger_channel_unless_guild_scope() {
+    let history = seeded_history().await;
+    let tool = tool_with(FakeApi::with(vec![]), &[]);
+    let ids = |v: &Value| v["count"].as_u64().unwrap();
+    let call = |input: Value| {
+        let (tool, history) = (&tool, history.clone());
+        async move { json_of(&tool.call(input, &ctx(Some(history))).await.unwrap()) }
+    };
+    // 既定のトリガー(999)には記録が無い
+    assert_eq!(ids(&call(json!({"action": "search_messages"})).await), 0);
+    assert_eq!(
+        ids(&call(json!({"action": "search_messages", "scope": "guild"})).await),
+        3
+    );
+    // チャンネルを指定すれば、そちらが優先される
+    assert_eq!(
+        ids(&call(json!({"action": "search_messages", "channel_id": "#noth開発計画"})).await),
+        2
+    );
 }
 
 #[tokio::test]
@@ -616,7 +668,7 @@ async fn search_messages_by_channel_name_query_and_dates() {
             .collect()
     };
 
-    let all = search(json!({"action": "search_messages"})).await;
+    let all = search(json!({"action": "search_messages", "scope": "guild"})).await;
     assert_eq!(ids(&all), ["3", "2", "1"]);
     let v = search(json!({"action": "search_messages", "channel_id": "#noth開発計画"})).await;
     assert_eq!(ids(&v), ["3", "1"]);
@@ -628,19 +680,25 @@ async fn search_messages_by_channel_name_query_and_dates() {
     assert_eq!(v["messages"][1]["is_noise"], Value::Null);
     let v = search(json!({"action": "search_messages", "channel_id": "222222222222222222"})).await;
     assert_eq!(ids(&v), ["2"]);
-    let v = search(json!({"action": "search_messages", "query": "予算", "author": "ali"})).await;
+    let v = search(
+        json!({"action": "search_messages", "scope": "guild", "query": "予算", "author": "ali"}),
+    )
+    .await;
     assert_eq!(ids(&v), ["1"]);
     // 日付だけの until はその日を含む(ローカル 10/1 の発言は拾い、10/2 は含まない)
     let v =
-        search(json!({"action": "search_messages", "since": "2026-10-01", "until": "2026-10-01"}))
+        search(json!({"action": "search_messages", "scope": "guild", "since": "2026-10-01", "until": "2026-10-01"}))
             .await;
     assert_eq!(ids(&v), ["2", "1"]);
-    let v = search(json!({"action": "search_messages", "since": "2026-10-02T00:00:00"})).await;
+    let v = search(
+        json!({"action": "search_messages", "scope": "guild", "since": "2026-10-02T00:00:00"}),
+    )
+    .await;
     assert_eq!(ids(&v), ["3"]);
     let v =
-        search(json!({"action": "search_messages", "until": "2026-10-01T00:00:01+09:00"})).await;
+        search(json!({"action": "search_messages", "scope": "guild", "until": "2026-10-01T00:00:01+09:00"})).await;
     assert!(ids(&v).is_empty());
-    let v = search(json!({"action": "search_messages", "limit": 1})).await;
+    let v = search(json!({"action": "search_messages", "scope": "guild", "limit": 1})).await;
     assert_eq!(v["count"], 1);
 }
 
@@ -673,7 +731,7 @@ async fn search_messages_errors() {
 
 #[test]
 fn search_query_resolves_channel_and_limit() {
-    let q = |v: Value| search::build_query(&v, GUILD, &tz()).unwrap();
+    let q = |v: Value| search::build_query(&v, GUILD, &tz(), None).unwrap();
     assert_eq!(
         q(json!({"channel_id": "#雑談"})).channel_name.as_deref(),
         Some("雑談")
@@ -685,6 +743,30 @@ fn search_query_resolves_channel_and_limit() {
     assert_eq!(
         q(json!({"channel_id": "222222222222222222"})).channel_id,
         Some(222_222_222_222_222_222)
+    );
+    let with_default = |v: Value| search::build_query(&v, GUILD, &tz(), Some(5)).unwrap();
+    assert_eq!(with_default(json!({})).channel_id, Some(5));
+    assert_eq!(with_default(json!({"scope": "guild"})).channel_id, None);
+    assert_eq!(
+        with_default(json!({"channel_id": "#雑談"})).channel_id,
+        None
+    );
+    // 不正な scope は guild 扱いにせず、トリガーのチャンネルに倒れる
+    assert_eq!(with_default(json!({"scope": "all"})).channel_id, Some(5));
+    // channel_id と scope: guild が両方あれば channel_id が優先
+    assert_eq!(
+        with_default(json!({"scope": "guild", "channel_id": "222222222222222222"})).channel_id,
+        Some(222_222_222_222_222_222)
+    );
+    // u64 に収まらない数字だけの ID は、黙って別のチャンネルにせずエラー
+    assert!(
+        search::build_query(
+            &json!({"channel_id": "99999999999999999999"}),
+            GUILD,
+            &tz(),
+            Some(5)
+        )
+        .is_err()
     );
     assert_eq!(q(json!({})).limit, 30);
     assert_eq!(q(json!({"limit": 1000})).limit, 100);
@@ -769,7 +851,7 @@ async fn search_total_budget_keeps_newest() {
     let tool = tool_with(FakeApi::with(vec![]), &[]);
     let out = tool
         .call(
-            json!({"action": "search_messages", "limit": 100}),
+            json!({"action": "search_messages", "scope": "guild", "limit": 100}),
             &ctx(Some(Arc::new(store))),
         )
         .await
@@ -1224,7 +1306,7 @@ mod permissions {
         let search = |c: ToolContext, extra: Value| {
             let tool = &tool;
             async move {
-                let mut input = json!({"action": "search_messages", "query": "予算", "limit": 5});
+                let mut input = json!({"action": "search_messages", "scope": "guild", "query": "予算", "limit": 5});
                 input
                     .as_object_mut()
                     .unwrap()
@@ -1285,7 +1367,7 @@ mod permissions {
         let out = call(
             &tool,
             &ctx_for(Some(Arc::new(store)), &[1], None),
-            json!({"action": "search_messages"}),
+            json!({"action": "search_messages", "scope": "guild"}),
         )
         .await;
         assert_eq!(json_of(&out)["count"], 0);
@@ -1464,7 +1546,7 @@ mod permissions {
         let out = call(
             &tool,
             &ctx_for(Some(store), &[1], None),
-            json!({"action": "search_messages", "limit": 10}),
+            json!({"action": "search_messages", "scope": "guild", "limit": 10}),
         )
         .await;
         let v = json_of(&out);
@@ -1487,7 +1569,7 @@ mod permissions {
         let out = call(
             &tool,
             &ctx_for(Some(store), &[1], None),
-            json!({"action": "search_messages", "limit": 5}),
+            json!({"action": "search_messages", "scope": "guild", "limit": 5}),
         )
         .await;
         let v = json_of(&out);
@@ -1505,7 +1587,7 @@ mod permissions {
         let out = call(
             &tool,
             &ctx_for(Some(store), &[4], None),
-            json!({"action": "search_messages"}),
+            json!({"action": "search_messages", "scope": "guild"}),
         )
         .await;
         let v = json_of(&out);
@@ -1654,7 +1736,7 @@ mod permissions {
             .await
             .unwrap();
         let hist: Arc<dyn noth_core::history::MessageHistory> = Arc::new(store);
-        let search = json!({"action": "search_messages"});
+        let search = json!({"action": "search_messages", "scope": "guild"});
         let out = call(
             &tool,
             &ctx_for(Some(hist.clone()), &[4], Some(GENERAL)),

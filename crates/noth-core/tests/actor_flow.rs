@@ -600,8 +600,14 @@ async fn silent_buffers_then_reply_promotes_one_block() {
 
     let prompt = &h.prompts()[0];
     assert_eq!(prompt.active_log, vec![turns[0].clone()]);
-    let last = prompt.ephemeral_tail.last().unwrap();
-    assert_eq!(last.text, turns[1].text);
+    let [trigger, channel] = &prompt.ephemeral_tail[..] else {
+        panic!("tail: {:?}", prompt.ephemeral_tail);
+    };
+    assert_eq!(trigger.text, turns[1].text);
+    // 発言先は Layer 4 にだけ置く。トリガーのブロックは Layer 3 と同一のまま
+    assert!(channel.text.contains("#general(channel_id: 100)"));
+    assert!(!channel.text.contains("[Goal]"));
+    assert!(!turns[1].text.contains("channel_id"));
     assert!(prompt.tools.is_empty());
     assert!(!prompt.harness_rules.contains("Goal"));
     assert!(prompt.profile.contains("alice"));
@@ -874,10 +880,11 @@ async fn relevant_chunk_goes_to_layer4_before_trigger() {
     h.say(GENERAL, "旅行の話どうなった?").await;
 
     let tail = &h.prompts()[0].ephemeral_tail;
-    assert_eq!(tail.len(), 2);
+    assert_eq!(tail.len(), 3);
     assert_eq!(tail[0].kind, TurnKind::RelevantChunk);
     assert!(tail[0].text.contains("旅行の計画を立てよう"));
     assert_eq!(tail[1].kind, TurnKind::Trigger);
+    assert_eq!(tail[2].kind, TurnKind::Instruction);
     let turns = h.store.active_turns(GUILD).await.unwrap();
     assert!(turns.iter().all(|t| t.kind != TurnKind::RelevantChunk));
 }
@@ -1350,6 +1357,12 @@ async fn spawn_task_posts_ack_and_records_goal_before_fork() {
     assert_eq!(task.audience.requesters, vec![1]);
     assert_eq!(task.base.active_log, turns);
     assert!(task.base.ephemeral_tail.is_empty());
+    assert_eq!(task.audience.channel_id, Some(GENERAL));
+    assert_eq!(task.audience.channel_name.as_deref(), Some("general"));
+    // router が spawn_task と判定したときだけ、Layer 4 の末尾で Worker に回すよう促す
+    let hint = main.ephemeral_tail.last().unwrap();
+    assert!(hint.text.contains("#general(channel_id: 100)"));
+    assert!(hint.text.contains("[Goal]"));
     assert_eq!(
         serde_json::to_value(&task.base.tools).unwrap(),
         serde_json::to_value(&main.tools).unwrap()

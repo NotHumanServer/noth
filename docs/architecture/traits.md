@@ -129,7 +129,7 @@ pub trait Tool: Send + Sync {
 
 tool の出力は Worker のコンテキストにだけ入り、本線には届きません。出力は `tool_output_max_chars` で切り詰めてから Worker に返します。
 
-`ToolContext` は `audience: Audience { requesters: Vec<UserId>, channel_id: Option<ChannelId> }` も持ちます。Worker を起動させた発言者とトリガーのチャンネルで、actor が `WorkerTask::audience` に詰め、Worker が `ToolContext` に写します。tool が「出力が届く先の全員に見えるものだけ」を返すための情報です。届く先は、依頼した人、トリガーのチャンネルを見られる `allowed_users` 全員、`@everyone` がそのチャンネルを見られるなら `@everyone`、の和集合です([security.md §2](security.md#2-discord-側の対策))。
+`ToolContext` は `audience: Audience { requesters: Vec<UserId>, channel_id: Option<ChannelId>, channel_name: Option<String> }` も持ちます。Worker を起動させた発言者とトリガーのチャンネルで、actor が `WorkerTask::audience` に詰め、Worker が `ToolContext` に写します。tool が「出力が届く先の全員に見えるものだけ」を返すための情報です。届く先は、依頼した人、トリガーのチャンネルを見られる `allowed_users` 全員、`@everyone` がそのチャンネルを見られるなら `@everyone`、の和集合です([security.md §2](security.md#2-discord-側の対策))。
 
 `ToolContext` は `run_id` / `task_category` / `work_dir` / `meter` に加え、記録済みの発言を読み取り専用で引く `history: Option<Arc<dyn MessageHistory>>` を持ちます。tool crate が `noth-core` の trait だけで SQLite の `messages` を検索できるようにするためで、実体は Core の `Store` です(Worker が `WorkerTask::history` から渡す。None なら検索できない)。
 

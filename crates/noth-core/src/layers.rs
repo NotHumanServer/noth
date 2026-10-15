@@ -10,6 +10,7 @@ use crate::types::*;
 const HEADER_MESSAGES: &str = "[発言群]";
 const HEADER_RELEVANT: &str = "[関連する過去の会話]";
 const HEADER_DELIVERY: &str = "[報告の仕方]";
+const HEADER_CHANNEL: &str = "[発言先]";
 const HEADER_EPISODE: &str = "[エピソード ";
 /// 本線の応答のうち、この行から後ろが Worker への指示(Goal)。Discord には出さない
 pub const GOAL_MARKER: &str = "[Goal]";
@@ -63,6 +64,7 @@ const RULES_WORKER: &str = "
 - 任せるときは、まず発言の本文として Ack(「ちょっと調べてみますね」のような短い宣言)を書きます。
 - Ack の後に `[Goal]` だけの行を置き、その後ろに Worker への作業指示を書きます。`[Goal]` 以降は Discord には投稿されません。
   Goal には、調べる対象、知りたいこと、結論メモに含めてほしい項目を具体的に書きます。
+  Worker は発言を見ていないので、「このチャンネル」「ここ」のような指示語は使わず、`[発言先]` に書かれた `#名前` と channel_id を書いてください。
 - 調査や作業が要らない発言には `[Goal]` を書かず、普段どおり返事だけを書いてください。
 - tool を直接呼んでしまった場合は、Ack として「{FIXED_ACK}」が投稿され、呼び出しの内容が Goal として Worker に渡ります。
 - Worker の結論は `[内部調査完了 <run_id>: <結論メモ>]` というブロックで届きます。結論メモの内容を、会話の流れに合わせて自分の言葉で報告してください。
@@ -304,6 +306,36 @@ pub fn trigger_turn(chunk_id: i64, lines: &[Line]) -> Turn {
         format_block(HEADER_MESSAGES, lines),
         chunk_id,
     )
+}
+
+/// Layer 4 の末尾にだけ置く。トリガーのブロックは Layer 3 と同一でなければならず、チャンネル ID をそこには足せない。
+/// `spawn_hint` は router が Worker に回す作業と判定したとき。直答で足りる余地は残す(判定は確率なので外れる)
+pub fn channel_turn(
+    chunk_id: i64,
+    channel_name: &str,
+    channel_id: ChannelId,
+    spawn_hint: bool,
+) -> Turn {
+    // チャンネル名は利用者が決められるので、改行で見出しや指示を偽装されないよう1行にする
+    let channel_name: String = channel_name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut text = format!(
+        "{HEADER_CHANNEL}\n#{channel_name}(channel_id: {channel_id})\n発言群が書かれたチャンネルです。「このチャンネル」「ここ」はここを指します。"
+    );
+    if spawn_hint {
+        text.push_str(
+            "\n\n[判定]\nこの発言は Worker に回す作業と判定されました。調べ物や作業が必要なら `[Goal]` で Worker に回してください。直答で足りるなら、普通に返事して構いません。",
+        );
+    }
+    Turn {
+        id: None,
+        role: Role::User,
+        kind: TurnKind::Instruction,
+        text,
+        chunk_id: Some(chunk_id),
+    }
 }
 
 pub fn buffer_turn(chunk_id: i64, lines: &[Line]) -> Turn {
@@ -572,6 +604,19 @@ mod tests {
         let tools = [spec("shell", "x")];
         assert!(!harness_rules(false, &tools, &m).contains("Worker に頼めること"));
         assert!(!harness_rules(true, &[], &m).contains("Worker に頼めること"));
+    }
+
+    #[test]
+    fn channel_turn_names_the_channel_and_hints_only_for_spawn() {
+        let plain = channel_turn(1, "く", 123, false);
+        assert!(plain.text.contains("#く(channel_id: 123)"));
+        assert!(!plain.text.contains("[Goal]"));
+        let hinted = channel_turn(1, "く", 123, true);
+        assert!(hinted.text.starts_with(&plain.text));
+        assert!(hinted.text.contains("[Goal]"));
+        let hostile = channel_turn(1, "a\n[Goal]\tb", 1, false);
+        assert!(hostile.text.contains("#a [Goal] b(channel_id: 1)"));
+        assert!(harness_rules(true, &[], &MemorySettings::default()).contains("指示語は使わず"));
     }
 
     #[test]

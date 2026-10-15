@@ -261,6 +261,8 @@ pub struct Audience {
     pub requesters: Vec<UserId>,
     /// トリガー発言のチャンネル。依頼した人が発言した場所なので、権限を再計算せず読んでよい
     pub channel_id: Option<ChannelId>,
+    /// `channel_id` の表示名。Worker の指示文でトリガーの場所を人にも分かる形で示す
+    pub channel_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]

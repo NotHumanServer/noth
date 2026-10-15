@@ -447,6 +447,10 @@ impl Actor {
             .any(|m| text::contains_any_name(&m.content, &self.config.router.call_names));
         // Clef は Noth の応答直後の返事を Noth 宛てと見なさないことが多いので、名前で呼ばれたのと同じ扱いにする
         let in_conversation = self.continues_conversation(&batch);
+        let addressed_directly = batch
+            .messages
+            .iter()
+            .any(|m| m.mentions_self || m.reply_to_self);
         let (mut binarized, kind, answers, latency_ms) =
             match self.router.decide(&state, &questions).await {
                 Ok(decision) => (
@@ -456,6 +460,7 @@ impl Actor {
                         &self.config.router.reactions,
                         &self.config.router.thresholds,
                         called_by_name || in_conversation,
+                        addressed_directly,
                     ),
                     "judge",
                     judge::answers_json(&decision),
@@ -471,11 +476,7 @@ impl Actor {
                     (safe, "judge_error", json!({ "error": e.to_string() }), 0)
                 }
             };
-        if batch
-            .messages
-            .iter()
-            .any(|m| m.mentions_self || m.reply_to_self)
-        {
+        if addressed_directly {
             binarized.answer_direct_call();
         }
         let decision_id = self
@@ -596,6 +597,12 @@ impl Actor {
             ));
         }
         tail.push(trigger.clone());
+        tail.push(layers::channel_turn(
+            chunk_id,
+            &batch.channel_name,
+            batch.channel_id,
+            matches!(verdict, RouterVerdict::SpawnTask { .. }),
+        ));
 
         let active_log = self.store.active_turns(guild).await?;
         let prompt = self.prompt(active_log, tail);
@@ -761,7 +768,9 @@ impl Actor {
         let guild = self.guild;
         // DB の失敗で Ack 投稿後に中断し、Queued のまま残る run を作らないよう、Ack より前に済ませる
         let row_ids: Vec<i64> = batch.messages.iter().map(|m| m.row_id).collect();
-        let audience = self.audience(&row_ids, batch.channel_id).await?;
+        let audience = self
+            .audience(&row_ids, batch.channel_id, &batch.channel_name)
+            .await?;
         let ack_message_id = match self.channel.send(batch.channel_id, &plan.ack, None).await {
             Ok(id) => id,
             Err(e) => {
@@ -807,7 +816,12 @@ impl Actor {
     }
 
     /// トリガー発言群の発言者。tool が閲覧権限を確かめる相手になる
-    async fn audience(&self, row_ids: &[i64], channel_id: ChannelId) -> Result<Audience> {
+    async fn audience(
+        &self,
+        row_ids: &[i64],
+        channel_id: ChannelId,
+        channel_name: &str,
+    ) -> Result<Audience> {
         let mut requesters = Vec::new();
         for id in row_ids {
             let Some(m) = self.store.message(*id).await? else {
@@ -819,6 +833,7 @@ impl Actor {
                 return Ok(Audience {
                     requesters: Vec::new(),
                     channel_id: Some(channel_id),
+                    channel_name: Some(channel_name.to_string()),
                 });
             };
             if !m.is_self && !requesters.contains(&m.user_id) {
@@ -828,6 +843,7 @@ impl Actor {
         Ok(Audience {
             requesters,
             channel_id: Some(channel_id),
+            channel_name: Some(channel_name.to_string()),
         })
     }
 

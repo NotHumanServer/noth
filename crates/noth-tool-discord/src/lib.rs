@@ -185,7 +185,7 @@ impl DiscordTool {
             .history
             .as_ref()
             .ok_or("発言の検索窓口がありません(Worker から呼ばれていません)")?;
-        let q = search::build_query(input, self.guild_id, &self.tz)?;
+        let q = search::build_query(input, self.guild_id, &self.tz, ctx.audience.channel_id)?;
         let found = self
             .search_readable(history.as_ref(), q, &ctx.audience)
             .await?;
@@ -310,7 +310,10 @@ impl DiscordTool {
         ctx: &ToolContext,
     ) -> std::result::Result<Value, String> {
         const ACTION: &str = "fetch_messages";
-        let channel_id = require_id(input, "channel_id")?;
+        // トリガーのチャンネルは依頼した人が発言した場所なので、「このチャンネル」には ID を省略させる
+        let channel_id = id_arg(input, "channel_id")?
+            .or(ctx.audience.channel_id)
+            .ok_or("channel_id は必須です")?;
         let mut query = vec![("limit", clamp_limit(input, FETCH_DEFAULT_LIMIT).to_string())];
         let anchors: Vec<(&str, u64)> = ["before", "after", "around"]
             .into_iter()

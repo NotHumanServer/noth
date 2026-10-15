@@ -312,10 +312,20 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
         .collect::<Vec<_>>()
         .join("\n");
 
+    let place = match (task.audience.channel_id, &task.audience.channel_name) {
+        (Some(id), Some(name)) => format!(
+            "依頼された場所: #{name}(channel_id: {id})。Goal の「このチャンネル」「ここ」はこの場所を指します。\n"
+        ),
+        (Some(id), None) => format!(
+            "依頼された場所: channel_id {id}。Goal の「このチャンネル」「ここ」はこの場所を指します。\n"
+        ),
+        _ => String::new(),
+    };
     let text = format!(
         "あなたは Goal を達成するための汎用エージェントとして、バックグラウンドで作業します。あなたの出力は Discord には表示されません。\n\
          system の「自律タスク(Ack と Goal)」「Worker に頼めること」は本線向けの規約です(キャッシュを共有するため同じ system を使っています)。あなたは Worker なので、Ack や `[Goal]` は書かずに作業してください。\n\
          task_category: {}\n\
+         {place}\
          Goal: {}\n\n\
          手順(必須):\n{steps}\n\n\
          作業が終わったら、結論メモだけを最終回答として書いてください。このとき tool は呼ばないでください。\n\
@@ -582,6 +592,27 @@ mod tests {
         let prompts = p.prompts.lock().unwrap();
         assert!(prompts[0].harness_rules == "rules");
         prompts[0].ephemeral_tail[0].text.clone()
+    }
+
+    #[tokio::test]
+    async fn instruction_names_the_requested_place() {
+        let p = MockProvider::new(vec![text("メモ"), text("メモ")]);
+        let w = worker(p.clone(), vec![], settings(3, 100));
+        let mut t = task(TaskCategory::WebResearch);
+        t.audience = noth_core::types::Audience {
+            requesters: vec![1],
+            channel_id: Some(10),
+            channel_name: Some("く".into()),
+        };
+        w.run(t).await;
+        w.run(task(TaskCategory::WebResearch)).await;
+        let prompts = p.prompts.lock().unwrap();
+        assert!(
+            prompts[0].ephemeral_tail[0]
+                .text
+                .contains("依頼された場所: #く(channel_id: 10)")
+        );
+        assert!(!prompts[1].ephemeral_tail[0].text.contains("依頼された場所"));
     }
 
     #[tokio::test]
@@ -917,6 +948,7 @@ mod tests {
         task.audience = noth_core::types::Audience {
             requesters: vec![1, 2],
             channel_id: Some(10),
+            channel_name: None,
         };
         w.run(task).await;
         let seen = t.audience.lock().unwrap().clone().unwrap();

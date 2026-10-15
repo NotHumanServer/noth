@@ -37,7 +37,7 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 | tool | `tool-web-search` | Web 検索。バックエンドは `tinyfish`(Search API) | 未登録なら tool 一覧に出ないので使えない。Worker は検索できない旨を結論メモに書く |
 | tool | `tool-web-fetch` | URL の本文取得。バックエンドは `tinyfish`(Fetch API) | 未登録なら tool 一覧に出ないので使えない |
 | tool | `tool-web-agent` | 自然言語の目標で実サイトを操作。バックエンドは `tinyfish`(Agent API `run-async` + ポーリング) | 未登録なら tool 一覧に出ないので使えない |
-| tool | `tool-discord` | 読み取り専用の Discord 参照。サーバー内チャンネルの REST 取得(`fetch_messages` / `list_pins` / `list_channels` など)と、Noth が記録済みの発言の検索(`search_messages`)。Bot トークンと `guild_id` は `[channel.discord]` を流用し、読めるのは依頼した人全員に見えるチャンネルだけで、操作は `[channel.discord] guild_id` のサーバーに限る([security.md §2](security.md#2-discord-側の対策)) | Worker が過去ログやサーバー構成を参照できない旨を結論メモに書く。`channel-discord` が有効でないと起動しない(トークンを共有するため) |
+| tool | `tool-discord` | 読み取り専用の Discord 参照。サーバー内チャンネルの REST 取得(`fetch_messages` / `list_pins` / `list_channels` など)と、Noth が記録済みの発言の検索(`search_messages`)。`fetch_messages` は `channel_id` を省略するとトリガーのチャンネルを取り、`search_messages` はチャンネルを指定しないとトリガーのチャンネルだけを検索する(サーバー全体は `scope: "guild"`)。Bot トークンと `guild_id` は `[channel.discord]` を流用し、読めるのは依頼した人全員に見えるチャンネルだけで、操作は `[channel.discord] guild_id` のサーバーに限る([security.md §2](security.md#2-discord-側の対策)) | Worker が過去ログやサーバー構成を参照できない旨を結論メモに書く。`channel-discord` が有効でないと起動しない(トークンを共有するため) |
 | tool | `tool-shell` | ホスト上でのコマンド実行。サンドボックスなし([security.md](security.md)) | 未登録なら tool 一覧に出ないので使えない。Worker は実行できない旨を結論メモに書く |
 
 tool module は `worker` が有効なときだけ意味を持ちます。`worker` 無効で tool が有効な構成は `noth doctor` が警告します。

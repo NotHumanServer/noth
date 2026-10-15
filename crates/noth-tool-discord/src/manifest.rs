@@ -10,13 +10,13 @@ pub(crate) struct ActionDef {
 pub(crate) const ACTIONS: &[ActionDef] = &[
     ActionDef {
         name: "search_messages",
-        params: "(channel_id?, query?, author?, since?, until?, limit?)",
-        description: "Noth が記録済みの過去の発言を検索する。新しい順。チャンネルは名前でも指定できる",
+        params: "(channel_id?, scope?, query?, author?, since?, until?, limit?)",
+        description: "Noth が記録済みの過去の発言を検索する。新しい順。チャンネルは名前でも指定できる。チャンネルを省略すると、依頼された場所のチャンネルだけを検索する(サーバー全体は scope=\"guild\")",
     },
     ActionDef {
         name: "fetch_messages",
-        params: "(channel_id, before?, after?, around?, limit?)",
-        description: "チャンネルの発言を Discord から直接取得する(古い順に返す)",
+        params: "(channel_id?, before?, after?, around?, limit?)",
+        description: "チャンネルの発言を Discord から直接取得する(古い順に返す)。channel_id を省略すると、依頼された場所のチャンネルを取る",
     },
     ActionDef {
         name: "list_pins",
@@ -91,6 +91,11 @@ pub(crate) fn input_schema(enabled: &[&str]) -> Value {
             "channel_id": {
                 "type": "string",
                 "description": "チャンネル ID。search_messages ではチャンネル名(#noth開発計画 のように # 付きでも可)も指定できる"
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["guild"],
+                "description": "search_messages: \"guild\" でサーバー全体を検索する。省略時は channel_id、無ければ依頼された場所のチャンネルだけ"
             },
             "user_id": {"type": "string", "description": "member_info の対象ユーザー ID"},
             "before": {"type": "string", "description": "fetch_messages: この発言 ID より前を取る"},

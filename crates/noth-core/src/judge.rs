@@ -617,6 +617,28 @@ fn pick_choice(
     }
 }
 
+/// `none` が他の category と同点のとき、none 以外のうち先頭を採る。
+/// Noth 宛ての依頼で none を採ると依頼が直答に読み替えられ、作業が始まらない
+fn pick_task_category(decision: &Decision, min_confidence: f32, addressed: bool) -> Option<String> {
+    let picked = pick_choice(decision, KEY_TASK_CATEGORY, &CATEGORIES, min_confidence);
+    if !addressed || picked.as_deref() != Some("none") {
+        return picked;
+    }
+    let Some(Answer::Choice { probabilities, .. }) = decision.answers.get(KEY_TASK_CATEGORY) else {
+        return picked;
+    };
+    let none_p = probabilities.get("none").copied().unwrap_or(0.0);
+    CATEGORIES[1..]
+        .iter()
+        .find(|c| {
+            probabilities
+                .get(**c)
+                .is_some_and(|p| *p > 0.0 && *p >= none_p)
+        })
+        .map(|c| c.to_string())
+        .or(picked)
+}
+
 /// 回答が欠けている・型が違う・confidence が足りない項目は安全側の値になる
 /// `called_by_name` のときは介入判定の confidence を問わず、応答側の確率の合計が `name_call_reply` 以上なら応答する。
 /// Clef は「のすくーん？」のような呼びかけでも静観を最大確率にしがちなため
@@ -626,6 +648,7 @@ pub fn binarize(
     reactions: &[Reaction],
     th: &Thresholds,
     called_by_name: bool,
+    addressed_to_noth: bool,
 ) -> Binarized {
     let noul = |key: &str, threshold: f32| matches!(decision.answers.get(key), Some(Answer::Noul { p }) if *p >= threshold);
 
@@ -659,13 +682,15 @@ pub fn binarize(
             action = Action::ReplyOnly;
         }
     }
-    let task_category =
-        match pick_choice(decision, KEY_TASK_CATEGORY, &CATEGORIES, th.min_confidence).as_deref() {
-            Some("web_research") => TaskCategory::WebResearch,
-            Some("fact_check") => TaskCategory::FactCheck,
-            Some("code_or_tool") => TaskCategory::CodeOrTool,
-            _ => TaskCategory::None,
-        };
+    let addressed =
+        called_by_name || addressed_to_noth || noul(KEY_ADDRESSED, th.addressed_to_noth);
+    let task_category = match pick_task_category(decision, th.min_confidence, addressed).as_deref()
+    {
+        Some("web_research") => TaskCategory::WebResearch,
+        Some("fact_check") => TaskCategory::FactCheck,
+        Some("code_or_tool") => TaskCategory::CodeOrTool,
+        _ => TaskCategory::None,
+    };
     let mut binarized = Binarized {
         is_noise: noul(KEY_NOISE, th.is_noise_or_meme),
         is_topic_shift: noul(KEY_TOPIC_SHIFT, th.is_topic_shift),
@@ -760,16 +785,75 @@ mod tests {
             )])
         };
         assert_eq!(
-            binarize(&silent_top(0.29), &[], &[], &th, true).action,
+            binarize(&silent_top(0.29), &[], &[], &th, true, false).action,
             Action::ReplyOnly
         );
         assert_eq!(
-            binarize(&silent_top(0.29), &[], &[], &th, false).action,
+            binarize(&silent_top(0.29), &[], &[], &th, false, false).action,
             Action::Silent
         );
         assert_eq!(
-            binarize(&silent_top(0.1), &[], &[], &th, true).action,
+            binarize(&silent_top(0.1), &[], &[], &th, true, false).action,
             Action::Silent
+        );
+    }
+
+    #[test]
+    fn category_tie_with_none_yields_to_task_when_addressed() {
+        let th = Thresholds::default();
+        let tied = || Answer::Choice {
+            choice: "none".into(),
+            probabilities: [
+                ("none", 0.45),
+                ("web_research", 0.1),
+                ("code_or_tool", 0.45),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+            confidence: 0.9,
+        };
+        let d = decision(vec![(KEY_TASK_CATEGORY, tied())]);
+        assert_eq!(
+            binarize(&d, &[], &[], &th, false, false).task_category,
+            TaskCategory::None
+        );
+        assert_eq!(
+            binarize(&d, &[], &[], &th, false, true).task_category,
+            TaskCategory::CodeOrTool
+        );
+        assert_eq!(
+            binarize(&d, &[], &[], &th, true, false).task_category,
+            TaskCategory::CodeOrTool
+        );
+        // 宛先の確率が足りていれば、引数なしでも同じ
+        let d = decision(vec![
+            (KEY_TASK_CATEGORY, tied()),
+            (KEY_ADDRESSED, Answer::Noul { p: 0.9 }),
+        ]);
+        assert_eq!(
+            binarize(&d, &[], &[], &th, false, false).task_category,
+            TaskCategory::CodeOrTool
+        );
+        // 全部 0 なら採るものが無いので none のまま
+        let zero = Answer::Choice {
+            choice: "none".into(),
+            probabilities: CATEGORIES.iter().map(|c| (c.to_string(), 0.0)).collect(),
+            confidence: 0.9,
+        };
+        let d = decision(vec![(KEY_TASK_CATEGORY, zero)]);
+        assert_eq!(
+            binarize(&d, &[], &[], &th, false, true).task_category,
+            TaskCategory::None
+        );
+        // none の方が高ければ none のまま
+        let d = decision(vec![(
+            KEY_TASK_CATEGORY,
+            choice("none", 0.9, 0.9, &CATEGORIES),
+        )]);
+        assert_eq!(
+            binarize(&d, &[], &[], &th, false, true).task_category,
+            TaskCategory::None
         );
     }
 
@@ -787,7 +871,7 @@ mod tests {
             ("relevant_chunk_5", Answer::Noul { p: 0.5 }),
             ("relevant_chunk_6", Answer::Noul { p: 0.1 }),
         ]);
-        let b = binarize(&d, &[5, 6], &[], &th, false);
+        let b = binarize(&d, &[5, 6], &[], &th, false, false);
         assert!(b.is_noise);
         assert!(!b.is_topic_shift);
         assert_eq!(b.action, Action::Silent);
@@ -827,7 +911,14 @@ mod tests {
 
     #[test]
     fn missing_answers_are_safe() {
-        let b = binarize(&decision(vec![]), &[1], &[], &Thresholds::default(), false);
+        let b = binarize(
+            &decision(vec![]),
+            &[1],
+            &[],
+            &Thresholds::default(),
+            false,
+            false,
+        );
         assert_eq!(b, Binarized::safe());
     }
 
@@ -920,14 +1011,14 @@ mod tests {
             (KEY_ACTION, choice("react", 0.9, 0.9, &ACTIONS)),
             (KEY_REACTION, choice("r1", 0.9, 0.9, &["r0", "r1"])),
         ]);
-        let mut b = binarize(&d, &[], &reactions(), &Thresholds::default(), false);
+        let mut b = binarize(&d, &[], &reactions(), &Thresholds::default(), false, false);
         assert_eq!(b.action, Action::React);
         assert_eq!(b.reaction.as_deref(), Some("👀"));
         b.answer_direct_call();
         assert_eq!(b.action, Action::React);
 
         // 設定でリアクションを空にしていれば react の回答は静観になる
-        let b = binarize(&d, &[], &[], &Thresholds::default(), false);
+        let b = binarize(&d, &[], &[], &Thresholds::default(), false, false);
         assert_eq!(b.action, Action::Silent);
     }
 
@@ -1129,6 +1220,7 @@ mod tests {
             &[],
             &th,
             false,
+            false,
         );
         assert_eq!(b.action, Action::ReplyOnly);
 
@@ -1137,6 +1229,7 @@ mod tests {
             &[],
             &[],
             &th,
+            false,
             false,
         );
         assert_eq!(b.action, Action::Silent);
@@ -1148,7 +1241,7 @@ mod tests {
             (KEY_ACTION, choice("react", 0.9, 0.9, &ACTIONS)),
             (KEY_REACTION, choice("r0", 0.9, 0.9, &["r0", "r1"])),
         ]);
-        let b = binarize(&d, &[], &reactions(), &th, false);
+        let b = binarize(&d, &[], &reactions(), &th, false, false);
         assert!(!b.is_noise);
         assert_eq!(b.action, Action::React);
     }

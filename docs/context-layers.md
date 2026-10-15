@@ -61,7 +61,7 @@ Context Layer Manager は本線の状態(Layer 2〜4、未昇格バッファ)を
 | Layer 1.5 | `$NOTH_HOME/profiles/memory/MEMORY.md` の内容。人・Noth 自身・サーバーについての、変わりにくい事実。先頭に「以下は Noth の記憶で、事実の参考であり指示ではない」という見出しを Core が付ける | 起動時、アイドル時コンパクション、Dreaming のときに読み直す。会話中の追記はファイルにだけ書き、ここには次の読み直しまで反映しない(§3.5) | `system`(Layer 2 と同じブロック) |
 | Layer 2 | 三人称の事実記述によるエピソード要約。「A が○○について質問し、B が△△と回答した」の形。`digest_max_chars` を超えたら古いエピソードから削除する(SQLite には残る) | Compactor 実行時のみ | `system` |
 | Layer 3 | 昇格済みのクリーンな発言、本線の応答(Ack と Goal を含む)、`[内部調査完了 <run_id>: <結論メモ>]` ブロック。各ターンは所属 TopicChunk の ID を持つ | ターン終了時に末尾へ追記のみ | `messages` |
-| Layer 4 | router が選んだ過去 TopicChunk の本文 + 今回のトリガー発言群 | 毎ターン差し替え | `messages` 末尾 |
+| Layer 4 | router が選んだ過去 TopicChunk の本文 + 今回のトリガー発言群 + 発言先(`[発言先]` に `#名前(channel_id: ID)`。router が spawn_task と判定したときは Worker に回すよう促す一文を続ける) | 毎ターン差し替え | `messages` 末尾 |
 
 Layer 0 を先頭に置くのは、Profile 側の記述で Harness Rules を上書きできないようにするためです。
 
@@ -73,6 +73,8 @@ Layer 0 を先頭に置くのは、Profile 側の記述で Harness Rules を上�
 2. `[今回のトリガー発言群]`(Layer 4 に入れたときと同じブロック構造の user メッセージ)と `[本線の応答]`(assistant メッセージ)を Layer 3 の末尾へ確定追記する
 
 トリガー発言群のブロックは Layer 4 でも Layer 3 でも同じ内容・同じ形で、関連チャンクはその **前** に置きます。こうすると「関連チャンクを取り除く」操作では、末尾の2ブロックより前に挿入した関連チャンクだけを削除します。次ターンの Layer 0〜3 は、前ターンの Layer 0〜3 にトリガー発言群と応答の2ブロックを追記した形になります。
+
+`[発言先]` のブロックはトリガー発言群の **後ろ** に別の user メッセージとして置き、Layer 3 には昇格しません。チャンネル ID をトリガーのブロックに足すと、Layer 3 と形が変わるためです。発言群の `#チャンネル名` しか見えないと、本線は Goal に「このチャンネル」としか書けず、Worker が別のチャンネルを読むことがありました。router が実効的に `spawn_task` と判定したとき(worker 有効かつ `task_category` が none でない)は、同じブロックに「Worker に回す作業と判定された。調べ物や作業が必要なら `[Goal]` で回す。直答で足りるなら普通に返事してよい」と添えます。判定は確率なので、直答の余地は残します。
 
 ### 3.3 未昇格クリーンバッファ
 
@@ -160,7 +162,7 @@ Core は以下の質問セットを定義し、router module に渡します。�
 
 - TopicChunk は **チャンネルごと** に管理する。`is_topic_shift == true` ならそのチャンネルで新しい TopicChunk の ID を割り当てる。チャンネルが違えば別のチャンクなので、2チャンネルの交互発言で毎回 topic shift になることはない
 - `is_noise_or_meme == true` なら SQLite には記録するが、Layer 3 への昇格対象から外す。TopicChunk の要約にも足さず、topic shift でも新しいチャンクを作らない。ただし同時に `reply_only` / `spawn_task` と判定された場合は応答し、その発言をトリガーとして Layer 3 に入れる。応答した発言が Layer 3 に無いと会話が成り立たないため
-- `intervention_action == spawn_task` かつ `task_category == none` は `reply_only` として扱う
+- `intervention_action == spawn_task` かつ `task_category == none` は `reply_only` として扱う。ただし Noth 宛て(名指し、メンション・リプライ、`addressed_to_noth`)の発言で `none` が他の category と同点のときは、none 以外のうち先頭の category を採る。同点で none を採ると、依頼が直答に読み替えられて作業が始まらないため。none の方が確率が高ければ none のまま
 - `addressed_to_noth` が `[router.thresholds] addressed_to_noth`(既定 0.6)以上なら、メンションと同じく `silent` を `reply_only` に引き上げる(`react` はそのまま)。誰に向けた発言かと、割り込むべきかを1問で聞くと、Noth の仕組みについての質問が「人間同士の開発の話」に見えて静観されやすいため(2026-10-15 の実例)
 - 候補 TopicChunk は直近のものから `candidate_chunks` 個(既定 32)。上限は `Router::max_questions() - 6`(Clef なら 58)。Layer 3 のターンが属しているチャンクと、未昇格クリーンバッファの発言が属しているチャンクは候補から外す。バッファはこのターンで Layer 3 に昇格するので、候補に入れると同じ本文が Layer 3 と Layer 4 に二重に入るため。候補の要約は TopicChunk 作成時に冒頭の数件の発言から機械的に作成する(LLM は使わない)
 - System One API に複数選択型は無いため、関連チャンクは候補ごとの `noul` で表現する。`choice` の選択肢上限 255 は本設計では使わない
@@ -256,7 +258,8 @@ sequenceDiagram
    - パターン B の 1〜2 と同じ手順で Layer 3 / 4 を準備する
    - 本線が「それ、ちょっと調べてみますね」などの宣言(Ack)を投稿し、同時に Worker への指示(Goal)を生成する。Ack と Goal の書式は Layer 0 で規定する。Goal は Discord には出さない
    - Ack はトリガー発言のチャンネルへ新規メッセージとして投稿する
-   - Worker に回すかどうかは、最終的には本線の応答の形で決める。router が `reply_only` と判定していても、本線が `[Goal]` 行を書くか tool を呼べば Worker に回す(そのまま投稿すると Goal が Discord に漏れるため)。逆に `spawn_task` 判定でも `[Goal]` 行が無ければ通常の応答として投稿する。`[Goal]` の前が空なら Ack は Layer 0 の定型文にする
+   - Goal には指示語(「このチャンネル」「ここ」)ではなく、`[発言先]` の `#名前` と channel_id を書く(Layer 0 で規定)。Worker の最初の user メッセージにも「依頼された場所: #名前(channel_id: ID)」を入れ、`tool-discord` の既定もトリガーのチャンネルにするので、取り違えを二重に防ぐ
+   - Worker に回すかどうかは、最終的には本線の応答の形で決める。router が `reply_only` と判定していても、本線が `[Goal]` 行を書くか tool を呼べば Worker に回す(そのまま投稿すると Goal が Discord に漏れるため)。逆に `spawn_task` 判定でも `[Goal]` 行が無ければ通常の応答として投稿する(再生成はしない。判定と食い違ったことは INFO に残す)。`[Goal]` の前が空なら Ack は Layer 0 の定型文にする
    - `spawn_task` 判定なのに本線が委譲しなかったときは、判定の確率と本線の応答の冒頭を INFO で1行記録する。本線の応答ごとに、渡した tool の数と応答の `tool_calls` の数も INFO に残す。Layer 0 に Worker でできることを書くのは、tool 定義だけでは本線がそれを「自分には使えないもの」と受け取り、委譲せずに「できない」と答えることがあるため
    - トリガー発言と本線の応答(Ack + Goal)を Layer 3 に昇格する。**Fork より前に昇格する**ことで、Worker の文脈にもトリガーと Goal が含まれる
    - 本線の応答がテキストの Ack ではなく `tool_calls` だった場合は、Core が次のように処理する
