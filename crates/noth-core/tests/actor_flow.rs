@@ -1748,6 +1748,30 @@ async fn idle_compact_replaces_old_turns_with_digest() {
 }
 
 #[tokio::test]
+async fn compactor_rules_exclude_worker_sections() {
+    let mut h = Harness::setup(Setup {
+        worker: true,
+        compactor: true,
+        keep_recent_turns: 2,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    for q in ["質問1", "質問2", "質問3"] {
+        h.say(GENERAL, q).await;
+    }
+    let main_rules = h.prompts()[0].harness_rules.clone();
+    assert!(main_rules.contains("Worker に頼めること"));
+    let later = Timestamp::now() + jiff::SignedDuration::from_mins(11);
+    h.actor.check_idle(later).await.unwrap();
+    assert_eq!(h.process_next_job().await, "compact");
+    let calls = h.compactor.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert!(!calls[0].0.contains("Worker に頼めること"));
+    assert!(!calls[0].0.contains("[Goal]"));
+}
+
+#[tokio::test]
 async fn idle_compact_failure_keeps_turns() {
     let mut h = Harness::setup(Setup {
         compactor: true,

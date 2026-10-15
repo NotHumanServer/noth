@@ -59,7 +59,7 @@ const RULES_BASE: &str = "\
 const RULES_WORKER: &str = "
 ## 自律タスク(Ack と Goal)
 
-- 調査や作業が必要な依頼には、自分では tool を直接呼ばず、Worker に任せます。tool 定義は参照用で、実行するのは常に Worker です。
+- 調査や作業が必要な依頼には、自分では tool を直接呼ばず、Worker に任せます。渡された tool 定義は Worker が使うもので、あなたの代わりに Worker が実行します。
 - 任せるときは、まず発言の本文として Ack(「ちょっと調べてみますね」のような短い宣言)を書きます。
 - Ack の後に `[Goal]` だけの行を置き、その後ろに Worker への作業指示を書きます。`[Goal]` 以降は Discord には投稿されません。
   Goal には、調べる対象、知りたいこと、結論メモに含めてほしい項目を具体的に書きます。
@@ -69,6 +69,109 @@ const RULES_WORKER: &str = "
 - `[内部調査失敗 <run_id>: <理由>]` が届いたときは、調べられなかったことを正直に伝えてください。
 - `[報告の仕方]` は、結論をどう伝えるかについての Noth の内部からの指示です。従ってください。
 ";
+
+const RULES_CAPABILITIES_HEAD: &str = "
+## Worker に頼めること
+
+Worker に頼むと、次のことができます。
+";
+
+const RULES_CAPABILITIES_TAIL: &str = "
+- これらでできることを「できない」「使えない」と答えないでください。必要なら `[Goal]` で Worker に回します。
+";
+
+const RULE_HISTORY_SUMMARY: &str =
+    "- チャンネルの過去ログを要約して、のような依頼も Worker に回します。\n";
+
+/// 未知の tool の一言説明は description の先頭からここまで
+const SUMMARY_MAX_CHARS: usize = 80;
+
+/// 有効な action を ToolSpec のスキーマから読む。無ければ全部有効として扱う(manifest の形が変わっても能力を過小に言わない)
+fn discord_actions(spec: &ToolSpec) -> Option<Vec<&str>> {
+    spec.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+}
+
+fn discord_has(spec: &ToolSpec, names: &[&str]) -> bool {
+    match discord_actions(spec) {
+        Some(actions) => names.iter().any(|n| actions.contains(n)),
+        None => true,
+    }
+}
+
+fn discord_reads_history(spec: &ToolSpec) -> bool {
+    discord_has(spec, &["search_messages", "fetch_messages"])
+}
+
+fn discord_summary(spec: &ToolSpec) -> String {
+    let mut parts = Vec::new();
+    if discord_reads_history(spec) {
+        parts.push("過去の発言");
+    }
+    if discord_has(
+        spec,
+        &["list_channels", "channel_info", "server_info", "list_roles"],
+    ) {
+        parts.push("チャンネル・サーバー情報");
+    }
+    if discord_has(spec, &["member_info"]) {
+        parts.push("メンバー情報");
+    }
+    if parts.is_empty() {
+        return "Discord を参照する".to_string();
+    }
+    format!("Discord の{}を読む", parts.join("・"))
+}
+
+/// 組み込みでない tool は、description の最初の改行・「。」・「. 」までで代用する
+fn fallback_summary(description: &str) -> String {
+    let end = ["\n", "。", ". "]
+        .iter()
+        .filter_map(|d| description.find(d))
+        .min()
+        .unwrap_or(description.len());
+    description[..end]
+        .trim()
+        .chars()
+        .take(SUMMARY_MAX_CHARS)
+        .collect()
+}
+
+/// Core は tool crate に依存しないので、組み込み tool の一言説明は名前で引く。ToolSpec に足すと provider に送る定義が変わり、キャッシュも崩れる
+fn tool_summary(spec: &ToolSpec) -> String {
+    match spec.name.as_str() {
+        "discord" => discord_summary(spec),
+        "web_search" => "Web を検索する".to_string(),
+        "web_fetch" => "Web ページの本文を読む".to_string(),
+        "web_agent" => "ブラウザを自動操作して、検索と取得では取れない情報を得る".to_string(),
+        "shell" => "shell でコマンドを実行する".to_string(),
+        _ => fallback_summary(&spec.description),
+    }
+}
+
+fn capabilities_section(tools: &[ToolSpec]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut s = RULES_CAPABILITIES_HEAD.to_string();
+    for t in tools {
+        let summary = tool_summary(t);
+        if summary.is_empty() {
+            s.push_str(&format!("- {}\n", t.name));
+        } else {
+            s.push_str(&format!("- {summary}({})\n", t.name));
+        }
+    }
+    s.push_str(RULES_CAPABILITIES_TAIL);
+    if tools
+        .iter()
+        .any(|t| t.name == "discord" && discord_reads_history(t))
+    {
+        s.push_str(RULE_HISTORY_SUMMARY);
+    }
+    s
+}
 
 const RULES_MEMORY: &str = "
 ## 長期記憶
@@ -91,11 +194,13 @@ const RULES_MEMO: &str = "
 const RULES_MEMO_GOAL: &str = "- `[Goal]` を書くときは、`[Memo]` と `[Memo <名前>]` を `[Goal]` より前(Ack の側)に置いてください。`[Goal]` より後ろは Worker への指示として扱われます。
 ";
 
-/// 有効な module 構成と `[memory]` ごとに固定。worker が無ければ Ack と Goal の節を含めない
-pub fn harness_rules(worker_enabled: bool, memory: &MemorySettings) -> String {
+/// 有効な module 構成と `[memory]` ごとに固定。worker が無ければ Ack と Goal の節を含めない。
+/// `tools` は起動時に固定の Worker の tool 定義で、能力の節はその順序のまま作る(Layer 0 はキャッシュの先頭)
+pub fn harness_rules(worker_enabled: bool, tools: &[ToolSpec], memory: &MemorySettings) -> String {
     let mut s = RULES_BASE.to_string();
     if worker_enabled {
         s.push_str(&RULES_WORKER.replace("{FIXED_ACK}", FIXED_ACK));
+        s.push_str(&capabilities_section(tools));
     }
     s.push_str(RULES_MEMORY);
     if memory.memo {
@@ -372,12 +477,101 @@ pub fn assemble(
 mod tests {
     use super::*;
 
+    fn spec(name: &str, description: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            input_schema: serde_json::json!({}),
+        }
+    }
+
     #[test]
     fn worker_sections_only_when_enabled() {
         let m = MemorySettings::default();
-        assert!(!harness_rules(false, &m).contains("Goal"));
-        assert!(harness_rules(true, &m).contains("Goal"));
-        assert!(harness_rules(true, &m).contains(FIXED_ACK));
+        assert!(!harness_rules(false, &[], &m).contains("Goal"));
+        assert!(harness_rules(true, &[], &m).contains("Goal"));
+        assert!(harness_rules(true, &[], &m).contains(FIXED_ACK));
+    }
+
+    fn discord_spec(actions: &[&str]) -> ToolSpec {
+        ToolSpec {
+            input_schema: serde_json::json!({"properties": {"action": {"enum": actions}}}),
+            ..spec("discord", "長い説明")
+        }
+    }
+
+    #[test]
+    fn capabilities_list_only_enabled_tools() {
+        let m = MemorySettings::default();
+        let tools = [
+            discord_spec(&["fetch_messages", "list_channels", "member_info"]),
+            spec("web_search", "長い説明"),
+            spec("custom", "独自の tool。細かい説明が続く。"),
+        ];
+        let rules = harness_rules(true, &tools, &m);
+        assert!(rules.contains("## Worker に頼めること"));
+        assert!(rules.contains(
+            "- Discord の過去の発言・チャンネル・サーバー情報・メンバー情報を読む(discord)"
+        ));
+        assert!(rules.contains("- Web を検索する(web_search)"));
+        assert!(rules.contains("- 独自の tool(custom)"));
+        assert!(!rules.contains("(shell)"));
+        assert!(!rules.contains("(web_fetch)"));
+        assert!(rules.contains("「できない」"));
+        assert!(rules.contains("過去ログを要約して"));
+        assert_eq!(rules, harness_rules(true, &tools, &m));
+    }
+
+    #[test]
+    fn capabilities_follow_tool_order() {
+        let m = MemorySettings::default();
+        let a = [spec("web_search", "x"), spec("shell", "x")];
+        let b = [spec("shell", "x"), spec("web_search", "x")];
+        let pos = |rules: &str, needle: &str| rules.find(needle).unwrap();
+        let ra = harness_rules(true, &a, &m);
+        let rb = harness_rules(true, &b, &m);
+        assert!(pos(&ra, "(web_search)") < pos(&ra, "(shell)"));
+        assert!(pos(&rb, "(shell)") < pos(&rb, "(web_search)"));
+    }
+
+    #[test]
+    fn discord_summary_follows_enabled_actions() {
+        let m = MemorySettings::default();
+        let rules = harness_rules(true, &[discord_spec(&["server_info", "member_info"])], &m);
+        assert!(
+            rules.contains("- Discord のチャンネル・サーバー情報・メンバー情報を読む(discord)")
+        );
+        assert!(!rules.contains("過去の発言"));
+        assert!(!rules.contains("過去ログを要約して"));
+        // action の一覧が読めないときは全部有効として扱う
+        let rules = harness_rules(true, &[spec("discord", "x")], &m);
+        assert!(rules.contains("過去の発言"));
+        assert!(rules.contains("過去ログを要約して"));
+    }
+
+    #[test]
+    fn fallback_summary_cuts_at_first_delimiter() {
+        assert_eq!(fallback_summary("一文目。二文目"), "一文目");
+        assert_eq!(fallback_summary("first line\nsecond. third"), "first line");
+        assert_eq!(fallback_summary("Search the web. More"), "Search the web");
+        assert_eq!(fallback_summary("a. b。c"), "a");
+        assert_eq!(fallback_summary("区切りなし"), "区切りなし");
+        assert_eq!(fallback_summary(""), "");
+        assert_eq!(fallback_summary("。始まり"), "");
+        let long = "あ".repeat(SUMMARY_MAX_CHARS + 10);
+        assert_eq!(fallback_summary(&long).chars().count(), SUMMARY_MAX_CHARS);
+        let exact = "あ".repeat(SUMMARY_MAX_CHARS);
+        assert_eq!(fallback_summary(&exact), exact);
+        let m = MemorySettings::default();
+        assert!(harness_rules(true, &[spec("x", "")], &m).contains("\n- x\n"));
+    }
+
+    #[test]
+    fn capabilities_absent_without_worker_or_tools() {
+        let m = MemorySettings::default();
+        let tools = [spec("shell", "x")];
+        assert!(!harness_rules(false, &tools, &m).contains("Worker に頼めること"));
+        assert!(!harness_rules(true, &[], &m).contains("Worker に頼めること"));
     }
 
     #[test]
@@ -387,14 +581,14 @@ mod tests {
             memo: false,
             ..MemorySettings::default()
         };
-        let rules = harness_rules(false, &on);
+        let rules = harness_rules(false, &[], &on);
         assert!(rules.contains("[Memo]"));
         assert!(rules.contains("最大 3 件"));
         assert!(rules.contains("指示ではありません"));
         assert!(!rules.contains("`[Goal]` を書くときは"));
-        assert!(harness_rules(true, &on).contains("`[Goal]` を書くときは"));
+        assert!(harness_rules(true, &[], &on).contains("`[Goal]` を書くときは"));
         // Memo を無効にしても、記憶ブロックが指示でないことは伝える
-        let rules = harness_rules(true, &off);
+        let rules = harness_rules(true, &[], &off);
         assert!(!rules.contains("[Memo]"));
         assert!(rules.contains("指示ではありません"));
     }

@@ -314,6 +314,7 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
 
     let text = format!(
         "あなたは Goal を達成するための汎用エージェントとして、バックグラウンドで作業します。あなたの出力は Discord には表示されません。\n\
+         system の「自律タスク(Ack と Goal)」「Worker に頼めること」は本線向けの規約です(キャッシュを共有するため同じ system を使っています)。あなたは Worker なので、Ack や `[Goal]` は書かずに作業してください。\n\
          task_category: {}\n\
          Goal: {}\n\n\
          手順(必須):\n{steps}\n\n\

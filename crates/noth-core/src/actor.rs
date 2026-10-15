@@ -26,6 +26,8 @@ use crate::{Error, Result, bus, heartbeat, ingest, memory, progress, restore};
 /// typing インジケータは Discord 側で約 10 秒で消えるので、それより短い間隔で再送する
 const TYPING_INTERVAL: Duration = Duration::from_secs(8);
 const SUMMARY_CHARS: usize = 40;
+/// 委譲しなかった本線の応答をログに出すときの先頭の文字数
+const MISMATCH_HEAD_CHARS: usize = 60;
 /// 関連チャンク 1 つあたりの本文の上限。候補が多くても Layer 4 が膨らまないようにする
 const RELEVANT_CHUNK_MAX_CHARS: usize = 6_000;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -222,6 +224,8 @@ pub struct Actor {
     /// コンパクションを済ませたアイドル期間。新しい人間の発言が来るまで次を積まない
     compacted_for: Option<i64>,
     harness_rules: String,
+    /// Compactor に渡す規約。Worker の節を含めない(要約に Ack や Goal を書かせない)。Layer 1 も入れないので本線とキャッシュは共有しない
+    compactor_rules: String,
     profile: String,
     /// Layer 1.5。起動時とコンパクション後だけ読み直す。[Memo] の追記では更新しない(Layer 1.5 以降のキャッシュが全て外れるため)
     memory: String,
@@ -242,6 +246,16 @@ pub struct Actor {
 enum FailureKind {
     Reply,
     Join,
+}
+
+/// 本線を呼ぶときの router の判定。委譲しなかったときに食い違いを記録するために渡す
+#[derive(Debug, Clone, Copy)]
+enum RouterVerdict {
+    ReplyOnly,
+    SpawnTask {
+        /// 判定の JSON に spawn_task の確率が無ければ None
+        probability: Option<f64>,
+    },
 }
 
 /// 本線が Worker に任せると決めた内容
@@ -298,7 +312,8 @@ impl Actor {
                 .map_or(FALLBACK_KEEP_RECENT_TURNS, |s| s.keep_recent_turns),
         };
         Ok(Self {
-            harness_rules: layers::harness_rules(worker.is_some(), &config.memory),
+            harness_rules: layers::harness_rules(worker.is_some(), &tools, &config.memory),
+            compactor_rules: layers::harness_rules(false, &[], &config.memory),
             profile: layers::profile_layer(&config, members),
             memory: memory::layer_text(
                 &memory::read(&config.paths.memory_file()),
@@ -515,24 +530,35 @@ impl Actor {
                 Ok(())
             }
             Action::ReplyOnly | Action::SpawnTask => {
+                let verdict = if action == Action::SpawnTask {
+                    RouterVerdict::SpawnTask {
+                        probability: answers[judge::KEY_ACTION]["probabilities"]["spawn_task"]
+                            .as_f64(),
+                    }
+                } else {
+                    RouterVerdict::ReplyOnly
+                };
                 self.respond(
                     &batch,
                     chunk_id,
                     &binarized.relevant,
                     binarized.task_category,
+                    verdict,
                 )
                 .await
             }
         }
     }
 
-    /// パターン B と C。spawn_task かどうかは router の判定ではなく本線の応答の形で決める
+    /// パターン B と C。spawn_task かどうかは router の判定ではなく本線の応答の形で決める。
+    /// `verdict` は本線が委譲しなかったときの食い違いのログ用
     async fn respond(
         &mut self,
         batch: &JudgeBatch,
         chunk_id: i64,
         relevant: &[i64],
         category: TaskCategory,
+        verdict: RouterVerdict,
     ) -> Result<()> {
         let guild = self.guild;
         let trigger_ids: HashSet<i64> = batch.messages.iter().map(|m| m.row_id).collect();
@@ -586,10 +612,35 @@ impl Actor {
             }
         };
 
+        tracing::info!(
+            tools = self.tools.len(),
+            tool_calls = completion.tool_calls.len(),
+            has_text = completion.text.is_some(),
+            chunk_id,
+            "本線の応答"
+        );
         if let Some(plan) = self.task_plan(&completion, category) {
             return self
                 .start_task(batch, chunk_id, trigger, plan, &completion.usage)
                 .await;
+        }
+        if let RouterVerdict::SpawnTask { probability } = verdict {
+            let head: String = completion
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(MISMATCH_HEAD_CHARS)
+                .collect();
+            tracing::info!(
+                spawn_task_p = ?probability,
+                head,
+                chunk_id,
+                "router は spawn_task と判定しましたが、本線は委譲しませんでした"
+            );
         }
         let Some(text) = completion
             .text
@@ -1073,7 +1124,7 @@ impl Actor {
             return Ok(());
         }
         let (range, kept) = turns.split_at(cut);
-        let episode = match compactor.digest(&self.harness_rules, range).await {
+        let episode = match compactor.digest(&self.compactor_rules, range).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(error = %e, "Layer 3 の要約に失敗しました。ターンはそのまま残します");
@@ -1286,7 +1337,7 @@ impl Actor {
         let ids: Vec<i64> = target.iter().filter_map(|t| t.id).collect();
 
         if let Some((compactor, settings)) = self.compaction.clone() {
-            match compactor.digest(&self.harness_rules, &target).await {
+            match compactor.digest(&self.compactor_rules, &target).await {
                 Ok(episode) => {
                     self.merge_episode(&episode, settings.digest_max_chars, &ids, &compacted)
                         .await?;
