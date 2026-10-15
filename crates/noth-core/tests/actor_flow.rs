@@ -526,6 +526,7 @@ impl Harness {
                 at: msg.timestamp,
                 mentions_self,
                 reply_to_self: false,
+                reply_to: None,
             }],
         };
         self.actor.handle_judge(batch).await.unwrap();
@@ -558,6 +559,7 @@ fn incoming(
         is_self: false,
         mentions_self: false,
         reply_to_self: false,
+        reply_to: None,
     }
 }
 

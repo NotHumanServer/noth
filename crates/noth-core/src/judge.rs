@@ -43,6 +43,7 @@ pub struct PendingMessage {
     /// 再起動で復元した分も messages に保存した値を使うので、名指しへの応答は失われない
     pub mentions_self: bool,
     pub reply_to_self: bool,
+    pub reply_to: Option<ReplyTo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,14 +288,16 @@ pub fn build_join_state(input: &JoinInput, cfg: &RouterSection) -> RouterState {
         .since_fork
         .iter()
         .map(|r| {
-            json!({
+            let mut v = json!({
                 "channel_id": r.channel_id.to_string(),
                 "channel": r.channel_name,
                 "author": r.author_name,
                 "content": r.content,
                 "at": rfc3339(r.created_at),
                 "is_self": r.is_self,
-            })
+            });
+            insert_reply_to(&mut v, r.reply_to.as_ref());
+            v
         })
         .collect();
     let mut state = json!({
@@ -343,6 +346,17 @@ fn rfc3339(ts: Timestamp) -> String {
     ts.to_string()
 }
 
+/// リプライでない発言には key ごと付けない(state を無駄に膨らませない)
+fn insert_reply_to(v: &mut Value, reply_to: Option<&ReplyTo>) {
+    if let Some(r) = reply_to {
+        v["reply_to"] = json!({
+            "author": r.author_name,
+            "is_self": r.is_self,
+            "excerpt": r.excerpt,
+        });
+    }
+}
+
 /// recent は trigger を除いて直近 `recent_messages` 件に絞り、`state_max_chars` を超える間は古い方から捨てる
 pub fn build_state(
     batch: &JudgeBatch,
@@ -356,7 +370,7 @@ pub fn build_state(
         .messages
         .iter()
         .map(|m| {
-            json!({
+            let mut v = json!({
                 "channel_id": batch.channel_id.to_string(),
                 "channel": batch.channel_name,
                 "author": m.author_name,
@@ -365,7 +379,9 @@ pub fn build_state(
                 "mentions_self": m.mentions_self,
                 "reply_to_self": m.reply_to_self,
                 "calls_noth_by_name": contains_any_name(&m.content, &cfg.call_names),
-            })
+            });
+            insert_reply_to(&mut v, m.reply_to.as_ref());
+            v
         })
         .collect();
 
@@ -373,14 +389,16 @@ pub fn build_state(
         .iter()
         .filter(|r| !trigger_ids.contains(&r.id))
         .map(|r| {
-            json!({
+            let mut v = json!({
                 "channel_id": r.channel_id.to_string(),
                 "channel": r.channel_name,
                 "author": r.author_name,
                 "content": r.content,
                 "at": rfc3339(r.created_at),
                 "is_self": r.is_self,
-            })
+            });
+            insert_reply_to(&mut v, r.reply_to.as_ref());
+            v
         })
         .collect();
     if recent.len() > cfg.recent_messages {
@@ -667,6 +685,7 @@ mod tests {
                 at: Timestamp::UNIX_EPOCH,
                 mentions_self: false,
                 reply_to_self: false,
+                reply_to: None,
             }],
         };
         let state = build_state(&batch, &[], &[], &HashMap::new(), &cfg);
@@ -783,5 +802,91 @@ mod tests {
         // 設定でリアクションを空にしていれば react の回答は静観になる
         let b = binarize(&d, &[], &[], &Thresholds::default(), false);
         assert_eq!(b.action, Action::Silent);
+    }
+
+    #[test]
+    fn reply_to_appears_in_state_only_when_present() {
+        let reply = ReplyTo {
+            message_id: 7,
+            author_name: "bob".into(),
+            is_self: true,
+            excerpt: "元の発言".into(),
+        };
+        let pending = |row_id, reply_to| PendingMessage {
+            row_id,
+            message_id: row_id as u64,
+            author_name: "alice".into(),
+            content: "はい".into(),
+            at: Timestamp::UNIX_EPOCH,
+            mentions_self: false,
+            reply_to_self: false,
+            reply_to,
+        };
+        let batch = JudgeBatch {
+            channel_id: 1,
+            channel_name: "general".into(),
+            messages: vec![pending(1, Some(reply)), pending(2, None)],
+        };
+        let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
+        let state = build_state(&batch, &[], &[], &HashMap::new(), &cfg);
+        assert_eq!(
+            state.0["trigger"][0]["reply_to"],
+            json!({"author": "bob", "is_self": true, "excerpt": "元の発言"})
+        );
+        assert!(state.0["trigger"][1].get("reply_to").is_none());
+    }
+
+    fn one_message_batch() -> JudgeBatch {
+        JudgeBatch {
+            channel_id: 1,
+            channel_name: "general".into(),
+            messages: vec![PendingMessage {
+                row_id: 1,
+                message_id: 1,
+                author_name: "alice".into(),
+                content: "はい".into(),
+                at: Timestamp::UNIX_EPOCH,
+                mentions_self: false,
+                reply_to_self: false,
+                reply_to: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn recent_carries_reply_to_when_present() {
+        let row = |id: i64, reply_to: Option<ReplyTo>| MessageRow {
+            id,
+            guild_id: 1,
+            channel_id: 1,
+            channel_name: "general".into(),
+            message_id: id as u64,
+            user_id: 1,
+            author_name: "bob".into(),
+            is_self: false,
+            mentions_self: false,
+            reply_to_self: false,
+            reply_to,
+            content: "x".into(),
+            created_at: Timestamp::UNIX_EPOCH,
+            chunk_id: None,
+            is_noise: None,
+            decision_id: None,
+            promoted_turn_id: None,
+        };
+        let reply = ReplyTo {
+            message_id: 7,
+            author_name: "alice".into(),
+            is_self: false,
+            excerpt: "元".into(),
+        };
+        let recent = [row(101, Some(reply)), row(102, None)];
+        let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
+        let state = build_state(&one_message_batch(), &recent, &[], &HashMap::new(), &cfg);
+        assert_eq!(
+            state.0["recent"][0]["reply_to"],
+            json!({"author": "alice", "is_self": false, "excerpt": "元"})
+        );
+        assert!(state.0["recent"][1].get("reply_to").is_none());
     }
 }

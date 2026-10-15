@@ -30,6 +30,25 @@ pub struct IncomingMessage {
     pub mentions_self: bool,
     /// Noth の発言へのリプライか。引用本文は読まず、参照先の author だけを見る
     pub reply_to_self: bool,
+    pub reply_to: Option<ReplyTo>,
+}
+
+/// Discord のリプライ先。router の state と主 LLM の発言行に出す
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyTo {
+    pub message_id: MessageId,
+    pub author_name: String,
+    pub is_self: bool,
+    /// 本文の先頭 60 文字
+    pub excerpt: String,
+}
+
+impl ReplyTo {
+    pub const EXCERPT_CHARS: usize = 60;
+
+    pub fn excerpt_of(content: &str) -> String {
+        content.chars().take(Self::EXCERPT_CHARS).collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

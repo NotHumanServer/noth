@@ -85,6 +85,7 @@ pub async fn run(
                         at: msg.timestamp,
                         mentions_self: msg.mentions_self,
                         reply_to_self: msg.reply_to_self,
+                        reply_to: msg.reply_to,
                     });
                 }
                 None => {

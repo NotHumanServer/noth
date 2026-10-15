@@ -30,6 +30,7 @@ pub async fn restore(store: &Store, guild: GuildId) -> Result<Vec<JudgeBatch>> {
             at: row.created_at,
             mentions_self: row.mentions_self,
             reply_to_self: row.reply_to_self,
+            reply_to: row.reply_to,
         });
     }
     Ok(batches)

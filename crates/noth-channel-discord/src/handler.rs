@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use noth_core::async_trait;
 use noth_core::bus::{BusEvent, BusHandle};
 use noth_core::traits::ConnectionState;
-use noth_core::types::{IncomingMessage, UserId};
+use noth_core::types::{IncomingMessage, ReplyTo, UserId};
 use serenity::all as sn;
 use serenity::prelude::{Context, EventHandler};
 
@@ -89,6 +89,40 @@ impl EventHandler for Handler {
             })
             .unwrap_or_else(|| msg.channel_id.get().to_string());
 
+        let reply_to = msg.referenced_message.as_ref().map(|r| {
+            let is_self = r.author.id.get() == self.self_id;
+            // allowed_users 以外の発言は保存しない方針なので、返信先でも名前と本文を残さない
+            if !is_self && !self.allowed.contains(&r.author.id.get()) {
+                return ReplyTo {
+                    message_id: r.id.get(),
+                    author_name: "<user>".into(),
+                    is_self: false,
+                    excerpt: String::new(),
+                };
+            }
+            let author_name = if is_self {
+                self.self_name.clone()
+            } else {
+                r.member
+                    .as_ref()
+                    .and_then(|m| m.nick.clone())
+                    .or_else(|| lookup.get(&r.author.id.get()).cloned())
+                    .unwrap_or_else(|| r.author.display_name().to_string())
+            };
+            let referenced = replace_mentions(
+                &r.content,
+                self.self_id,
+                &self.self_name,
+                &self.allowed,
+                &lookup,
+            );
+            ReplyTo {
+                message_id: r.id.get(),
+                author_name,
+                is_self,
+                excerpt: ReplyTo::excerpt_of(&referenced),
+            }
+        });
         let incoming = IncomingMessage {
             guild_id: self.guild_id,
             channel_id: msg.channel_id.get(),
@@ -105,6 +139,7 @@ impl EventHandler for Handler {
                 .referenced_message
                 .as_ref()
                 .is_some_and(|r| r.author.id.get() == self.self_id),
+            reply_to,
         };
         if let Err(e) = self.bus.publish(BusEvent::MessageReceived(incoming)).await {
             tracing::error!(error = %e, "failed to publish message");

@@ -499,6 +499,7 @@ impl Actor {
                 author: m.author_name.clone(),
                 at: m.at,
                 content: m.content.clone(),
+                reply_to: m.reply_to.clone(),
             })
             .collect();
         let trigger = layers::trigger_turn(chunk_id, &trigger_lines);
@@ -1253,6 +1254,7 @@ fn rows_to_lines(rows: &[MessageRow]) -> Vec<Line> {
             author: r.author_name.clone(),
             at: r.created_at,
             content: r.content.clone(),
+            reply_to: r.reply_to.clone(),
         })
         .collect()
 }

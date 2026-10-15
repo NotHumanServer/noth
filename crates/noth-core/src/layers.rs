@@ -116,6 +116,7 @@ pub struct Line {
     pub author: String,
     pub at: Timestamp,
     pub content: String,
+    pub reply_to: Option<ReplyTo>,
 }
 
 fn format_time(ts: Timestamp) -> String {
@@ -127,11 +128,17 @@ fn format_time(ts: Timestamp) -> String {
 fn format_block(header: &str, lines: &[Line]) -> String {
     let mut s = header.to_string();
     for l in lines {
+        // リプライでない行は従来の書式のまま(append-only キャッシュの前方一致を保つ)
+        let reply = match &l.reply_to {
+            Some(r) => format!("(→ {} への返信)", r.author_name),
+            None => String::new(),
+        };
         s.push_str(&format!(
-            "\n#{} {} {}: {}",
+            "\n#{} {} {}{}: {}",
             l.channel,
             format_time(l.at),
             l.author,
+            reply,
             l.content
         ));
     }
@@ -373,17 +380,25 @@ mod tests {
                 author: "alice".into(),
                 at: ts,
                 content: "こんにちは".into(),
+                reply_to: None,
             },
             Line {
                 channel: "general".into(),
                 author: "bob".into(),
                 at: ts,
                 content: "やあ".into(),
+                reply_to: Some(ReplyTo {
+                    message_id: 1,
+                    author_name: "alice".into(),
+                    is_self: false,
+                    excerpt: "こんにちは".into(),
+                }),
             },
         ];
         let t = trigger_turn(3, &lines);
         assert!(t.text.starts_with("[発言群]\n#general "));
         assert!(t.text.contains("alice: こんにちは\n#general "));
+        assert!(t.text.ends_with("bob(→ alice への返信): やあ"));
         assert_eq!(t.chunk_id, Some(3));
     }
 }

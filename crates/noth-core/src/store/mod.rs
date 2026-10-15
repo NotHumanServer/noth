@@ -28,6 +28,7 @@ pub struct MessageRow {
     pub is_self: bool,
     pub mentions_self: bool,
     pub reply_to_self: bool,
+    pub reply_to: Option<ReplyTo>,
     pub content: String,
     pub created_at: Timestamp,
     pub chunk_id: Option<i64>,
@@ -162,7 +163,7 @@ pub struct NewWorkerRun {
 /// 機械要約の上限。候補用なので短く保つ
 const SUMMARY_MAX_CHARS: usize = 200;
 
-const MESSAGE_COLUMNS: &str = "id, guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, content, created_at, chunk_id, is_noise, decision_id, promoted_turn_id";
+const MESSAGE_COLUMNS: &str = "id, guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, reply_to_message_id, reply_to_author, reply_to_is_self, reply_to_excerpt, content, created_at, chunk_id, is_noise, decision_id, promoted_turn_id";
 const CHUNK_COLUMNS: &str = "id, guild_id, channel_id, started_at, ended_at, summary, compacted";
 const RUN_COLUMNS: &str = "run_id, status, task_category, goal, started_at, finished_at, channel_id, chunk_id, trigger_message_id, fork_message_id, conclusion, delivery_style";
 
@@ -187,6 +188,7 @@ fn message_row(r: &SqliteRow) -> Result<MessageRow> {
         is_self: r.try_get("is_self")?,
         mentions_self: r.try_get("mentions_self")?,
         reply_to_self: r.try_get("reply_to_self")?,
+        reply_to: reply_to_of(r)?,
         content: r.try_get("content")?,
         created_at: ts(r.try_get("created_at")?),
         chunk_id: r.try_get("chunk_id")?,
@@ -194,6 +196,24 @@ fn message_row(r: &SqliteRow) -> Result<MessageRow> {
         decision_id: r.try_get("decision_id")?,
         promoted_turn_id: r.try_get("promoted_turn_id")?,
     })
+}
+
+fn reply_to_of(r: &SqliteRow) -> Result<Option<ReplyTo>> {
+    let Some(message_id) = r.try_get::<Option<i64>, _>("reply_to_message_id")? else {
+        return Ok(None);
+    };
+    Ok(Some(ReplyTo {
+        message_id: message_id as u64,
+        author_name: r
+            .try_get::<Option<String>, _>("reply_to_author")?
+            .unwrap_or_default(),
+        is_self: r
+            .try_get::<Option<bool>, _>("reply_to_is_self")?
+            .unwrap_or(false),
+        excerpt: r
+            .try_get::<Option<String>, _>("reply_to_excerpt")?
+            .unwrap_or_default(),
+    }))
 }
 
 fn chunk_row(r: &SqliteRow) -> Result<ChunkRow> {
@@ -304,8 +324,8 @@ impl Store {
     // --- messages ---
     pub async fn insert_message(&self, msg: &IncomingMessage) -> Result<i64> {
         let r = sqlx::query(
-            "INSERT INTO messages (guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, content, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, content, created_at, reply_to_message_id, reply_to_author, reply_to_is_self, reply_to_excerpt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(msg.guild_id as i64)
         .bind(msg.channel_id as i64)
@@ -318,6 +338,10 @@ impl Store {
         .bind(msg.reply_to_self)
         .bind(&msg.content)
         .bind(msg.timestamp.as_millisecond())
+        .bind(msg.reply_to.as_ref().map(|r| r.message_id as i64))
+        .bind(msg.reply_to.as_ref().map(|r| r.author_name.as_str()))
+        .bind(msg.reply_to.as_ref().map(|r| r.is_self))
+        .bind(msg.reply_to.as_ref().map(|r| r.excerpt.as_str()))
         .execute(&self.pool)
         .await?;
         Ok(r.last_insert_rowid())
@@ -1100,6 +1124,7 @@ mod tests {
             is_self,
             mentions_self: false,
             reply_to_self: false,
+            reply_to: None,
         }
     }
 
@@ -1596,5 +1621,22 @@ mod tests {
         }
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reply_to_round_trips() {
+        let s = Store::open_memory().await.unwrap();
+        let mut m = incoming(1, false, "返信");
+        m.reply_to = Some(ReplyTo {
+            message_id: 42,
+            author_name: "bob".into(),
+            is_self: true,
+            excerpt: "元".into(),
+        });
+        s.insert_message(&m).await.unwrap();
+        s.insert_message(&incoming(2, false, "通常")).await.unwrap();
+        let rows = s.unjudged_messages(G).await.unwrap();
+        assert_eq!(rows[0].reply_to, m.reply_to);
+        assert_eq!(rows[1].reply_to, None);
     }
 }
