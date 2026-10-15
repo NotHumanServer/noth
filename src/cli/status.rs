@@ -79,6 +79,10 @@ pub async fn run(cfg: Option<&Path>) -> Result<ExitCode> {
         Some(u) => println!("直近ターンの input_tokens: {}", u.input_tokens),
         None => println!("直近ターンの input_tokens: -"),
     }
+    match super::cost::today_line(&store, hb.guild_id).await {
+        Ok(line) => println!("{line}"),
+        Err(e) => println!("今日のコスト: 取得できません({e})"),
+    }
     let runs = store.active_runs(hb.guild_id).await?;
     println!("進行中の Worker: {} 件", runs.len());
     for r in &runs {

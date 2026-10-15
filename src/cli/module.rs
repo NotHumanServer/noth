@@ -6,7 +6,7 @@ use noth_core::config::enabled_modules;
 use noth_core::registry::{KNOWN_MODULES, ModuleKind, kind_of};
 
 use super::status::notify_restart_needed;
-use super::{edit, message, paths, service};
+use super::{edit, message, pad, paths, service};
 
 pub fn list(cfg: Option<&Path>) -> Result<ExitCode> {
     let reg = crate::registry();
@@ -35,12 +35,6 @@ pub fn list(cfg: Option<&Path>) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// 全角文字を2桁として数え、日本語の見出しでも列を揃える
-fn pad(s: &str, width: usize) -> String {
-    let w: usize = s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
-    format!("{s}{}", " ".repeat(width.saturating_sub(w)))
 }
 
 /// 無いと module が動かないセクション。tool-* と router-mention は既定値で動くので対象外

@@ -1,5 +1,6 @@
 mod auth;
 mod config_cmd;
+mod cost;
 mod doctor;
 mod edit;
 mod init;
@@ -68,6 +69,18 @@ pub enum Command {
     Status,
     /// 設定と外部疎通を検査する
     Doctor,
+    /// LLM と外部 API の利用量・コストを集計して表示する
+    Cost {
+        /// 集計する期間(today / 24h / 7d / 30d / all)
+        #[arg(long, default_value = "7d", value_name = "期間")]
+        since: String,
+        /// 集計の単位
+        #[arg(long, value_enum, default_value_t = cost::By::Model)]
+        by: cost::By,
+        /// 課金先アカウントの状態を取得しない(外部 API を呼ばない)
+        #[arg(long)]
+        offline: bool,
+    },
     /// ログを表示する
     Logs {
         /// 新しい行を追って表示し続ける
@@ -195,6 +208,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Auth(AuthCmd::Codex) => auth::codex(cfg).await,
         Command::Status => status::run(cfg).await,
         Command::Doctor => doctor::run(cfg).await,
+        Command::Cost { since, by, offline } => cost::run(cfg, &since, by, offline).await,
         Command::Logs { follow, lines } => logs::run(cfg, follow, lines).await,
     }
 }
@@ -235,4 +249,16 @@ pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("{} を作成できません", dir.display()))
+}
+
+/// 全角文字を2桁として数え、日本語の見出しでも列を揃える
+pub(crate) fn pad(s: &str, width: usize) -> String {
+    let w: usize = s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+    format!("{s}{}", " ".repeat(width.saturating_sub(w)))
+}
+
+/// `pad` の右寄せ版。数値の桁を揃える
+pub(crate) fn pad_left(s: &str, width: usize) -> String {
+    let w: usize = s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+    format!("{}{s}", " ".repeat(width.saturating_sub(w)))
 }
