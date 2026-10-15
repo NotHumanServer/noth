@@ -206,7 +206,7 @@ debounce_secs = 2.0
 [router]
 recent_messages  = 30            # state.recent に入れる直近発言数
 state_max_chars  = 24000         # state 全体の文字数上限。Clef-flash(24,576 tokens)では保守的に
-candidate_chunks = 32            # 関連判定にかける候補 TopicChunk の数(上限は max_questions - 4)
+candidate_chunks = 32            # 関連判定にかける候補 TopicChunk の数(上限は max_questions - 5)
 call_names       = ["noth", "ノス", "のす"]  # 本文でこう呼ばれたら min_confidence を無視して router の判定に従う
 conversation_window_secs = 120  # Noth が応答してからこの秒数は、話していた相手の発言を呼び名と同じ扱いにする
 
@@ -216,6 +216,14 @@ is_topic_shift   = 0.6
 relevant_chunk   = 0.5
 min_confidence   = 0.15
 name_call_reply  = 0.25  # 呼び名で呼ばれたとき、reply_only と spawn_task の確率の合計がこれ以上なら応答する
+
+# router が選べる絵文字リアクション。話すほどではないが気になる発言に付ける。
+# 省略時は次の 8 種。`reactions = []` でリアクションしなくなる。`<:name:id>` のカスタム絵文字も使える
+[[router.reactions]]
+emoji   = "👍"
+meaning = "同意・了解"
+# 😂 笑える / 👀 気になる・続きを見ていたい / 🙏 感謝・お疲れさま / 🎉 お祝い・うれしい知らせ
+# 🤔 考えさせられる・ちょっと疑問 / ❤️ 共感・いいね / 😢 残念・つらい
 
 [router.systemone]
 preset     = "jev"               # jev | clef | custom。省略時も jev

@@ -24,6 +24,7 @@ pub async fn restore(store: &Store, guild: GuildId) -> Result<Vec<JudgeBatch>> {
         });
         batches[i].messages.push(PendingMessage {
             row_id: row.id,
+            message_id: row.message_id,
             author_name: row.author_name,
             content: row.content,
             at: row.created_at,

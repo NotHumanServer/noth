@@ -30,6 +30,7 @@ struct MockChannel {
     typing: Mutex<Vec<ChannelId>>,
     edits: Mutex<Vec<(ChannelId, MessageId, String, tokio::time::Instant)>>,
     edit_fail: AtomicBool,
+    reactions: Mutex<Vec<(ChannelId, MessageId, String)>>,
 }
 
 #[async_trait]
@@ -65,6 +66,13 @@ impl Channel for MockChannel {
             text.to_string(),
             tokio::time::Instant::now(),
         ));
+        Ok(())
+    }
+    async fn react(&self, channel_id: ChannelId, message_id: MessageId, emoji: &str) -> Result<()> {
+        self.reactions
+            .lock()
+            .unwrap()
+            .push((channel_id, message_id, emoji.to_string()));
         Ok(())
     }
     async fn typing(&self, channel_id: ChannelId) -> Result<()> {
@@ -291,7 +299,7 @@ fn choice(name: &str, options: &[&str], confidence: f32) -> Answer {
 }
 
 fn action(name: &str) -> Answer {
-    choice(name, &["silent", "reply_only", "spawn_task"], 1.0)
+    choice(name, &["silent", "react", "reply_only", "spawn_task"], 1.0)
 }
 
 fn category(name: &str) -> Answer {
@@ -344,6 +352,10 @@ fn config(hard_limit: u64, table: toml::Table) -> Config {
             call_names: vec!["noth".into()],
             conversation_window_secs: 120,
             thresholds: Thresholds::default(),
+            reactions: vec![Reaction {
+                emoji: "👀".into(),
+                meaning: "気になる".into(),
+            }],
         },
         table,
         env: Default::default(),
@@ -508,6 +520,7 @@ impl Harness {
             channel_name: name.into(),
             messages: vec![PendingMessage {
                 row_id,
+                message_id: msg.message_id,
                 author_name: "alice".into(),
                 content: content.into(),
                 at: msg.timestamp,
@@ -580,6 +593,39 @@ async fn silent_buffers_then_reply_promotes_one_block() {
     assert!(prompt.tools.is_empty());
     assert!(!prompt.harness_rules.contains("Goal"));
     assert!(prompt.profile.contains("alice"));
+}
+
+#[tokio::test]
+async fn react_adds_emoji_to_last_message_without_speaking() {
+    let mut h = Harness::new().await;
+    let mut a = answers("react", 0.0, 0.0);
+    a.push(("reaction", choice("r0", &["r0"], 1.0)));
+    h.router.set(a);
+    h.say(GENERAL, "新しいキーボード買った").await;
+    h.say(GENERAL, "打鍵感が最高").await;
+
+    let reactions = h.channel.reactions.lock().unwrap().clone();
+    assert_eq!(
+        reactions,
+        vec![
+            (GENERAL, 1001, "👀".to_string()),
+            (GENERAL, 1002, "👀".to_string())
+        ]
+    );
+    assert!(h.sent().is_empty());
+    assert!(h.prompts().is_empty());
+    assert!(h.store.active_turns(GUILD).await.unwrap().is_empty());
+    assert_eq!(h.store.buffered_messages(GUILD).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn react_without_emoji_answer_stays_silent() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("react", 0.0, 0.0));
+    h.say(GENERAL, "新しいキーボード買った").await;
+
+    assert!(h.channel.reactions.lock().unwrap().is_empty());
+    assert!(h.sent().is_empty());
 }
 
 #[tokio::test]

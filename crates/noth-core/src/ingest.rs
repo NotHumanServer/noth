@@ -79,6 +79,7 @@ pub async fn run(
                     entry.deadline = extended_deadline(entry.first_at, now, debounce);
                     entry.batch.messages.push(PendingMessage {
                         row_id,
+                        message_id: msg.message_id,
                         author_name: msg.author_name,
                         content: msg.content,
                         at: msg.timestamp,

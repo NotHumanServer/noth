@@ -52,6 +52,17 @@ pub trait Channel: Send + Sync {
             "この Channel は発言の編集に対応していません".into(),
         ))
     }
+    /// 発言に絵文字リアクションを付ける。対応しない Channel は既定のまま Err を返し、Core は何もしない
+    async fn react(
+        &self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: &str,
+    ) -> Result<()> {
+        Err(crate::Error::Other(
+            "この Channel はリアクションに対応していません".into(),
+        ))
+    }
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
     /// `noth doctor` の疎通確認。結果の説明を返す

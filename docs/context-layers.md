@@ -100,14 +100,15 @@ Core は以下の質問セットを定義し、router module に渡します。�
 |---|---|---|
 | `is_noise_or_meme` | noul | スタンプ連打・コピペ連投など文脈価値のないノイズか |
 | `is_topic_shift` | noul | そのチャンネルの直前の会話から話題が切り替わったか |
-| `intervention_action` | choice: `silent` / `reply_only` / `spawn_task` | 静観するか、本線だけを起動するか、本線と Worker を起動するか |
+| `intervention_action` | choice: `silent` / `react` / `reply_only` / `spawn_task` | 静観するか、リアクションだけ付けるか、本線だけを起動するか、本線と Worker を起動するか。`react` は `[[router.reactions]]` が空なら選択肢に出さない |
+| `reaction` | choice: `r0`〜(`[[router.reactions]]` の順) | `react` のときに付ける絵文字。選択肢の説明は「絵文字 + 意味」。`[[router.reactions]]` が空なら出さない |
 | `task_category` | choice: `none` / `web_research` / `fact_check` / `code_or_tool` | Worker に渡す作業の種類 |
 | `relevant_chunk_<id>` | noul × 候補数 | 候補 TopicChunk `<id>` が今回の発言に関連するか。候補ごとに1問 |
 
 - TopicChunk は **チャンネルごと** に管理する。`is_topic_shift == true` ならそのチャンネルで新しい TopicChunk の ID を割り当てる。チャンネルが違えば別のチャンクなので、2チャンネルの交互発言で毎回 topic shift になることはない
 - `is_noise_or_meme == true` なら SQLite には記録するが、Layer 3 への昇格対象から外す。TopicChunk の要約にも足さず、topic shift でも新しいチャンクを作らない。ただし同時に `reply_only` / `spawn_task` と判定された場合は応答し、その発言をトリガーとして Layer 3 に入れる。応答した発言が Layer 3 に無いと会話が成り立たないため
 - `intervention_action == spawn_task` かつ `task_category == none` は `reply_only` として扱う
-- 候補 TopicChunk は直近のものから `candidate_chunks` 個(既定 32)。上限は `Router::max_questions() - 4`(Clef なら 60)。Layer 3 のターンが属しているチャンクと、未昇格クリーンバッファの発言が属しているチャンクは候補から外す。バッファはこのターンで Layer 3 に昇格するので、候補に入れると同じ本文が Layer 3 と Layer 4 に二重に入るため。候補の要約は TopicChunk 作成時に冒頭の数件の発言から機械的に作成する(LLM は使わない)
+- 候補 TopicChunk は直近のものから `candidate_chunks` 個(既定 32)。上限は `Router::max_questions() - 5`(Clef なら 59)。Layer 3 のターンが属しているチャンクと、未昇格クリーンバッファの発言が属しているチャンクは候補から外す。バッファはこのターンで Layer 3 に昇格するので、候補に入れると同じ本文が Layer 3 と Layer 4 に二重に入るため。候補の要約は TopicChunk 作成時に冒頭の数件の発言から機械的に作成する(LLM は使わない)
 - System One API に複数選択型は無いため、関連チャンクは候補ごとの `noul` で表現する。`choice` の選択肢上限 255 は本設計では使わない
 
 ### 4.3 Worker 合流判定(Worker 完了時)
@@ -175,6 +176,15 @@ sequenceDiagram
 
 1. router が `silent` と判定する。本線は起動しない
 2. `is_noise_or_meme == false` の発言だけを未昇格クリーンバッファに入れる
+
+### パターン A': リアクションだけ付ける(`intervention_action == react`)
+
+話すほどではないが、気になる・興味がある発言に絵文字で反応します。
+
+1. router が `react` と判定し、`reaction` で絵文字を選ぶ。`reaction` の回答が欠けるか confidence が足りなければ静観になる
+2. トリガー発言群の最後の発言にリアクションを付ける。本線は起動しない。失敗(権限不足など)はログに残して無視する
+3. 発言していないので Layer 3 には何も足さない。発言はパターン A と同じく未昇格クリーンバッファに入れる
+4. メンションやリプライで名指しされても、`react` の判定はそのまま活かす。お礼に 🙏 を返すのは無視ではなく応答なので
 
 ### パターン B: 通常の会話介入(`intervention_action == reply_only`)
 

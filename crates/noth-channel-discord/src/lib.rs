@@ -155,6 +155,16 @@ impl Channel for DiscordChannel {
             .map_err(transport)
     }
 
+    async fn react(&self, channel_id: ChannelId, message_id: MessageId, emoji: &str) -> Result<()> {
+        // `<:name:id>` 形式のカスタム絵文字も設定で使えるよう、Unicode と決め打ちせず解析する
+        let reaction = sn::ReactionType::try_from(emoji)
+            .map_err(|e| Error::Other(format!("絵文字 {emoji:?} を解釈できません: {e}")))?;
+        sn::ChannelId::new(channel_id)
+            .create_reaction(&self.http, sn::MessageId::new(message_id), reaction)
+            .await
+            .map_err(transport)
+    }
+
     async fn typing(&self, channel_id: ChannelId) -> Result<()> {
         sn::ChannelId::new(channel_id)
             .broadcast_typing(&self.http)

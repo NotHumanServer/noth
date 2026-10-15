@@ -9,7 +9,7 @@ Noth を Discord サーバーに常駐させるための Bot 作成から `noth 
 | 項目 | 内容 |
 |---|---|
 | Gateway intents | `GUILDS` / `GUILD_MESSAGES` / `MESSAGE_CONTENT`。特権インテントは `MESSAGE_CONTENT` だけ |
-| 行う操作 | メッセージ受信、送信(リプライ含む。`allowed_mentions` は空)、typing インジケータ |
+| 行う操作 | メッセージ受信、送信(リプライ含む。`allowed_mentions` は空)、typing インジケータ、絵文字リアクション |
 | メンバー情報 | `GUILD_MEMBERS` は要求しない。`allowed_users` の各 ID について REST の Get Guild Member で取得する |
 
 ## 2. 手順
@@ -30,7 +30,7 @@ Noth を Discord サーバーに常駐させるための Bot 作成から `noth 
 
 ### 2.3 招待 URL を作ってサーバーに追加する
 
-**OAuth2** の URL Generator で、scope に `bot` だけを選びます。Bot 権限は次の 4 つだけにします。
+**OAuth2** の URL Generator で、scope に `bot` だけを選びます。Bot 権限は次の 5 つだけにします。
 
 | 権限 | 必要な理由 | 値 |
 |---|---|---|
@@ -38,11 +38,12 @@ Noth を Discord サーバーに常駐させるための Bot 作成から `noth 
 | Send Messages | 発言する | `1 << 11` |
 | Send Messages in Threads | スレッド内で発言する | `1 << 38` |
 | Read Message History | リプライとして投稿する(Create Message の要件) | `1 << 16` |
+| Add Reactions | 発言はせず絵文字リアクションだけで反応する | `1 << 6` |
 
-合計の permissions 整数値は `274877975552` です。URL は次の形になります。`<CLIENT_ID>` は **General Information** の Application ID です。
+合計の permissions 整数値は `274877975616` です。URL は次の形になります。`<CLIENT_ID>` は **General Information** の Application ID です。
 
 ```text
-https://discord.com/oauth2/authorize?client_id=<CLIENT_ID>&scope=bot&permissions=274877975552
+https://discord.com/oauth2/authorize?client_id=<CLIENT_ID>&scope=bot&permissions=274877975616
 ```
 
 `bot` scope だけなら `redirect_uri` や `response_type` は不要です。URL を開いて追加先のサーバーを選びます。管理者権限(Administrator)は付けません。

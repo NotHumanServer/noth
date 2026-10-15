@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
-use crate::config::{RouterSection, Thresholds};
+use crate::config::{Reaction, RouterSection, Thresholds};
 use crate::store::{ChunkRow, MessageRow};
 use crate::text::contains_any_name;
 use crate::traits::{Answer, Decision, Question};
@@ -15,9 +15,10 @@ pub const KEY_TOPIC_SHIFT: &str = "is_topic_shift";
 pub const KEY_ACTION: &str = "intervention_action";
 pub const KEY_TASK_CATEGORY: &str = "task_category";
 pub const KEY_DELIVERY: &str = "delivery_style";
+pub const KEY_REACTION: &str = "reaction";
 
 /// `is_noise_or_meme` など固定の質問の数。候補チャンクの上限は `max_questions() - FIXED_QUESTIONS`
-pub const FIXED_QUESTIONS: usize = 4;
+pub const FIXED_QUESTIONS: usize = 5;
 
 pub fn relevant_key(chunk_id: i64) -> String {
     format!("relevant_chunk_{chunk_id}")
@@ -35,6 +36,7 @@ pub struct JudgeBatch {
 pub struct PendingMessage {
     /// `messages` の行 ID
     pub row_id: i64,
+    pub message_id: MessageId,
     pub author_name: String,
     pub content: String,
     pub at: Timestamp,
@@ -46,6 +48,8 @@ pub struct PendingMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Silent,
+    /// 発言はせず、トリガーの最後の発言に絵文字リアクションだけ付ける
+    React,
     ReplyOnly,
     SpawnTask,
 }
@@ -54,6 +58,7 @@ impl Action {
     pub fn as_str(self) -> &'static str {
         match self {
             Action::Silent => "silent",
+            Action::React => "react",
             Action::ReplyOnly => "reply_only",
             Action::SpawnTask => "spawn_task",
         }
@@ -82,7 +87,7 @@ impl DeliveryStyle {
 
 const DELIVERY_STYLES: [&str; 4] = ["normal_report", "brief_supplement", "reply_anchor", "abort"];
 
-const ACTIONS: [&str; 3] = ["silent", "reply_only", "spawn_task"];
+const ACTIONS: [&str; 4] = ["silent", "react", "reply_only", "spawn_task"];
 const CATEGORIES: [&str; 4] = ["none", "web_research", "fact_check", "code_or_tool"];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +98,8 @@ pub struct Binarized {
     pub task_category: TaskCategory,
     /// 関連と判定された候補チャンクの ID(候補の並び順)
     pub relevant: Vec<i64>,
+    /// action が React のときに付ける絵文字
+    pub reaction: Option<String>,
 }
 
 impl Binarized {
@@ -104,10 +111,12 @@ impl Binarized {
             action: Action::Silent,
             task_category: TaskCategory::None,
             relevant: Vec::new(),
+            reaction: None,
         }
     }
 
-    /// 名指しされたのに確率や confidence 次第で無視すると利用者には故障に見えるので、router の判定より優先して応答する
+    /// 名指しされたのに確率や confidence 次第で無視すると利用者には故障に見えるので、router の判定より優先して応答する。
+    /// リアクションは無視ではなく応答なので、お礼への 🙏 のような判定はそのまま活かす
     pub fn answer_direct_call(&mut self) {
         self.is_noise = false;
         if self.action == Action::Silent {
@@ -126,7 +135,39 @@ impl Binarized {
     }
 }
 
-pub fn build_questions(candidates: &[ChunkRow]) -> Vec<(String, Question)> {
+fn reaction_key(index: usize) -> String {
+    format!("r{index}")
+}
+
+/// `reactions` が空ならリアクションの選択肢も質問も出さない
+pub fn build_questions(candidates: &[ChunkRow], reactions: &[Reaction]) -> Vec<(String, Question)> {
+    let mut action_criteria = vec![(
+        "silent".to_string(),
+        "静観する。Noth は何も発言しない".to_string(),
+    )];
+    if !reactions.is_empty() {
+        action_criteria.push((
+            "react".into(),
+            "発言はせず、絵文字リアクションだけ付ける。話すほどではないが気になる・興味があるとき"
+                .into(),
+        ));
+    }
+    action_criteria.extend([
+        (
+            "reply_only".to_string(),
+            "Noth が会話に返答する。調査や作業は要らない".to_string(),
+        ),
+        (
+            "spawn_task".to_string(),
+            "Noth が返答し、同時にウェブ調査やツールを使った作業を背景で始める".to_string(),
+        ),
+    ]);
+    let react_hint = if reactions.is_empty() {
+        ""
+    } else {
+        "口を挟むほどではないが、Noth が興味を持ちそうな話題、気になる知らせ、思わず反応したくなる発言には react を選びます。\
+            ただし何にでも反応すると鬱陶しいので、ありふれた雑談や事務的なやりとりには付けません。"
+    };
     let mut qs = vec![
         (
             KEY_NOISE.to_string(),
@@ -149,20 +190,16 @@ pub fn build_questions(candidates: &[ChunkRow]) -> Vec<(String, Question)> {
         (
             KEY_ACTION.to_string(),
             Question::Choice {
-                instructions: "Noth はこのサーバーの仲間の一人で、少人数の自然な雑談には口を挟みすぎない存在です。\
+                instructions: format!("Noth はこのサーバーの仲間の一人で、少人数の自然な雑談には口を挟みすぎない存在です。\
                     トリガー発言群に対して Noth が何をするかを選んでください。\
                     Noth への呼びかけ(メンション、Noth の発言へのリプライ、Noth に向けた質問や依頼)には応えます。\
                     calls_noth_by_name が true の発言は本文に Noth の呼び名を含みます。Noth に話しかけているなら応え、\
                     Noth の開発や設定について人間同士で話しているだけなら静観します。\
                     Noth が直前に答えた話題の続きで、明らかに Noth に向けた返事のときも応えます。\
-                    人間同士の雑談や独り言、すでに会話が成立している流れには入らず、静観します。\
+                    人間同士の雑談や独り言、すでに会話が成立している流れには入らず、静観します。{react_hint}\
                     迷うときは静観を選んでください。"
-                    .into(),
-                criteria: vec![
-                    ("silent".into(), "静観する。Noth は何も発言しない".into()),
-                    ("reply_only".into(), "Noth が会話に返答する。調査や作業は要らない".into()),
-                    ("spawn_task".into(), "Noth が返答し、同時にウェブ調査やツールを使った作業を背景で始める".into()),
-                ],
+                ),
+                criteria: action_criteria,
             },
         ),
         (
@@ -180,6 +217,21 @@ pub fn build_questions(candidates: &[ChunkRow]) -> Vec<(String, Question)> {
             },
         ),
     ];
+    if !reactions.is_empty() {
+        qs.push((
+            KEY_REACTION.to_string(),
+            Question::Choice {
+                instructions: "Noth がトリガー発言群の最後の発言に絵文字リアクションを付けるとしたら、どれが一番自然かを選んでください。\
+                    発言の内容と、それを読んだ Noth の気持ちに合うものを選びます。"
+                    .into(),
+                criteria: reactions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (reaction_key(i), format!("{} {}", r.emoji, r.meaning)))
+                    .collect(),
+            },
+        ));
+    }
     for c in candidates {
         qs.push((
             relevant_key(c.id),
@@ -431,6 +483,7 @@ fn pick_choice(
 pub fn binarize(
     decision: &Decision,
     candidate_ids: &[i64],
+    reactions: &[Reaction],
     th: &Thresholds,
     called_by_name: bool,
 ) -> Binarized {
@@ -443,12 +496,22 @@ pub fn binarize(
     };
     let mut action =
         match pick_choice(decision, KEY_ACTION, &ACTIONS, action_min_confidence).as_deref() {
+            Some("react") if !reactions.is_empty() => Action::React,
             Some("reply_only") => Action::ReplyOnly,
             Some("spawn_task") => Action::SpawnTask,
             _ => Action::Silent,
         };
+    let reaction_keys: Vec<String> = (0..reactions.len()).map(reaction_key).collect();
+    let reaction_options: Vec<&str> = reaction_keys.iter().map(String::as_str).collect();
+    let reaction = pick_choice(decision, KEY_REACTION, &reaction_options, th.min_confidence)
+        .and_then(|key| reaction_keys.iter().position(|k| *k == key))
+        .map(|i| reactions[i].emoji.clone());
+    // 絵文字が決まらないなら付けようがないので、何もしない側に倒す
+    if action == Action::React && reaction.is_none() {
+        action = Action::Silent;
+    }
     if called_by_name
-        && action == Action::Silent
+        && matches!(action, Action::Silent | Action::React)
         && let Some(Answer::Choice { probabilities, .. }) = decision.answers.get(KEY_ACTION)
     {
         let p = |k: &str| probabilities.get(k).copied().unwrap_or(0.0);
@@ -473,6 +536,7 @@ pub fn binarize(
             .copied()
             .filter(|id| noul(&relevant_key(*id), th.relevant_chunk))
             .collect(),
+        reaction,
     }
 }
 
@@ -551,15 +615,15 @@ mod tests {
             )])
         };
         assert_eq!(
-            binarize(&silent_top(0.29), &[], &th, true).action,
+            binarize(&silent_top(0.29), &[], &[], &th, true).action,
             Action::ReplyOnly
         );
         assert_eq!(
-            binarize(&silent_top(0.29), &[], &th, false).action,
+            binarize(&silent_top(0.29), &[], &[], &th, false).action,
             Action::Silent
         );
         assert_eq!(
-            binarize(&silent_top(0.1), &[], &th, true).action,
+            binarize(&silent_top(0.1), &[], &[], &th, true).action,
             Action::Silent
         );
     }
@@ -578,7 +642,7 @@ mod tests {
             ("relevant_chunk_5", Answer::Noul { p: 0.5 }),
             ("relevant_chunk_6", Answer::Noul { p: 0.1 }),
         ]);
-        let b = binarize(&d, &[5, 6], &th, false);
+        let b = binarize(&d, &[5, 6], &[], &th, false);
         assert!(b.is_noise);
         assert!(!b.is_topic_shift);
         assert_eq!(b.action, Action::Silent);
@@ -597,6 +661,7 @@ mod tests {
             channel_name: "general".into(),
             messages: vec![PendingMessage {
                 row_id: 1,
+                message_id: 1,
                 author_name: "alice".into(),
                 content: "あ".repeat(5_000),
                 at: Timestamp::UNIX_EPOCH,
@@ -616,7 +681,7 @@ mod tests {
 
     #[test]
     fn missing_answers_are_safe() {
-        let b = binarize(&decision(vec![]), &[1], &Thresholds::default(), false);
+        let b = binarize(&decision(vec![]), &[1], &[], &Thresholds::default(), false);
         assert_eq!(b, Binarized::safe());
     }
 
@@ -666,5 +731,57 @@ mod tests {
         assert_eq!(b.effective_action(true), Action::SpawnTask);
         b.task_category = TaskCategory::None;
         assert_eq!(b.effective_action(true), Action::ReplyOnly);
+    }
+
+    fn reactions() -> Vec<Reaction> {
+        vec![
+            Reaction {
+                emoji: "👍".into(),
+                meaning: "同意".into(),
+            },
+            Reaction {
+                emoji: "👀".into(),
+                meaning: "気になる".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn react_is_offered_only_with_reactions() {
+        let with = build_questions(&[], &reactions());
+        assert!(with.iter().any(|(k, _)| k == KEY_REACTION));
+        let Some((_, Question::Choice { criteria, .. })) =
+            with.iter().find(|(k, _)| k == KEY_ACTION)
+        else {
+            panic!("intervention_action が無い");
+        };
+        assert!(criteria.iter().any(|(n, _)| n == "react"));
+        assert_eq!(with.len(), FIXED_QUESTIONS);
+
+        let without = build_questions(&[], &[]);
+        assert!(!without.iter().any(|(k, _)| k == KEY_REACTION));
+        let Some((_, Question::Choice { criteria, .. })) =
+            without.iter().find(|(k, _)| k == KEY_ACTION)
+        else {
+            panic!("intervention_action が無い");
+        };
+        assert!(!criteria.iter().any(|(n, _)| n == "react"));
+    }
+
+    #[test]
+    fn react_picks_emoji_and_survives_direct_call() {
+        let d = decision(vec![
+            (KEY_ACTION, choice("react", 0.9, 0.9, &ACTIONS)),
+            (KEY_REACTION, choice("r1", 0.9, 0.9, &["r0", "r1"])),
+        ]);
+        let mut b = binarize(&d, &[], &reactions(), &Thresholds::default(), false);
+        assert_eq!(b.action, Action::React);
+        assert_eq!(b.reaction.as_deref(), Some("👀"));
+        b.answer_direct_call();
+        assert_eq!(b.action, Action::React);
+
+        // 設定でリアクションを空にしていれば react の回答は静観になる
+        let b = binarize(&d, &[], &[], &Thresholds::default(), false);
+        assert_eq!(b.action, Action::Silent);
     }
 }

@@ -375,7 +375,7 @@ impl Actor {
             &self.channel_names,
             &self.config.router,
         );
-        let questions = judge::build_questions(&candidates);
+        let questions = judge::build_questions(&candidates, &self.config.router.reactions);
         let candidate_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
 
         let called_by_name = batch
@@ -390,6 +390,7 @@ impl Actor {
                     judge::binarize(
                         &decision,
                         &candidate_ids,
+                        &self.config.router.reactions,
                         &self.config.router.thresholds,
                         called_by_name || in_conversation,
                     ),
@@ -453,6 +454,18 @@ impl Actor {
         tracing::info!(channel = %batch.channel_name, action = action.as_str(), noise = binarized.is_noise, chunk_id, "judge");
         match action {
             Action::Silent => Ok(()),
+            // 発言しないので Layer 3 には何も足さず、発言群は静観と同じくバッファに残す
+            Action::React => {
+                let emoji = binarized.reaction.as_deref().unwrap_or_default();
+                if let Err(e) = self
+                    .channel
+                    .react(batch.channel_id, last.message_id, emoji)
+                    .await
+                {
+                    tracing::warn!(error = %e, emoji, "リアクションを付けられませんでした");
+                }
+                Ok(())
+            }
             Action::ReplyOnly | Action::SpawnTask => {
                 self.respond(
                     &batch,

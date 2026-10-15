@@ -120,6 +120,16 @@ pub struct RouterSection {
     pub conversation_window_secs: u64,
     #[serde(default)]
     pub thresholds: Thresholds,
+    /// router が選べる絵文字リアクション。空にするとリアクションで反応しなくなる
+    #[serde(default = "default_reactions")]
+    pub reactions: Vec<Reaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Reaction {
+    pub emoji: String,
+    /// router が絵文字を選ぶ手がかり。どんな気持ちで付けるか
+    pub meaning: String,
 }
 
 /// `[worker]`。Core(同時実行数・timeout)と worker module(反復・出力上限)の両方が読む
@@ -728,6 +738,25 @@ fn d05() -> f32 {
 }
 fn d015() -> f32 {
     0.15
+}
+
+fn default_reactions() -> Vec<Reaction> {
+    [
+        ("👍", "同意・了解"),
+        ("😂", "笑える"),
+        ("👀", "気になる・続きを見ていたい"),
+        ("🙏", "感謝・お疲れさま"),
+        ("🎉", "お祝い・うれしい知らせ"),
+        ("🤔", "考えさせられる・ちょっと疑問"),
+        ("❤️", "共感・いいね"),
+        ("😢", "残念・つらい"),
+    ]
+    .into_iter()
+    .map(|(emoji, meaning)| Reaction {
+        emoji: emoji.into(),
+        meaning: meaning.into(),
+    })
+    .collect()
 }
 
 fn default_conversation_window_secs() -> u64 {
