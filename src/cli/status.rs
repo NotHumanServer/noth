@@ -6,11 +6,15 @@ use jiff::Timestamp;
 use noth_core::heartbeat::STALE_AFTER;
 use noth_core::store::Store;
 
+use super::lock::{self, LockState};
 use super::paths;
 
-/// heartbeat が STALE_AFTER 以内に更新されていれば常駐中とみなす。DB が読めなければ停止中扱い
+/// lock を持つプロセスがあれば常駐中。lock を確かめられないときだけ heartbeat の鮮度で推測する
 pub async fn is_running(cfg: Option<&Path>) -> bool {
     let Ok(p) = paths(cfg) else { return false };
+    if let Ok(state) = lock::probe(&p.run_lock()) {
+        return matches!(state, LockState::Held { .. });
+    }
     let db = p.database();
     if !db.exists() {
         return false;
@@ -34,7 +38,14 @@ pub async fn notify_restart_needed(cfg: Option<&Path>) {
 }
 
 pub async fn run(cfg: Option<&Path>) -> Result<ExitCode> {
-    let db = paths(cfg)?.database();
+    let p = paths(cfg)?;
+    match lock::probe(&p.run_lock()) {
+        Ok(LockState::Held { pid: Some(pid) }) => println!("プロセス: 起動中(pid {pid})"),
+        Ok(LockState::Held { pid: None }) => println!("プロセス: 起動中(pid 不明)"),
+        Ok(LockState::Free) => println!("プロセス: 停止中"),
+        Err(e) => println!("プロセス: 確認できません({e})"),
+    }
+    let db = p.database();
     // Store::open は DB を作ってしまうので、未起動の環境では開かない
     if !db.exists() {
         println!("未起動です(heartbeat がありません)");

@@ -53,6 +53,10 @@ impl Paths {
     pub fn database(&self) -> PathBuf {
         self.home.join("data").join("noth.sqlite")
     }
+    /// 同じ DB に2つの `noth run` が書き込むと、発言の重複や同じ発言への2重返信が起きる
+    pub fn run_lock(&self) -> PathBuf {
+        self.home.join("data").join("noth.lock")
+    }
     pub fn work_dir(&self, run_id: &str) -> PathBuf {
         self.home.join("work").join(run_id)
     }

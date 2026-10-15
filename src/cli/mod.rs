@@ -4,6 +4,7 @@ mod cost;
 mod doctor;
 mod edit;
 mod init;
+mod lock;
 mod logs;
 mod module;
 mod run;

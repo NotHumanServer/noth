@@ -16,6 +16,8 @@ pub async fn run(cfg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
     for dir in [&p.home, &p.home.join("data"), &logs_dir] {
         create_private_dir(dir)?;
     }
+    // ログの初期化より前に取る。2つ目のプロセスが同じログファイルへ書き始めないようにするため
+    let _lock = super::lock::acquire(&p.run_lock())?;
     // ログは会話内容を含むので、以前に緩い権限で作られたディレクトリも絞る
     fs::set_permissions(&logs_dir, fs::Permissions::from_mode(0o700))?;
     // appender はログを既定の umask(通常 0644)で作るが、ログには会話内容が入る。
