@@ -1,12 +1,13 @@
 use super::*;
 use noth_backend_tinyfish::testing::{MockServer, Reply, load_config};
-use noth_core::types::TaskCategory;
+use noth_core::types::{Billing, MeterEvent, TaskCategory};
 
 fn ctx() -> ToolContext {
     ToolContext {
         run_id: "r".into(),
         task_category: TaskCategory::WebResearch,
         work_dir: std::env::temp_dir(),
+        meter: None,
     }
 }
 
@@ -151,4 +152,61 @@ async fn all_empty_text_is_error() {
         .await
         .unwrap();
     assert!(out.is_error);
+}
+
+fn metered_ctx() -> (
+    ToolContext,
+    tokio::sync::mpsc::UnboundedReceiver<MeterEvent>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ToolContext {
+            meter: Some(tx),
+            run_id: "run-1".into(),
+            ..ctx()
+        },
+        rx,
+    )
+}
+
+#[tokio::test]
+async fn reports_url_count_cost() {
+    let server = MockServer::start(|_, _| {
+        Reply::json(200, r#"{"results":[{"url":"https://a","text":"t"}]}"#)
+            .with_header("x-ratelimit-limit", "150")
+            .with_header("x-ratelimit-remaining", "148")
+            .with_header("x-ratelimit-reset", "1760500000")
+    })
+    .await;
+    let (ctx, mut rx) = metered_ctx();
+    WebFetch::new(server.backend())
+        .call(json!({"urls":["https://a","https://b"]}), &ctx)
+        .await
+        .unwrap();
+    let Some(MeterEvent::RateLimit(rl)) = rx.recv().await else {
+        panic!("rate limit が先に来るはず");
+    };
+    assert_eq!(
+        (rl.source.as_str(), rl.bucket.as_str(), rl.limit),
+        ("tool-web-fetch", "fetch", 150)
+    );
+    let Some(MeterEvent::Cost(c)) = rx.recv().await else {
+        panic!("cost が来るはず");
+    };
+    assert_eq!(c.unit, Some(("url".into(), 2)));
+    assert_eq!(c.billing, Billing::Free);
+    assert_eq!(c.amount_usd, Some(0.0));
+}
+
+#[tokio::test]
+async fn account_status_is_none() {
+    let server = MockServer::start(|_, _| Reply::json(200, "{}")).await;
+    assert_eq!(
+        WebFetch::new(server.backend())
+            .account_status()
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(server.recorded().is_empty());
 }

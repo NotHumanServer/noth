@@ -42,6 +42,7 @@ mod tests {
             run_id: "r".into(),
             task_category: c,
             work_dir: "/tmp".into(),
+            meter: None,
         }
     }
 

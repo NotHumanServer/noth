@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use noth_backend_tinyfish::meter::{report_cost, report_rate_limit};
 use noth_backend_tinyfish::{FetchOptions, FetchResponse, TinyFish, require_backend};
 use noth_core::registry::{ModuleCtx, Registry};
 use noth_core::traits::Tool;
-use noth_core::types::{ToolContext, ToolOutput, ToolSpec};
+use noth_core::types::{Billing, ToolContext, ToolOutput, ToolSpec};
 use noth_core::{Error, Result};
 use serde_json::{Value, json};
 
+const SOURCE: &str = "tool-web-fetch";
 const MAX_URLS: usize = 10;
 /// 全 URL の本文に割り当てる文字数の合計。1ページが出力を占有して残りが切れるのを防ぐため URL 数で等分する
 const TOTAL_TEXT_BUDGET: usize = 20_000;
@@ -112,7 +114,7 @@ impl Tool for WebFetch {
         }
     }
 
-    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let (urls, opts) = match parse_input(&input) {
             Ok(v) => v,
             Err(text) => {
@@ -122,9 +124,18 @@ impl Tool for WebFetch {
                 });
             }
         };
-        match self.backend.fetch(&urls, &opts).await {
+        match self.backend.fetch_metered(&urls, &opts).await {
             Ok(resp) => {
-                let (text, is_error) = format_response(&resp);
+                report_rate_limit(ctx, SOURCE, "fetch", resp.rate_limit.as_ref());
+                report_cost(
+                    ctx,
+                    SOURCE,
+                    "fetch",
+                    ("url", urls.len() as u64),
+                    Some(0.0),
+                    Billing::Free,
+                );
+                let (text, is_error) = format_response(&resp.body);
                 Ok(ToolOutput { text, is_error })
             }
             Err(Error::Api { body, .. }) => Ok(ToolOutput {

@@ -1,12 +1,13 @@
 use super::*;
 use noth_backend_tinyfish::testing::{MockServer, Recorded, Reply, load_config};
-use noth_core::types::TaskCategory;
+use noth_core::types::{Billing, MeterEvent, TaskCategory};
 
 fn ctx() -> ToolContext {
     ToolContext {
         run_id: "r".into(),
         task_category: TaskCategory::WebResearch,
         work_dir: std::env::temp_dir(),
+        meter: None,
     }
 }
 
@@ -435,4 +436,88 @@ async fn permanent_poll_error_cancels_immediately() {
         .filter(|r| r.target == "/v1/runs/r1")
         .count();
     assert_eq!(polls, 1);
+}
+
+fn metered_ctx() -> (
+    ToolContext,
+    tokio::sync::mpsc::UnboundedReceiver<MeterEvent>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ToolContext {
+            meter: Some(tx),
+            run_id: "run-1".into(),
+            ..ctx()
+        },
+        rx,
+    )
+}
+
+fn wallet_mock(wallet_status: u16) -> impl Fn(&Recorded, usize) -> Reply {
+    move |req, _| {
+        if req.target == "/v1/wallet" {
+            Reply::json(
+                wallet_status,
+                r#"{"available_balance":"10","currency":"USD","as_of":"x","rates":{"meters":[{"label":"TinyFish Agent","unit_amount":"0.016","per":"step"}]}}"#,
+            )
+        } else if req.method == "POST" {
+            Reply::json(200, r#"{"run_id":"r1"}"#)
+        } else {
+            Reply::json(
+                200,
+                &run_json("COMPLETED", r#","num_of_steps":5,"result":{}"#),
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn reports_metered_cost_from_wallet_rate_and_caches_it() {
+    let server = MockServer::start(wallet_mock(200)).await;
+    let t = tool(&server);
+    let (ctx, mut rx) = metered_ctx();
+    for _ in 0..2 {
+        t.call(json!({"url":"u","goal":"g"}), &ctx).await.unwrap();
+    }
+    for _ in 0..2 {
+        let Some(MeterEvent::Cost(c)) = rx.recv().await else {
+            panic!("cost が来るはず");
+        };
+        assert_eq!(
+            (c.source.as_str(), c.model.as_str()),
+            ("tool-web-agent", "agent")
+        );
+        assert_eq!(c.unit, Some(("step".into(), 5)));
+        assert_eq!(c.billing, Billing::Metered);
+        assert_eq!(c.run_id.as_deref(), Some("run-1"));
+        assert!((c.amount_usd.unwrap() - 0.08).abs() < 1e-9);
+    }
+    let wallets = server
+        .recorded()
+        .iter()
+        .filter(|r| r.target == "/v1/wallet")
+        .count();
+    assert_eq!(wallets, 1);
+}
+
+#[tokio::test]
+async fn unknown_rate_gives_none_amount() {
+    let server = MockServer::start(wallet_mock(500)).await;
+    let (ctx, mut rx) = metered_ctx();
+    tool(&server)
+        .call(json!({"url":"u","goal":"g"}), &ctx)
+        .await
+        .unwrap();
+    let Some(MeterEvent::Cost(c)) = rx.recv().await else {
+        panic!("cost が来るはず");
+    };
+    assert_eq!(c.amount_usd, None);
+    assert_eq!(c.unit, Some(("step".into(), 5)));
+}
+
+#[tokio::test]
+async fn account_status_reads_wallet() {
+    let server = MockServer::start(wallet_mock(200)).await;
+    let line = tool(&server).account_status().await.unwrap().unwrap();
+    assert!(line.starts_with("TinyFish 残高 $10"), "{line}");
 }

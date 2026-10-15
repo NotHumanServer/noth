@@ -120,6 +120,34 @@ pub struct WorkerRunRow {
     pub delivery_style: Option<String>,
 }
 
+/// `cost_summary` の集計キー
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostGroup {
+    Source,
+    Model,
+    Purpose,
+    /// ローカル時刻の日付(YYYY-MM-DD)
+    Day,
+    /// run_id の無い呼び出し(本線など)はキー `-` にまとめる
+    Run,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CostSummaryRow {
+    pub key: String,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    /// トークン以外の課金単位ごとの数量の合計。単位名の順
+    pub units: Vec<(String, u64)>,
+    /// 単価の分かる分だけの合計
+    pub amount_usd: f64,
+    /// 従量課金なのに単価が分からず amount_usd に入っていない呼び出しの数
+    pub unpriced_calls: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewWorkerRun {
     pub run_id: String,
@@ -784,6 +812,141 @@ impl Store {
         Ok(())
     }
 
+    // --- costs ---
+    pub async fn record_cost(&self, guild: GuildId, r: &CostRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO costs (guild_id, created_at, source, model, purpose, run_id, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, unit, quantity, amount_usd, billing)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(guild as i64)
+        .bind(now_ms())
+        .bind(&r.source)
+        .bind(&r.model)
+        .bind(r.purpose.as_str())
+        .bind(&r.run_id)
+        .bind(r.input_tokens as i64)
+        .bind(r.cache_read_tokens as i64)
+        .bind(r.cache_write_tokens as i64)
+        .bind(r.output_tokens as i64)
+        .bind(r.unit.as_ref().map(|(u, _)| u.as_str()))
+        .bind(r.unit.as_ref().map(|(_, q)| *q as i64))
+        .bind(r.amount_usd)
+        .bind(r.billing.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+    pub async fn upsert_rate_limit(&self, guild: GuildId, r: &RateLimitSnapshot) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO rate_limits (guild_id, source, bucket, \"limit\", remaining, reset_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(guild_id, source, bucket) DO UPDATE SET \"limit\" = excluded.\"limit\", remaining = excluded.remaining, reset_at = excluded.reset_at, updated_at = excluded.updated_at",
+        )
+        .bind(guild as i64)
+        .bind(&r.source)
+        .bind(&r.bucket)
+        .bind(r.limit as i64)
+        .bind(r.remaining as i64)
+        .bind(r.reset_at)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+    /// `since_ms` 以降の記録を集計する。キーの昇順、Day だけは新しい日付から
+    pub async fn cost_summary(
+        &self,
+        guild: GuildId,
+        since_ms: i64,
+        group: CostGroup,
+    ) -> Result<Vec<CostSummaryRow>> {
+        let rows = sqlx::query(
+            "SELECT created_at, source, model, purpose, run_id, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, unit, quantity, amount_usd, billing
+             FROM costs WHERE guild_id = ? AND created_at >= ? ORDER BY id ASC",
+        )
+        .bind(guild as i64)
+        .bind(since_ms)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut groups: std::collections::BTreeMap<
+            String,
+            (CostSummaryRow, std::collections::BTreeMap<String, u64>),
+        > = std::collections::BTreeMap::new();
+        for r in &rows {
+            // Day はローカル日付で切るため SQL ではなくここでキーを作る
+            let key = match group {
+                CostGroup::Source => r.try_get::<String, _>("source")?,
+                CostGroup::Model => r.try_get::<String, _>("model")?,
+                CostGroup::Purpose => r.try_get::<String, _>("purpose")?,
+                CostGroup::Day => ts(r.try_get("created_at")?)
+                    .to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%Y-%m-%d")
+                    .to_string(),
+                CostGroup::Run => r
+                    .try_get::<Option<String>, _>("run_id")?
+                    .unwrap_or_else(|| "-".into()),
+            };
+            let (row, units) = groups.entry(key.clone()).or_insert_with(|| {
+                (
+                    CostSummaryRow {
+                        key,
+                        ..Default::default()
+                    },
+                    Default::default(),
+                )
+            });
+            row.calls += 1;
+            row.input_tokens += r.try_get::<i64, _>("input_tokens")? as u64;
+            row.cache_read_tokens += r.try_get::<i64, _>("cache_read_tokens")? as u64;
+            row.cache_write_tokens += r.try_get::<i64, _>("cache_write_tokens")? as u64;
+            row.output_tokens += r.try_get::<i64, _>("output_tokens")? as u64;
+            if let Some(unit) = r.try_get::<Option<String>, _>("unit")? {
+                let quantity = r.try_get::<Option<i64>, _>("quantity")?.unwrap_or(0) as u64;
+                *units.entry(unit).or_default() += quantity;
+            }
+            match r.try_get::<Option<f64>, _>("amount_usd")? {
+                Some(amount) => row.amount_usd += amount,
+                None if r.try_get::<String, _>("billing")? == Billing::Metered.as_str() => {
+                    row.unpriced_calls += 1
+                }
+                None => {}
+            }
+        }
+        let mut out: Vec<CostSummaryRow> = groups
+            .into_values()
+            .map(|(mut row, units)| {
+                row.units = units.into_iter().collect();
+                row
+            })
+            .collect();
+        if group == CostGroup::Day {
+            out.reverse();
+        }
+        Ok(out)
+    }
+    /// 区分ごとの最新の値と、その更新時刻(UNIX ミリ秒)
+    pub async fn rate_limits(&self, guild: GuildId) -> Result<Vec<(RateLimitSnapshot, i64)>> {
+        let rows = sqlx::query(
+            "SELECT source, bucket, \"limit\", remaining, reset_at, updated_at FROM rate_limits WHERE guild_id = ? ORDER BY source, bucket",
+        )
+        .bind(guild as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    RateLimitSnapshot {
+                        source: r.try_get("source")?,
+                        bucket: r.try_get("bucket")?,
+                        limit: r.try_get::<i64, _>("limit")? as u64,
+                        remaining: r.try_get::<i64, _>("remaining")? as u64,
+                        reset_at: r.try_get("reset_at")?,
+                    },
+                    r.try_get("updated_at")?,
+                ))
+            })
+            .collect()
+    }
+
     // --- heartbeat ---
     pub async fn upsert_heartbeat(&self, guild: GuildId, state: &str, info: &Value) -> Result<()> {
         sqlx::query(
@@ -1264,6 +1427,137 @@ mod tests {
         assert_eq!(s.latest_digest(G).await.unwrap().as_deref(), Some("digest"));
         assert_eq!(s.active_turns(G).await.unwrap().len(), 1);
         assert!(s.chunk(c).await.unwrap().unwrap().compacted);
+    }
+
+    fn cost(source: &str, model: &str, purpose: Purpose, amount: Option<f64>) -> CostRecord {
+        CostRecord {
+            source: source.into(),
+            model: model.into(),
+            purpose,
+            run_id: None,
+            input_tokens: 10,
+            cache_read_tokens: 5,
+            cache_write_tokens: 1,
+            output_tokens: 2,
+            unit: None,
+            amount_usd: amount,
+            billing: Billing::Metered,
+        }
+    }
+
+    #[tokio::test]
+    async fn cost_summary_groups_and_counts_unpriced() {
+        let s = Store::open_memory().await.unwrap();
+        s.record_cost(
+            G,
+            &cost("provider-anthropic", "opus", Purpose::Main, Some(0.5)),
+        )
+        .await
+        .unwrap();
+        s.record_cost(G, &cost("provider-anthropic", "opus", Purpose::Join, None))
+            .await
+            .unwrap();
+        let mut agent = cost("tool-web-agent", "agent", Purpose::Worker, Some(0.25));
+        agent.run_id = Some("r1".into());
+        agent.unit = Some(("step".into(), 3));
+        s.record_cost(G, &agent).await.unwrap();
+        agent.unit = Some(("step".into(), 4));
+        agent.amount_usd = None;
+        s.record_cost(G, &agent).await.unwrap();
+        let mut free = cost("tool-web-search", "search", Purpose::Worker, None);
+        free.billing = Billing::Free;
+        free.unit = Some(("request".into(), 1));
+        s.record_cost(G, &free).await.unwrap();
+        // 他の guild は混ぜない
+        s.record_cost(
+            2,
+            &cost("provider-anthropic", "opus", Purpose::Main, Some(9.0)),
+        )
+        .await
+        .unwrap();
+
+        let by_source = s.cost_summary(G, 0, CostGroup::Source).await.unwrap();
+        let keys: Vec<&str> = by_source.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["provider-anthropic", "tool-web-agent", "tool-web-search"]
+        );
+        let anthropic = &by_source[0];
+        assert_eq!(anthropic.calls, 2);
+        assert_eq!(anthropic.input_tokens, 20);
+        assert_eq!(anthropic.cache_read_tokens, 10);
+        assert_eq!(anthropic.cache_write_tokens, 2);
+        assert_eq!(anthropic.output_tokens, 4);
+        assert_eq!(anthropic.amount_usd, 0.5);
+        assert_eq!(anthropic.unpriced_calls, 1);
+        assert_eq!(by_source[1].units, vec![("step".to_string(), 7)]);
+        assert_eq!(by_source[1].unpriced_calls, 1);
+        // 無料の呼び出しは単価不明に数えない
+        assert_eq!(by_source[2].unpriced_calls, 0);
+
+        let by_purpose = s.cost_summary(G, 0, CostGroup::Purpose).await.unwrap();
+        let keys: Vec<&str> = by_purpose.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["join", "main", "worker"]);
+        let by_run = s.cost_summary(G, 0, CostGroup::Run).await.unwrap();
+        let keys: Vec<&str> = by_run.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["-", "r1"]);
+        let by_model = s.cost_summary(G, 0, CostGroup::Model).await.unwrap();
+        assert_eq!(by_model.len(), 3);
+
+        let today = Timestamp::now()
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%Y-%m-%d")
+            .to_string();
+        let by_day = s.cost_summary(G, 0, CostGroup::Day).await.unwrap();
+        assert_eq!(by_day.len(), 1);
+        assert_eq!(by_day[0].key, today);
+        assert_eq!(by_day[0].calls, 5);
+
+        assert!(
+            s.cost_summary(G, now_ms() + 60_000, CostGroup::Source)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_summary_day_is_newest_first() {
+        let s = Store::open_memory().await.unwrap();
+        for (ms, model) in [(1_700_000_000_000_i64, "old"), (1_800_000_000_000, "new")] {
+            sqlx::query("INSERT INTO costs (guild_id, created_at, source, model, purpose, billing) VALUES (?, ?, 's', ?, 'main', 'metered')")
+                .bind(G as i64)
+                .bind(ms)
+                .bind(model)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        let by_day = s.cost_summary(G, 0, CostGroup::Day).await.unwrap();
+        assert_eq!(by_day.len(), 2);
+        assert!(by_day[0].key > by_day[1].key);
+        assert_eq!(by_day[0].unpriced_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limits_keep_latest_per_bucket() {
+        let s = Store::open_memory().await.unwrap();
+        let snap = |bucket: &str, remaining| RateLimitSnapshot {
+            source: "tool-web-search".into(),
+            bucket: bucket.into(),
+            limit: 100,
+            remaining,
+            reset_at: Some(1_800_000_000),
+        };
+        s.upsert_rate_limit(G, &snap("search", 90)).await.unwrap();
+        s.upsert_rate_limit(G, &snap("search", 80)).await.unwrap();
+        s.upsert_rate_limit(G, &snap("fetch", 50)).await.unwrap();
+        let got = s.rate_limits(G).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, snap("fetch", 50));
+        assert_eq!(got[1].0, snap("search", 80));
+        assert!(got[1].1 > 0);
+        assert!(s.rate_limits(2).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -3,13 +3,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use noth_backend_tinyfish::meter::report_cost;
 use noth_backend_tinyfish::{AgentRun, RunStatus, TinyFish, require_backend};
 use noth_core::registry::{ModuleCtx, Registry};
 use noth_core::traits::Tool;
-use noth_core::types::{ToolContext, ToolOutput, ToolSpec};
+use noth_core::types::{Billing, ToolContext, ToolOutput, ToolSpec};
 use noth_core::{Error, Result};
 use serde_json::{Value, json};
 
+const SOURCE: &str = "tool-web-agent";
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 /// worker の timeout より短くはならない想定だが、run が課金されたまま残らないよう上限を必ず付ける
 const DEFAULT_MAX_DURATION_SECS: u64 = 300;
@@ -76,6 +78,8 @@ pub struct WebAgent {
     /// エントリは run 1件あたり数十バイトなので、掃除はしない。
     /// Worker の run_id ごとの累計ステップ数。1回の調査で web_agent を繰り返し呼ばれても課金を頭打ちにする
     used_steps: Mutex<HashMap<String, u32>>,
+    /// wallet から読んだ1ステップの単価。取得に失敗した間は持たず、次の課金時に取り直す
+    step_usd: Mutex<Option<f64>>,
 }
 
 impl WebAgent {
@@ -88,6 +92,7 @@ impl WebAgent {
             max_steps: DEFAULT_MAX_STEPS,
             max_steps_per_run: DEFAULT_MAX_STEPS_PER_RUN,
             used_steps: Mutex::new(HashMap::new()),
+            step_usd: Mutex::new(None),
         }
     }
 
@@ -95,6 +100,37 @@ impl WebAgent {
         self.max_steps = max_steps;
         self.max_steps_per_run = max_steps_per_run;
         self
+    }
+
+    async fn step_usd(&self) -> Option<f64> {
+        let cached = *self.step_usd.lock().expect("lock");
+        if cached.is_some() {
+            return cached;
+        }
+        let rate = match self.backend.wallet().await {
+            Ok(w) => w.agent_step_usd(),
+            Err(e) => {
+                tracing::warn!(error = %e, "TinyFish の単価を取得できませんでした");
+                None
+            }
+        };
+        *self.step_usd.lock().expect("lock") = rate;
+        rate
+    }
+
+    async fn report_steps(&self, ctx: &ToolContext, steps: u32) {
+        if ctx.meter.is_none() || steps == 0 {
+            return;
+        }
+        let amount = self.step_usd().await.map(|usd| usd * f64::from(steps));
+        report_cost(
+            ctx,
+            SOURCE,
+            "agent",
+            ("step", u64::from(steps)),
+            amount,
+            Billing::Metered,
+        );
     }
 
     fn used(&self, run_id: &str) -> u32 {
@@ -348,6 +384,8 @@ impl Tool for WebAgent {
         let mut seen = 0;
         let result = self.run(&url, &goal, max_steps, &mut seen).await;
         self.add_used(&ctx.run_id, seen);
+        // 中断した run も、そこまでのステップは課金されている
+        self.report_steps(ctx, seen).await;
         match result {
             Err(Error::Api { body, .. }) => Ok(ToolOutput {
                 text: body,
@@ -358,6 +396,10 @@ impl Tool for WebAgent {
     }
 
     /// 実行すると課金されるので API は呼ばない。設定の検証は構築時に済んでいる
+    async fn account_status(&self) -> Result<Option<String>> {
+        self.backend.account_status().await.map(Some)
+    }
+
     async fn health_check(&self) -> Result<String> {
         Ok("設定を確認しました(課金を避けるため API は呼んでいません)".into())
     }

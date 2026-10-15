@@ -36,6 +36,7 @@ pub struct AgentWorker {
     specs: Vec<ToolSpec>,
     settings: WorkerSettings,
     max_tokens: u32,
+    meter: MeterSink,
 }
 
 impl AgentWorker {
@@ -47,6 +48,7 @@ impl AgentWorker {
             specs,
             settings,
             max_tokens,
+            meter: deps.meter,
         }
     }
 
@@ -311,11 +313,14 @@ impl Worker for AgentWorker {
         prompt.cache_to_end = true;
         let params = CompletionParams {
             max_tokens: self.max_tokens,
+            purpose: Purpose::Worker,
+            run_id: Some(task.run_id.clone()),
         };
         let tctx = ToolContext {
             run_id: task.run_id.clone(),
             task_category: task.task_category,
             work_dir: task.work_dir.clone(),
+            meter: Some(self.meter.clone()),
         };
 
         for iteration in 1..=self.settings.max_iterations {
@@ -369,6 +374,7 @@ mod tests {
     struct MockProvider {
         script: Mutex<VecDeque<Result<Completion>>>,
         prompts: Mutex<Vec<LayeredPrompt>>,
+        params: Mutex<Vec<(Purpose, Option<String>)>>,
     }
 
     impl MockProvider {
@@ -376,14 +382,19 @@ mod tests {
             Arc::new(Self {
                 script: Mutex::new(script.into()),
                 prompts: Mutex::new(Vec::new()),
+                params: Mutex::new(Vec::new()),
             })
         }
     }
 
     #[async_trait]
     impl Provider for MockProvider {
-        async fn complete(&self, p: &LayeredPrompt, _: &CompletionParams) -> Result<Completion> {
+        async fn complete(&self, p: &LayeredPrompt, cp: &CompletionParams) -> Result<Completion> {
             self.prompts.lock().unwrap().push(p.clone());
+            self.params
+                .lock()
+                .unwrap()
+                .push((cp.purpose, cp.run_id.clone()));
             self.script
                 .lock()
                 .unwrap()
@@ -399,6 +410,7 @@ mod tests {
         name: &'static str,
         out: Result<String>,
         called: Mutex<u32>,
+        had_meter: Mutex<bool>,
     }
 
     fn tool(name: &'static str, out: Result<String>) -> Arc<MockTool> {
@@ -406,6 +418,7 @@ mod tests {
             name,
             out,
             called: Mutex::new(0),
+            had_meter: Mutex::new(false),
         })
     }
 
@@ -418,8 +431,9 @@ mod tests {
                 input_schema: json!({}),
             }
         }
-        async fn call(&self, _: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+        async fn call(&self, _: serde_json::Value, c: &ToolContext) -> Result<ToolOutput> {
             *self.called.lock().unwrap() += 1;
+            *self.had_meter.lock().unwrap() = c.meter.is_some();
             match &self.out {
                 Ok(t) => Ok(ToolOutput {
                     text: t.clone(),
@@ -450,6 +464,7 @@ mod tests {
             WorkerDeps {
                 provider,
                 tools: tools.into_iter().map(|t| t as Arc<dyn Tool>).collect(),
+                meter: tokio::sync::mpsc::unbounded_channel().0,
             },
             s,
             1024,
@@ -776,5 +791,20 @@ mod tests {
         let mut t = task(TaskCategory::WebResearch);
         t.progress = Some(tx);
         assert_eq!(w.run(t).await, WorkerOutcome::Concluded("メモ".into()));
+    }
+
+    #[tokio::test]
+    async fn passes_purpose_run_id_and_meter() {
+        let t = tool("web_search", Ok("r".into()));
+        let p = MockProvider::new(vec![call("web_search"), text("メモ")]);
+        let w = worker(p.clone(), vec![t.clone()], settings(3, 100));
+        w.run(task(TaskCategory::WebResearch)).await;
+        let params = p.params.lock().unwrap();
+        assert_eq!(params.len(), 2);
+        for (purpose, run_id) in params.iter() {
+            assert_eq!(*purpose, Purpose::Worker);
+            assert_eq!(run_id.as_deref(), Some("run1"));
+        }
+        assert!(*t.had_meter.lock().unwrap());
     }
 }

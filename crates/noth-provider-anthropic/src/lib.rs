@@ -1,4 +1,5 @@
 //! Anthropic Messages API の provider。リクエスト構築・応答解析は `wire` の純粋関数に分けてある
+mod pricing;
 mod wire;
 
 use std::sync::Arc;
@@ -32,6 +33,8 @@ struct Settings {
     #[serde(default = "default_timeout_secs")]
     timeout_secs: u64,
     effort: Option<String>,
+    #[serde(default)]
+    pricing: pricing::Overrides,
 }
 
 fn default_cache_ttl() -> String {
@@ -79,6 +82,7 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
         model: s.model,
         ttl,
         effort,
+        pricing: s.pricing,
         retry_max: ctx.config.context.retry_max,
         preset: s.preset,
     }))
@@ -91,6 +95,7 @@ struct AnthropicProvider {
     model: String,
     ttl: wire::CacheTtl,
     effort: Option<&'static str>,
+    pricing: pricing::Overrides,
     retry_max: u32,
     preset: Option<String>,
 }
@@ -205,7 +210,14 @@ impl Provider for AnthropicProvider {
         let mut attempt = 0;
         loop {
             match self.post_once(&body).await {
-                Ok(resp) => return wire::parse_response(&resp),
+                Ok(resp) => {
+                    let cost_ctx = wire::CostContext {
+                        request_model: &self.model,
+                        ttl: self.ttl,
+                        overrides: &self.pricing,
+                    };
+                    return wire::parse_response(&resp, &cost_ctx);
+                }
                 Err(Attempt::Fatal(err)) => return Err(err),
                 Err(Attempt::Retry { err, retry_after }) => {
                     if attempt >= self.retry_max {

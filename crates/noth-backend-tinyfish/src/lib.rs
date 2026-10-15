@@ -8,6 +8,7 @@ use reqwest::{Method, Url, redirect};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+pub mod meter;
 #[cfg(feature = "testing")]
 pub mod testing;
 
@@ -64,6 +65,92 @@ impl std::fmt::Debug for TinyFish {
         f.debug_struct("TinyFish")
             .field("endpoints", &self.endpoints)
             .finish_non_exhaustive()
+    }
+}
+
+/// 応答本文と、同じ応答のヘッダから読んだレート制限
+#[derive(Debug, Clone)]
+pub struct Metered<T> {
+    pub body: T,
+    pub rate_limit: Option<RateLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimit {
+    pub limit: u64,
+    pub remaining: u64,
+    /// UNIX 秒
+    pub reset_at: Option<i64>,
+}
+
+impl RateLimit {
+    fn from_headers(h: &reqwest::header::HeaderMap) -> Option<Self> {
+        let get = |name: &str| h.get(name)?.to_str().ok()?.trim().parse::<i64>().ok();
+        Some(Self {
+            limit: u64::try_from(get("x-ratelimit-limit")?).ok()?,
+            remaining: u64::try_from(get("x-ratelimit-remaining")?).ok()?,
+            reset_at: get("x-ratelimit-reset"),
+        })
+    }
+}
+
+/// 金額は文字列で返ってくる
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Wallet {
+    #[serde(default)]
+    pub available_balance: String,
+    #[serde(default)]
+    pub currency: String,
+    #[serde(default)]
+    pub as_of: Option<String>,
+    #[serde(default)]
+    pub rates: WalletRates,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WalletRates {
+    #[serde(default)]
+    pub meters: Vec<WalletMeter>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WalletMeter {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub unit_amount: String,
+    #[serde(default)]
+    pub per: String,
+}
+
+impl Wallet {
+    /// Agent の1ステップあたり USD。見つからない・読めないなら None
+    pub fn agent_step_usd(&self) -> Option<f64> {
+        self.rates
+            .meters
+            .iter()
+            .find(|m| m.per == "step" && m.label.contains("Agent"))?
+            .unit_amount
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    fn status_line(&self) -> String {
+        let amount = if self.currency.is_empty() || self.currency == "USD" {
+            format!("${}", self.available_balance)
+        } else {
+            format!("{} {}", self.available_balance, self.currency)
+        };
+        let at = self.as_of.as_deref().map(|raw| {
+            let local = raw.parse::<jiff::Timestamp>().ok().map(|t| {
+                t.to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%Y-%m-%d %H:%M")
+                    .to_string()
+            });
+            format!("({} 時点)", local.as_deref().unwrap_or(raw))
+        });
+        format!("TinyFish 残高 {amount}{}", at.unwrap_or_default())
     }
 }
 
@@ -242,6 +329,14 @@ impl TinyFish {
     }
 
     pub async fn search(&self, query: &str, opts: &SearchOptions) -> Result<SearchResponse> {
+        Ok(self.search_metered(query, opts).await?.body)
+    }
+
+    pub async fn search_metered(
+        &self,
+        query: &str,
+        opts: &SearchOptions,
+    ) -> Result<Metered<SearchResponse>> {
         let mut url = parse_url(&self.endpoints.search)?;
         {
             let mut q = url.query_pairs_mut();
@@ -262,16 +357,25 @@ impl TinyFish {
                 q.append_pair("purpose", v);
             }
         }
-        self.request(Method::GET, url, None, true).await
+        self.request_metered(Method::GET, url, None, true).await
     }
 
     pub async fn fetch(&self, urls: &[String], opts: &FetchOptions) -> Result<FetchResponse> {
+        Ok(self.fetch_metered(urls, opts).await?.body)
+    }
+
+    pub async fn fetch_metered(
+        &self,
+        urls: &[String],
+        opts: &FetchOptions,
+    ) -> Result<Metered<FetchResponse>> {
         let mut body = json!({ "urls": urls, "format": "markdown" });
         if let Some(p) = &opts.purpose {
             body["purpose"] = json!(p);
         }
         let url = parse_url(&self.endpoints.fetch)?;
-        self.request(Method::POST, url, Some(body), true).await
+        self.request_metered(Method::POST, url, Some(body), true)
+            .await
     }
 
     /// 戻り値は run_id
@@ -317,6 +421,16 @@ impl TinyFish {
         Ok("TinyFish: ok".into())
     }
 
+    pub async fn wallet(&self) -> Result<Wallet> {
+        let url = parse_url(&format!("{}/v1/wallet", self.endpoints.agent))?;
+        self.request(Method::GET, url, None, true).await
+    }
+
+    /// `noth cost` 用の1行。残高が取れなければ Err
+    pub async fn account_status(&self) -> Result<String> {
+        Ok(self.wallet().await?.status_line())
+    }
+
     async fn request<T: serde::de::DeserializeOwned>(
         &self,
         method: Method,
@@ -324,6 +438,16 @@ impl TinyFish {
         body: Option<Value>,
         retry: bool,
     ) -> Result<T> {
+        Ok(self.request_metered(method, url, body, retry).await?.body)
+    }
+
+    async fn request_metered<T: serde::de::DeserializeOwned>(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Value>,
+        retry: bool,
+    ) -> Result<Metered<T>> {
         let mut attempt = 0;
         loop {
             let mut req = self
@@ -339,13 +463,15 @@ impl TinyFish {
                 .map_err(|e| Error::Transport(e.without_url().to_string()))?;
             let status = resp.status();
             let wait = retry_after(&resp);
+            let rate_limit = RateLimit::from_headers(resp.headers());
             let text = resp
                 .text()
                 .await
                 .map_err(|e| Error::Transport(e.without_url().to_string()))?;
             if status.is_success() {
-                return serde_json::from_str(&text)
-                    .map_err(|e| Error::Other(format!("TinyFish の応答を解釈できません: {e}")));
+                let body = serde_json::from_str(&text)
+                    .map_err(|e| Error::Other(format!("TinyFish の応答を解釈できません: {e}")))?;
+                return Ok(Metered { body, rate_limit });
             }
             let code = status.as_u16();
             // 非冪等な呼び出し(run-async)を再送すると run が二重に作られて課金される

@@ -1,4 +1,5 @@
 //! Gemini の generateContent の provider。リクエスト構築・応答解析は `wire` の純粋関数に分けてある
+mod pricing;
 mod wire;
 
 use std::path::Path;
@@ -36,6 +37,8 @@ struct Settings {
     thinking_level: Option<String>,
     #[serde(default = "default_timeout_secs")]
     timeout_secs: u64,
+    #[serde(default)]
+    pricing: pricing::Overrides,
 }
 
 fn default_location() -> String {
@@ -200,6 +203,7 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
         thinking_level,
         retry_max: ctx.config.context.retry_max,
         preset: s.preset,
+        pricing: s.pricing,
     }))
 }
 
@@ -211,6 +215,7 @@ struct GoogleProvider {
     thinking_level: Option<&'static str>,
     retry_max: u32,
     preset: Option<String>,
+    pricing: pricing::Overrides,
 }
 
 enum Attempt {
@@ -324,7 +329,17 @@ impl Provider for GoogleProvider {
         let mut attempt = 0;
         loop {
             match self.post_once(&body).await {
-                Ok(resp) => return wire::parse_response(&resp),
+                Ok(resp) => {
+                    let cost_ctx = wire::CostContext {
+                        request_model: &self.model,
+                        // 単価を確認できているのは AI Studio だけ
+                        priced: self.preset.is_none(),
+                        overrides: &self.pricing,
+                        purpose: params.purpose,
+                        run_id: params.run_id.clone(),
+                    };
+                    return wire::parse_response(&resp, &cost_ctx);
+                }
                 Err(Attempt::Fatal(err)) => return Err(err),
                 Err(Attempt::Retry { err, retry_after }) => {
                     if attempt >= self.retry_max {

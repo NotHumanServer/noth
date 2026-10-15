@@ -1,7 +1,12 @@
 use noth_core::traits::{Completion, LayeredPrompt};
-use noth_core::types::{CompletionParams, ExchangeItem, Role, ToolCall, ToolResult, Turn, Usage};
+use noth_core::types::{
+    Billing, CompletionParams, CostRecord, ExchangeItem, Purpose, Role, ToolCall, ToolResult, Turn,
+    Usage,
+};
 use noth_core::{Error, Result};
 use serde_json::{Value, json};
+
+use crate::pricing::{self, Overrides, TokenCounts};
 
 /// 先頭が model になるとき API が弾くため補う
 const OMITTED_NOTICE: &str = "[以前の会話は省略されています]";
@@ -181,7 +186,17 @@ pub fn build_request(
     Ok(body)
 }
 
-pub fn parse_response(resp: &Value) -> Result<Completion> {
+/// 費用計算に必要な、リクエスト側の情報
+pub struct CostContext<'a> {
+    pub request_model: &'a str,
+    /// 単価表を引ける接続先か。Vertex と opencode-go は単価が未確認
+    pub priced: bool,
+    pub overrides: &'a Overrides,
+    pub purpose: Purpose,
+    pub run_id: Option<String>,
+}
+
+pub fn parse_response(resp: &Value, cost_ctx: &CostContext) -> Result<Completion> {
     let usage = parse_usage(resp);
     let candidate = resp.pointer("/candidates/0");
     let reason = candidate
@@ -256,7 +271,38 @@ pub fn parse_response(resp: &Value) -> Result<Completion> {
         tool_calls,
         usage,
         raw_assistant,
+        cost: Some(cost_record(resp, cost_ctx)),
     })
+}
+
+fn cost_record(resp: &Value, ctx: &CostContext) -> CostRecord {
+    let model = resp
+        .get("modelVersion")
+        .and_then(Value::as_str)
+        .unwrap_or(ctx.request_model);
+    let u = parse_usage(resp);
+    // promptTokenCount はキャッシュ分を含むので、キャッシュ単価で数える分を引く
+    let counts = TokenCounts {
+        input: u.input_tokens.saturating_sub(u.cached_tokens),
+        cache_read: u.cached_tokens,
+        output: u.output_tokens,
+    };
+    let amount_usd = pricing::lookup(model, ctx.priced, counts.prompt_tokens(), ctx.overrides)
+        .map(|rates| pricing::amount_usd(&rates, &counts));
+    CostRecord {
+        source: "provider-google".into(),
+        model: model.to_string(),
+        purpose: ctx.purpose,
+        run_id: ctx.run_id.clone(),
+        input_tokens: counts.input,
+        cache_read_tokens: counts.cache_read,
+        // 暗黙キャッシュの書き込みは課金されない
+        cache_write_tokens: 0,
+        output_tokens: counts.output,
+        unit: None,
+        amount_usd,
+        billing: Billing::Metered,
+    }
 }
 
 fn parse_usage(resp: &Value) -> Usage {
@@ -377,8 +423,25 @@ mod tests {
         }
     }
 
+    fn cx() -> CostContext<'static> {
+        CostContext {
+            request_model: "gemini-2.5-flash",
+            priced: true,
+            overrides: &Overrides {
+                input: None,
+                cached_input: None,
+                output: None,
+            },
+            purpose: Purpose::Main,
+            run_id: None,
+        }
+    }
+
     fn params() -> CompletionParams {
-        CompletionParams { max_tokens: 100 }
+        CompletionParams {
+            max_tokens: 100,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -558,13 +621,13 @@ mod tests {
                 "candidatesTokenCount": 10, "thoughtsTokenCount": 7
             }
         });
-        let c = parse_response(&resp).unwrap();
+        let c = parse_response(&resp, &cx()).unwrap();
         assert_eq!(c.text.as_deref(), Some("こんにちは"));
         assert_eq!(c.tool_calls.len(), 2);
         let generated = c.tool_calls[0].id.clone();
         assert!(is_generated_id(&generated));
         // 別の応答では同じ id を振らない
-        let again = parse_response(&resp).unwrap();
+        let again = parse_response(&resp, &cx()).unwrap();
         assert_ne!(again.tool_calls[0].id, generated);
         assert_eq!(c.tool_calls[0].input, json!({"k": 1}));
         assert_eq!(c.tool_calls[1].id, "x9");
@@ -584,7 +647,7 @@ mod tests {
     #[test]
     fn plain_text_has_no_raw() {
         let resp = json!({"candidates": [{"content": {"parts": [{"text": "hi"}]}}]});
-        let c = parse_response(&resp).unwrap();
+        let c = parse_response(&resp, &cx()).unwrap();
         assert_eq!(c.text.as_deref(), Some("hi"));
         assert!(c.raw_assistant.is_none());
     }
@@ -592,17 +655,17 @@ mod tests {
     #[test]
     fn blocked_response_is_empty_not_error() {
         let resp = json!({"candidates": [{"finishReason": "SAFETY"}]});
-        let c = parse_response(&resp).unwrap();
+        let c = parse_response(&resp, &cx()).unwrap();
         assert!(c.text.is_none() && c.tool_calls.is_empty());
         let resp = json!({"promptFeedback": {"blockReason": "SAFETY"}});
-        assert!(parse_response(&resp).unwrap().text.is_none());
+        assert!(parse_response(&resp, &cx()).unwrap().text.is_none());
     }
 
     #[test]
     fn broken_finish_reasons_are_errors() {
         for r in ["MISSING_THOUGHT_SIGNATURE", "MALFORMED_FUNCTION_CALL"] {
             let resp = json!({"candidates": [{"finishReason": r}]});
-            assert!(parse_response(&resp).is_err(), "{r}");
+            assert!(parse_response(&resp, &cx()).is_err(), "{r}");
         }
     }
 
@@ -662,5 +725,54 @@ mod tests {
         );
         assert_eq!(parse_error(&with("soon")).retry_delay(), None);
         assert_eq!(parse_error(quota_failure_error()).retry_delay(), None);
+    }
+
+    #[test]
+    fn cost_splits_cached_and_includes_thoughts() {
+        let resp = json!({
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 1000, "toolUsePromptTokenCount": 100,
+                "cachedContentTokenCount": 600,
+                "candidatesTokenCount": 10, "thoughtsTokenCount": 40
+            }
+        });
+        let cx = CostContext {
+            purpose: Purpose::Worker,
+            run_id: Some("r1".into()),
+            ..cx()
+        };
+        let c = parse_response(&resp, &cx).unwrap().cost.unwrap();
+        assert_eq!(c.source, "provider-google");
+        assert_eq!(c.model, "gemini-2.5-flash");
+        assert_eq!(c.purpose, Purpose::Worker);
+        assert_eq!(c.run_id.as_deref(), Some("r1"));
+        assert_eq!(
+            (
+                c.input_tokens,
+                c.cache_read_tokens,
+                c.cache_write_tokens,
+                c.output_tokens
+            ),
+            (500, 600, 0, 50)
+        );
+        let want = (500.0 * 0.3 + 600.0 * 0.03 + 50.0 * 2.5) / 1e6;
+        assert!((c.amount_usd.unwrap() - want).abs() < 1e-12);
+        assert_eq!(c.billing, Billing::Metered);
+    }
+
+    #[test]
+    fn cost_unpriced_target_has_no_amount() {
+        let resp = json!({"candidates": [{"content": {"parts": [{"text": "hi"}]}}],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 1}});
+        let cx = CostContext {
+            priced: false,
+            ..cx()
+        };
+        let c = parse_response(&resp, &cx).unwrap().cost.unwrap();
+        assert_eq!(c.model, "gemini-2.5-flash");
+        assert_eq!(c.amount_usd, None);
+        assert_eq!(c.input_tokens, 10);
     }
 }

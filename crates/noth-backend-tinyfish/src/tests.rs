@@ -297,3 +297,65 @@ fn api_key_header_is_sensitive() {
     assert!(t.api_key.is_sensitive());
     assert!(TinyFish::new("a\nb".into(), Duration::from_secs(1), Endpoints::default()).is_err());
 }
+
+#[tokio::test]
+async fn rate_limit_headers_are_returned() {
+    let server = MockServer::start(|_, _| {
+        Reply::json(200, r#"{"results":[]}"#)
+            .with_header("x-ratelimit-limit", "30")
+            .with_header("x-ratelimit-remaining", "29")
+            .with_header("x-ratelimit-reset", "1760500000")
+    })
+    .await;
+    let m = server
+        .backend()
+        .search_metered("q", &SearchOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        m.rate_limit,
+        Some(RateLimit {
+            limit: 30,
+            remaining: 29,
+            reset_at: Some(1760500000)
+        })
+    );
+}
+
+#[tokio::test]
+async fn missing_rate_limit_headers_are_none() {
+    let server = MockServer::start(|_, _| Reply::json(200, r#"{"results":[]}"#)).await;
+    let m = server
+        .backend()
+        .search_metered("q", &SearchOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(m.rate_limit, None);
+}
+
+const WALLET: &str = r#"{"available_balance":"10","currency":"USD","as_of":"2026-10-15T03:50:00Z","rates":{"meters":[{"label":"TinyFish Agent","unit_amount":"0.016","currency":"USD","per":"step"},{"label":"TinyFish Fetch","unit_amount":"0","per":"url"}]}}"#;
+
+#[tokio::test]
+async fn wallet_rate_and_status_line() {
+    let server = MockServer::start(|_, _| Reply::json(200, WALLET)).await;
+    let tf = server.backend();
+    let w = tf.wallet().await.unwrap();
+    assert_eq!(w.agent_step_usd(), Some(0.016));
+    assert_eq!(server.recorded()[0].target, "/v1/wallet");
+    assert_eq!(server.recorded()[0].header("x-api-key"), Some("test-key"));
+    let line = tf.account_status().await.unwrap();
+    assert!(line.starts_with("TinyFish 残高 $10(2026-1"), "{line}");
+    assert!(line.ends_with("時点)"), "{line}");
+}
+
+#[test]
+fn status_line_falls_back_to_raw_timestamp() {
+    let w = Wallet {
+        available_balance: "5".into(),
+        currency: "JPY".into(),
+        as_of: Some("昨日".into()),
+        ..Default::default()
+    };
+    assert_eq!(w.status_line(), "TinyFish 残高 5 JPY(昨日 時点)");
+    assert_eq!(Wallet::default().agent_step_usd(), None);
+}

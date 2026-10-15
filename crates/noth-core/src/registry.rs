@@ -21,7 +21,10 @@ pub type WorkerFactory = fn(&ModuleCtx, WorkerDeps) -> Result<Arc<dyn Worker>>;
 pub type CompactorFactory = fn(&ModuleCtx, Arc<dyn Provider>) -> Result<Arc<dyn Compactor>>;
 
 pub struct WorkerDeps {
+    /// Core が計測用に包んだもの。Worker はそのまま使えば呼び出しが記録される
     pub provider: Arc<dyn Provider>,
+    /// tool に渡す `ToolContext::meter`
+    pub meter: crate::types::MeterSink,
     /// KNOWN_MODULES の順に並ぶ。tool 定義の順序を毎回同じにしてキャッシュを保つため
     pub tools: Vec<Arc<dyn Tool>>,
 }
@@ -79,6 +82,9 @@ pub struct Modules {
     pub compactor: Option<Arc<dyn Compactor>>,
     /// `noth doctor` の疎通確認用。worker が None でも有効な tool は入る
     pub tools: Vec<(&'static str, Arc<dyn Tool>)>,
+    /// provider の呼び出しと tool の課金が届く。`noth run` が受け取って SQLite に保存する
+    pub meter: crate::types::MeterSink,
+    pub meter_rx: tokio::sync::mpsc::UnboundedReceiver<crate::types::MeterEvent>,
 }
 
 impl Registry {
@@ -176,7 +182,12 @@ impl Registry {
             .providers
             .get_key_value(pick(ModuleKind::Provider).as_str())
             .expect("validated");
-        let provider = pf(&ctx(pname))?;
+        let (meter, meter_rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider: Arc<dyn Provider> = Arc::new(crate::metering::MeteredProvider::new(
+            pf(&ctx(pname))?,
+            pname,
+            meter.clone(),
+        ));
         let mut tools = Vec::new();
         for (name, kind) in KNOWN_MODULES {
             if *kind == ModuleKind::Tool && config.is_enabled(name) {
@@ -189,6 +200,7 @@ impl Registry {
                 &ctx("worker"),
                 WorkerDeps {
                     provider: provider.clone(),
+                    meter: meter.clone(),
                     tools: tools.iter().map(|(_, t)| t.clone()).collect(),
                 },
             )?),
@@ -207,6 +219,8 @@ impl Registry {
             worker,
             compactor,
             tools,
+            meter,
+            meter_rx,
         })
     }
 }

@@ -1,7 +1,11 @@
 use noth_core::traits::{Completion, LayeredPrompt};
-use noth_core::types::{CompletionParams, ExchangeItem, Role, ToolCall, Turn, Usage};
+use noth_core::types::{
+    Billing, CompletionParams, CostRecord, ExchangeItem, Purpose, Role, ToolCall, Turn, Usage,
+};
 use noth_core::{Error, Result};
 use serde_json::{Value, json};
+
+use crate::pricing::{self, Overrides, TokenCounts};
 
 /// 先頭が assistant になるとき API が弾くため補う
 const OMITTED_NOTICE: &str = "[以前の会話は省略されています]";
@@ -261,7 +265,14 @@ pub fn build_request(
     Ok(body)
 }
 
-pub fn parse_response(resp: &Value) -> Result<Completion> {
+/// 費用計算に必要な、リクエスト側の情報
+pub struct CostContext<'a> {
+    pub request_model: &'a str,
+    pub ttl: CacheTtl,
+    pub overrides: &'a Overrides,
+}
+
+pub fn parse_response(resp: &Value, cost_ctx: &CostContext) -> Result<Completion> {
     let blocks = resp
         .get("content")
         .and_then(Value::as_array)
@@ -314,13 +325,61 @@ pub fn parse_response(resp: &Value) -> Result<Completion> {
         cached_tokens: cache_read,
         output_tokens: u("output_tokens"),
     };
+    let cost = Some(cost_record(resp, cost_ctx, &u));
     let raw_assistant = (!tool_calls.is_empty()).then(|| Value::Array(blocks.clone()));
     Ok(Completion {
         text: (!text.is_empty()).then_some(text),
         tool_calls,
         usage,
         raw_assistant,
+        cost,
     })
+}
+
+fn cost_record(resp: &Value, ctx: &CostContext, u: &impl Fn(&str) -> u64) -> CostRecord {
+    let model = resp
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(ctx.request_model);
+    let write_total = u("cache_creation_input_tokens");
+    // 内訳があれば実際の TTL ごとの料金で数え、無ければリクエストの cache_ttl で全量を数える
+    let breakdown = |k: &str| {
+        resp.pointer(&format!("/usage/cache_creation/{k}"))
+            .and_then(Value::as_u64)
+    };
+    let (write_5m, write_1h) = match (
+        breakdown("ephemeral_5m_input_tokens"),
+        breakdown("ephemeral_1h_input_tokens"),
+    ) {
+        (None, None) => match ctx.ttl {
+            CacheTtl::FiveMinutes => (write_total, 0),
+            CacheTtl::OneHour => (0, write_total),
+        },
+        (a, b) => (a.unwrap_or(0), b.unwrap_or(0)),
+    };
+    let counts = TokenCounts {
+        input: u("input_tokens"),
+        cache_read: u("cache_read_input_tokens"),
+        cache_write_5m: write_5m,
+        cache_write_1h: write_1h,
+        output: u("output_tokens"),
+    };
+    let amount_usd = pricing::lookup(model, counts.prompt_tokens(), ctx.overrides)
+        .map(|rates| pricing::amount_usd(&rates, &counts));
+    CostRecord {
+        source: "provider-anthropic".into(),
+        model: model.to_string(),
+        // Core の計測が呼び出し元の値で上書きする
+        purpose: Purpose::Main,
+        run_id: None,
+        input_tokens: counts.input,
+        cache_read_tokens: counts.cache_read,
+        cache_write_tokens: write_5m + write_1h,
+        output_tokens: counts.output,
+        unit: None,
+        amount_usd,
+        billing: Billing::Metered,
+    }
 }
 
 #[cfg(test)]
@@ -352,7 +411,10 @@ mod tests {
     }
 
     fn params() -> CompletionParams {
-        CompletionParams { max_tokens: 100 }
+        CompletionParams {
+            max_tokens: 100,
+            ..Default::default()
+        }
     }
 
     fn count_cache_controls(v: &Value) -> usize {
@@ -454,6 +516,21 @@ mod tests {
         let body = build_request("m", &p, &params(), CacheTtl::FiveMinutes).unwrap();
         assert_eq!(body["tools"][0]["name"], "t");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    fn cx() -> CostContext<'static> {
+        static NONE: Overrides = Overrides {
+            input: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            cache_read: None,
+            output: None,
+        };
+        CostContext {
+            request_model: "claude-opus-5-5",
+            ttl: CacheTtl::FiveMinutes,
+            overrides: &NONE,
+        }
     }
 
     fn spec() -> ToolSpec {
@@ -667,10 +744,15 @@ mod tests {
             ],
             "usage": {}
         });
-        let c = parse_response(&resp).unwrap();
+        let c = parse_response(&resp, &cx()).unwrap();
         assert_eq!(c.raw_assistant, Some(resp["content"].clone()));
         let plain = json!({"content": [{"type":"text","text":"x"}], "usage": {}});
-        assert!(parse_response(&plain).unwrap().raw_assistant.is_none());
+        assert!(
+            parse_response(&plain, &cx())
+                .unwrap()
+                .raw_assistant
+                .is_none()
+        );
     }
 
     #[test]
@@ -689,7 +771,7 @@ mod tests {
                 "output_tokens": 5
             }
         });
-        let c = parse_response(&resp).unwrap();
+        let c = parse_response(&resp, &cx()).unwrap();
         assert_eq!(c.text.as_deref(), Some("hello world"));
         assert_eq!(c.tool_calls.len(), 1);
         assert_eq!(c.tool_calls[0].id, "toolu_1");
@@ -705,9 +787,71 @@ mod tests {
     }
 
     #[test]
+    fn cost_uses_response_model_and_ttl_split() {
+        let resp = json!({
+            "model": "claude-opus-5-5-20261001",
+            "content": [],
+            "usage": {
+                "input_tokens": 1_000_000,
+                "cache_read_input_tokens": 1_000_000,
+                "cache_creation_input_tokens": 2_000_000,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 1_000_000,
+                    "ephemeral_1h_input_tokens": 1_000_000
+                },
+                "output_tokens": 1_000_000
+            }
+        });
+        let c = parse_response(&resp, &cx()).unwrap().cost.unwrap();
+        assert_eq!(c.source, "provider-anthropic");
+        assert_eq!(c.model, "claude-opus-5-5-20261001");
+        assert_eq!(c.billing, Billing::Metered);
+        assert_eq!(c.cache_write_tokens, 2_000_000);
+        assert!((c.amount_usd.unwrap() - (4.0 + 0.2 + 5.0 + 8.0 + 20.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_without_breakdown_follows_cache_ttl() {
+        let resp = json!({
+            "content": [],
+            "usage": {"cache_creation_input_tokens": 1_000_000}
+        });
+        let mut cx1 = cx();
+        let five = parse_response(&resp, &cx1).unwrap().cost.unwrap();
+        assert_eq!(five.model, "claude-opus-5-5");
+        assert!((five.amount_usd.unwrap() - 5.0).abs() < 1e-9);
+        cx1.ttl = CacheTtl::OneHour;
+        let hour = parse_response(&resp, &cx1).unwrap().cost.unwrap();
+        assert!((hour.amount_usd.unwrap() - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_unknown_model_has_no_amount() {
+        let resp = json!({"model": "mystery", "content": [], "usage": {"input_tokens": 5}});
+        let c = parse_response(&resp, &cx()).unwrap().cost.unwrap();
+        assert!(c.amount_usd.is_none());
+        assert_eq!(c.input_tokens, 5);
+    }
+
+    #[test]
+    fn cost_respects_overrides() {
+        let o = Overrides {
+            output: Some(1.0),
+            ..Default::default()
+        };
+        let cx2 = CostContext {
+            overrides: &o,
+            ..cx()
+        };
+        let resp = json!({"content": [], "usage": {"output_tokens": 1_000_000}});
+        let c = parse_response(&resp, &cx2).unwrap().cost.unwrap();
+        assert!((c.amount_usd.unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn no_text_gives_none() {
         let resp = json!({"content": [], "usage": {"input_tokens": 1, "output_tokens": 0}});
-        let c = parse_response(&resp).unwrap();
+        let c = parse_response(&resp, &cx()).unwrap();
         assert!(c.text.is_none());
         assert_eq!(c.usage.cached_tokens, 0);
     }
@@ -715,7 +859,7 @@ mod tests {
     #[test]
     fn whitespace_only_text_is_skipped() {
         let resp = json!({"content": [{"type":"text","text":" \n"}], "usage": {}});
-        assert!(parse_response(&resp).unwrap().text.is_none());
+        assert!(parse_response(&resp, &cx()).unwrap().text.is_none());
     }
 
     #[test]

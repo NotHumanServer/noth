@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use noth_backend_tinyfish::meter::{report_cost, report_rate_limit};
 use noth_backend_tinyfish::{SearchOptions, SearchResponse, TinyFish, require_backend};
 use noth_core::registry::{ModuleCtx, Registry};
 use noth_core::traits::Tool;
-use noth_core::types::{ToolContext, ToolOutput, ToolSpec};
+use noth_core::types::{Billing, ToolContext, ToolOutput, ToolSpec};
 use noth_core::{Error, Result};
 use serde_json::{Value, json};
+
+const SOURCE: &str = "tool-web-search";
 
 pub fn register(reg: &mut Registry) {
     reg.register_tool("tool-web-search", factory);
@@ -127,7 +130,7 @@ impl Tool for WebSearch {
         }
     }
 
-    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let (query, opts) = match parse_options(&input) {
             Ok(v) => v,
             Err(text) => {
@@ -137,11 +140,22 @@ impl Tool for WebSearch {
                 });
             }
         };
-        match self.backend.search(&query, &opts).await {
-            Ok(resp) => Ok(ToolOutput {
-                text: format_results(&query, &resp),
-                is_error: false,
-            }),
+        match self.backend.search_metered(&query, &opts).await {
+            Ok(resp) => {
+                report_rate_limit(ctx, SOURCE, "search", resp.rate_limit.as_ref());
+                report_cost(
+                    ctx,
+                    SOURCE,
+                    "search",
+                    ("request", 1),
+                    Some(0.0),
+                    Billing::Free,
+                );
+                Ok(ToolOutput {
+                    text: format_results(&query, &resp.body),
+                    is_error: false,
+                })
+            }
             Err(Error::Api { body, .. }) => Ok(ToolOutput {
                 text: body,
                 is_error: true,
@@ -152,6 +166,10 @@ impl Tool for WebSearch {
 
     async fn health_check(&self) -> Result<String> {
         self.backend.health_check().await
+    }
+
+    async fn account_status(&self) -> Result<Option<String>> {
+        self.backend.account_status().await.map(Some)
     }
 }
 

@@ -1,5 +1,6 @@
 //! OpenAI の Chat Completions / Responses API の provider。リクエスト構築・応答解析は `wire` の純粋関数に分けてある
 pub mod codex_auth;
+mod pricing;
 mod wire;
 
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use noth_core::registry::{ModuleCtx, Registry};
 use noth_core::traits::{Completion, LayeredPrompt, Provider};
+use noth_core::types::Billing;
 use noth_core::types::CompletionParams;
 use noth_core::{Error, Result};
 use reqwest::StatusCode;
@@ -33,6 +35,8 @@ struct Settings {
     base_url: Option<String>,
     timeout_secs: Option<u64>,
     effort: Option<String>,
+    #[serde(default)]
+    pricing: pricing::Overrides,
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -108,6 +112,7 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
         client,
         base_url,
         auth,
+        pricing: s.pricing,
         model: s.model,
         format,
         effort,
@@ -120,6 +125,7 @@ struct OpenAiProvider {
     client: reqwest::Client,
     base_url: String,
     auth: Auth,
+    pricing: pricing::Overrides,
     model: String,
     format: wire::Format,
     effort: Option<&'static str>,
@@ -322,12 +328,25 @@ impl Provider for OpenAiProvider {
         let mut attempt = 0;
         loop {
             match self.post_once(path, &extra_headers, &body).await {
-                Ok(bytes) if codex => return wire::assemble_sse(&String::from_utf8_lossy(&bytes)),
                 Ok(bytes) => {
+                    let cost_ctx = wire::CostContext {
+                        request_model: &self.model,
+                        billing: if codex {
+                            Billing::Subscription
+                        } else {
+                            Billing::Metered
+                        },
+                        // preset / base_url の先は OpenAI 本家と価格が違うので、表の単価を当てない
+                        use_table: !self.compat,
+                        overrides: &self.pricing,
+                    };
+                    if codex {
+                        return wire::assemble_sse(&String::from_utf8_lossy(&bytes), &cost_ctx);
+                    }
                     let resp: Value = serde_json::from_slice(&bytes)?;
                     return match self.format {
-                        wire::Format::Chat => wire::parse_chat_response(&resp),
-                        wire::Format::Responses => wire::parse_responses_response(&resp),
+                        wire::Format::Chat => wire::parse_chat_response(&resp, &cost_ctx),
+                        wire::Format::Responses => wire::parse_responses_response(&resp, &cost_ctx),
                     };
                 }
                 Err(Attempt::Fatal(err)) => return Err(err),

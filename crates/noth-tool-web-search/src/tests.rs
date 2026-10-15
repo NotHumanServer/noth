@@ -1,12 +1,13 @@
 use super::*;
 use noth_backend_tinyfish::testing::{MockServer, Reply, load_config};
-use noth_core::types::TaskCategory;
+use noth_core::types::{Billing, MeterEvent, TaskCategory};
 
 fn ctx() -> ToolContext {
     ToolContext {
         run_id: "r".into(),
         task_category: TaskCategory::WebResearch,
         work_dir: std::env::temp_dir(),
+        meter: None,
     }
 }
 
@@ -134,4 +135,71 @@ fn factory_checks_backend_name() {
         };
         assert_eq!(factory(&ctx).is_ok(), ok, "{section}");
     }
+}
+
+fn metered_ctx() -> (
+    ToolContext,
+    tokio::sync::mpsc::UnboundedReceiver<MeterEvent>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ToolContext {
+            meter: Some(tx),
+            run_id: "run-1".into(),
+            ..ctx()
+        },
+        rx,
+    )
+}
+
+#[tokio::test]
+async fn reports_rate_limit_and_free_cost() {
+    let server = MockServer::start(|_, _| {
+        Reply::json(200, r#"{"results":[]}"#)
+            .with_header("x-ratelimit-limit", "30")
+            .with_header("x-ratelimit-remaining", "7")
+            .with_header("x-ratelimit-reset", "1760500000")
+    })
+    .await;
+    let (ctx, mut rx) = metered_ctx();
+    WebSearch::new(server.backend())
+        .call(json!({"query":"a"}), &ctx)
+        .await
+        .unwrap();
+    let Some(MeterEvent::RateLimit(rl)) = rx.recv().await else {
+        panic!("rate limit が先に来るはず");
+    };
+    assert_eq!(
+        (rl.source.as_str(), rl.bucket.as_str()),
+        ("tool-web-search", "search")
+    );
+    assert_eq!(
+        (rl.limit, rl.remaining, rl.reset_at),
+        (30, 7, Some(1760500000))
+    );
+    let Some(MeterEvent::Cost(c)) = rx.recv().await else {
+        panic!("cost が来るはず");
+    };
+    assert_eq!(c.model, "search");
+    assert_eq!(c.run_id.as_deref(), Some("run-1"));
+    assert_eq!(c.unit, Some(("request".into(), 1)));
+    assert_eq!(c.amount_usd, Some(0.0));
+    assert_eq!(c.billing, Billing::Free);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn account_status_reads_wallet() {
+    let server = MockServer::start(|_, _| {
+        Reply::json(
+            200,
+            r#"{"available_balance":"10","currency":"USD","as_of":"x"}"#,
+        )
+    })
+    .await;
+    let line = WebSearch::new(server.backend())
+        .account_status()
+        .await
+        .unwrap();
+    assert_eq!(line.as_deref(), Some("TinyFish 残高 $10(x 時点)"));
 }

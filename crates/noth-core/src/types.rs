@@ -89,10 +89,99 @@ pub struct Turn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterState(pub serde_json::Value);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionParams {
     pub max_tokens: u32,
+    /// コストの集計単位。provider は使わず、Core の計測が記録に使う
+    pub purpose: Purpose,
+    pub run_id: Option<String>,
 }
+
+/// 何のための呼び出しか。`noth cost --by purpose` の集計キー
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purpose {
+    #[default]
+    Main,
+    Join,
+    Worker,
+    Compaction,
+}
+
+impl Purpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Purpose::Main => "main",
+            Purpose::Join => "join",
+            Purpose::Worker => "worker",
+            Purpose::Compaction => "compaction",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Billing {
+    /// 使った分だけ課金される(API キー)
+    Metered,
+    /// 定額プランの枠を消費する(Codex など)。金額は記録しない
+    Subscription,
+    /// 無料の呼び出し(TinyFish の Search / Fetch など)。回数の把握のために記録する
+    Free,
+}
+
+impl Billing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Billing::Metered => "metered",
+            Billing::Subscription => "subscription",
+            Billing::Free => "free",
+        }
+    }
+}
+
+/// 1 回の課金対象の呼び出し。金額は単価表を持つ module が計算し、Core は保存と集計だけを行う
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostRecord {
+    /// module 名(`provider-anthropic`、`tool-web-agent` など)
+    pub source: String,
+    /// LLM ならモデル ID、tool なら API 名(`search`、`agent` など)
+    pub model: String,
+    pub purpose: Purpose,
+    pub run_id: Option<String>,
+    /// キャッシュの読み書きを除いた入力トークン
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// 思考のトークンを含む
+    pub output_tokens: u64,
+    /// トークン以外の課金単位(`step`、`request`、`url` など)と数量。LLM では None
+    pub unit: Option<(String, u64)>,
+    /// None は単価が分からない。トークン数や数量だけは集計できる
+    pub amount_usd: Option<f64>,
+    pub billing: Billing,
+}
+
+/// 外部 API が返したレート制限の残り。`noth cost` が最新の値を表示する
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitSnapshot {
+    pub source: String,
+    /// 同じ module 内の区分(`search`、`fetch` など)
+    pub bucket: String,
+    pub limit: u64,
+    pub remaining: u64,
+    /// UNIX 秒
+    pub reset_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MeterEvent {
+    Cost(CostRecord),
+    RateLimit(RateLimitSnapshot),
+}
+
+/// 送れなくても呼び出し自体は続ける。計測の失敗で会話や調査を止めないため
+pub type MeterSink = tokio::sync::mpsc::UnboundedSender<MeterEvent>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
@@ -151,6 +240,8 @@ pub struct ToolContext {
     pub run_id: String,
     pub task_category: TaskCategory,
     pub work_dir: std::path::PathBuf,
+    /// 有料 API の課金やレート制限の残りを Core に知らせる。None なら記録しない
+    pub meter: Option<MeterSink>,
 }
 
 #[derive(Debug, Clone)]

@@ -137,6 +137,8 @@ pub struct Completion {
     pub usage: Usage,
     /// tool_calls があるとき、`ExchangeItem::Assistant::raw` に入れて次の呼び出しで返す provider 固有の content
     pub raw_assistant: Option<serde_json::Value>,
+    /// provider が自分の単価表で計算した費用。purpose と run_id は Core の計測が上書きする
+    pub cost: Option<CostRecord>,
 }
 
 #[async_trait]
@@ -162,6 +164,10 @@ pub trait Tool: Send + Sync {
     /// `noth doctor` の疎通確認。外部 API を使わない tool は既定のままでよい
     async fn health_check(&self) -> Result<String> {
         Ok("ok".into())
+    }
+    /// `noth cost` に出す課金先アカウントの状態(残高など)。外部の課金が無い tool は None
+    async fn account_status(&self) -> Result<Option<String>> {
+        Ok(None)
     }
 }
 

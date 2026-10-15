@@ -243,6 +243,7 @@ mod tests {
             run_id: "r".into(),
             task_category: TaskCategory::CodeOrTool,
             work_dir: dir.to_path_buf(),
+            meter: None,
         }
     }
 

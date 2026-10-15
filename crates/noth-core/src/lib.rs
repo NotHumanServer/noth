@@ -7,6 +7,7 @@ pub mod heartbeat;
 pub mod ingest;
 pub mod judge;
 pub mod layers;
+pub mod metering;
 pub mod progress;
 pub mod registry;
 pub mod restore;

@@ -62,13 +62,15 @@ impl Job {
 
 /// 常駐処理の本体。restore → Channel::run と Ingest と actor の起動 → `shutdown` 完了で終了する。
 /// 終了時はキューに残った仕事と、Fork 済みの Worker の Join を処理し終えてから止まる(最長 worker.timeout_secs + 猶予)。
-/// heartbeat の起動と終了時の disconnected 更新もここで行う
+/// heartbeat の起動と終了時の disconnected 更新、計測イベントの保存もここで行う
 pub async fn run(
     config: Config,
-    modules: Modules,
+    mut modules: Modules,
     store: Store,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<()> {
+    let (_, closed_rx) = mpsc::unbounded_channel();
+    let meter_rx = std::mem::replace(&mut modules.meter_rx, closed_rx);
     let channel = modules.channel.clone();
     let guild = channel.guild_id();
 
@@ -89,6 +91,14 @@ pub async fn run(
     for batch in batches {
         let _ = jobs_tx.send(Job::Judge(batch));
     }
+
+    let (meter_stop, meter_stop_rx) = oneshot::channel::<()>();
+    let meter_task = tokio::spawn(record_meter_events(
+        store.clone(),
+        guild,
+        meter_rx,
+        meter_stop_rx,
+    ));
 
     let (bus_handle, bus_rx) = bus::channel(256);
     let heartbeat_task = heartbeat::spawn(store.clone(), guild, hb_info.clone(), channel.clone());
@@ -154,6 +164,14 @@ pub async fn run(
     {
         tracing::warn!("処理中の仕事や Worker が終わらないため中断します");
         actor_task.abort();
+    }
+    // provider や tool が送信側を持ち続けるのでキューは閉じない。actor が止まった後に届いた分まで書いてから止める
+    let _ = meter_stop.send(());
+    if tokio::time::timeout(SHUTDOWN_GRACE, meter_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("計測イベントの保存が終わらないため中断します");
     }
     heartbeat_task.abort();
     // abort 直前に始まった connected の upsert が disconnected を上書きしないよう、終了を待つ
@@ -493,7 +511,10 @@ impl Actor {
 
         let active_log = self.store.active_turns(guild).await?;
         let prompt = self.prompt(active_log, tail);
-        let completion = match self.complete_with_typing(batch.channel_id, &prompt).await {
+        let completion = match self
+            .complete_with_typing(batch.channel_id, &prompt, Purpose::Main, None)
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "本線の生成に失敗しました。応答せずバッファに残します");
@@ -782,7 +803,9 @@ impl Actor {
             active_log,
             vec![layers::delivery_instruction_turn(chunk_id, style)],
         );
-        let completion = self.complete_with_typing(run.channel_id, &prompt).await;
+        let completion = self
+            .complete_with_typing(run.channel_id, &prompt, Purpose::Join, Some(run_id))
+            .await;
         let reply_to = run
             .trigger_message_id
             .filter(|_| style == DeliveryStyle::ReplyAnchor);
@@ -936,9 +959,13 @@ impl Actor {
         &self,
         channel_id: ChannelId,
         prompt: &LayeredPrompt,
+        purpose: Purpose,
+        run_id: Option<&str>,
     ) -> Result<Completion> {
         let params = CompletionParams {
             max_tokens: self.config.context.max_tokens,
+            purpose,
+            run_id: run_id.map(str::to_string),
         };
         let typing = self.spawn_typing(channel_id);
         let completion = self.provider.complete(prompt, &params).await;
@@ -1081,6 +1108,39 @@ impl Actor {
                 tokio::time::sleep(interval).await;
             }
         })
+    }
+}
+
+/// 計測の保存に失敗しても会話や調査は止めない。`stop` を受けたら、それまでに届いた分を書いて終わる
+async fn record_meter_events(
+    store: Store,
+    guild: GuildId,
+    mut rx: mpsc::UnboundedReceiver<MeterEvent>,
+    mut stop: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Some(event) => record_meter_event(&store, guild, &event).await,
+                None => return,
+            },
+            _ = &mut stop => {
+                while let Ok(event) = rx.try_recv() {
+                    record_meter_event(&store, guild, &event).await;
+                }
+                return;
+            }
+        }
+    }
+}
+
+async fn record_meter_event(store: &Store, guild: GuildId, event: &MeterEvent) {
+    let result = match event {
+        MeterEvent::Cost(r) => store.record_cost(guild, r).await,
+        MeterEvent::RateLimit(r) => store.upsert_rate_limit(guild, r).await,
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "費用の記録を SQLite に保存できませんでした。`noth cost` の集計から漏れます");
     }
 }
 

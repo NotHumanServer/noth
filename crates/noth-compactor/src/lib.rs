@@ -77,6 +77,8 @@ impl Compactor for LlmCompactor {
                 &prompt,
                 &CompletionParams {
                     max_tokens: self.max_tokens,
+                    purpose: Purpose::Compaction,
+                    run_id: None,
                 },
             )
             .await?;
@@ -99,12 +101,14 @@ mod tests {
     struct MockProvider {
         reply: Option<String>,
         prompts: Mutex<Vec<LayeredPrompt>>,
+        purposes: Mutex<Vec<Purpose>>,
     }
 
     #[async_trait]
     impl Provider for MockProvider {
-        async fn complete(&self, p: &LayeredPrompt, _: &CompletionParams) -> Result<Completion> {
+        async fn complete(&self, p: &LayeredPrompt, cp: &CompletionParams) -> Result<Completion> {
             self.prompts.lock().unwrap().push(p.clone());
+            self.purposes.lock().unwrap().push(cp.purpose);
             Ok(Completion {
                 text: self.reply.clone(),
                 ..Default::default()
@@ -129,6 +133,7 @@ mod tests {
         let p = Arc::new(MockProvider {
             reply: reply.map(Into::into),
             prompts: Mutex::new(Vec::new()),
+            purposes: Mutex::new(Vec::new()),
         });
         (LlmCompactor::new(p.clone(), 512), p)
     }
@@ -143,6 +148,7 @@ mod tests {
         ];
         let out = c.digest("rules", &turns).await.unwrap();
         assert_eq!(out, "要約");
+        assert_eq!(*p.purposes.lock().unwrap(), [Purpose::Compaction]);
         let prompts = p.prompts.lock().unwrap();
         let prompt = &prompts[0];
         assert_eq!(prompt.harness_rules, "rules");

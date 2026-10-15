@@ -10,8 +10,9 @@ use noth_core::actor::{Actor, Job};
 use noth_core::bus::{self, BusEvent, BusHandle};
 use noth_core::config::*;
 use noth_core::judge::{JudgeBatch, PendingMessage};
+use noth_core::metering::MeteredProvider;
 use noth_core::registry::Modules;
-use noth_core::store::{NewWorkerRun, RunStatus, Store};
+use noth_core::store::{CostGroup, NewWorkerRun, RunStatus, Store};
 use noth_core::traits::*;
 use noth_core::types::*;
 use noth_core::{Error, Result};
@@ -360,6 +361,7 @@ struct Harness {
     jobs: tokio::sync::mpsc::UnboundedReceiver<Job>,
     home: PathBuf,
     next_message_id: MessageId,
+    meter_rx: tokio::sync::mpsc::UnboundedReceiver<MeterEvent>,
 }
 
 #[derive(Clone, Copy)]
@@ -423,15 +425,22 @@ impl Harness {
         let provider = Arc::new(MockProvider::new());
         let worker = Arc::new(MockWorker::new(setup.worker_permits));
         let compactor = Arc::new(MockCompactor::default());
+        let (meter, meter_rx) = tokio::sync::mpsc::unbounded_channel();
         let modules = Modules {
             channel: channel.clone(),
             router: router.clone(),
-            provider: provider.clone(),
+            provider: Arc::new(MeteredProvider::new(
+                provider.clone(),
+                "provider-mock",
+                meter.clone(),
+            )),
             worker: setup.worker.then(|| worker.clone() as Arc<dyn Worker>),
             compactor: setup
                 .compactor
                 .then(|| compactor.clone() as Arc<dyn Compactor>),
             tools: Vec::new(),
+            meter,
+            meter_rx: tokio::sync::mpsc::unbounded_channel().1,
         };
         let table: toml::Table = toml::from_str(&format!(
             "[worker]\nmax_concurrent = {}\ntimeout_secs = {}\nshow_progress = {}\n[compactor]\nidle_minutes = 10\nkeep_recent_turns = {}\ndigest_max_chars = 12000",
@@ -461,6 +470,7 @@ impl Harness {
             jobs,
             home,
             next_message_id: 1000,
+            meter_rx,
         }
     }
 
@@ -1016,6 +1026,8 @@ async fn run_replies_end_to_end_and_marks_disconnected() {
         worker: None,
         compactor: None,
         tools: Vec::new(),
+        meter: tokio::sync::mpsc::unbounded_channel().0,
+        meter_rx: tokio::sync::mpsc::unbounded_channel().1,
     };
     let table: toml::Table = toml::from_str("[channel.discord]\ndebounce_secs = 0.05").unwrap();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1634,6 +1646,8 @@ async fn run_waits_for_worker_join_on_shutdown() {
         worker: Some(worker.clone()),
         compactor: None,
         tools: Vec::new(),
+        meter: tokio::sync::mpsc::unbounded_channel().0,
+        meter_rx: tokio::sync::mpsc::unbounded_channel().1,
     };
     let table: toml::Table =
         toml::from_str("[channel.discord]\ndebounce_secs = 0.05\n[worker]\ntimeout_secs = 5")
@@ -1881,4 +1895,96 @@ async fn progress_disabled_never_edits() {
     h.process_next_job().await;
     assert!(h.channel.edits.lock().unwrap().is_empty());
     assert!(h.worker.tasks.lock().unwrap()[0].progress.is_none());
+}
+
+fn drain_purposes(h: &mut Harness) -> Vec<(Purpose, Option<String>)> {
+    let mut out = Vec::new();
+    while let Ok(event) = h.meter_rx.try_recv() {
+        if let MeterEvent::Cost(c) = event {
+            out.push((c.purpose, c.run_id));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn main_and_join_calls_are_metered_with_purpose() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(with_delivery(
+        spawn_answers("web_research"),
+        "normal_report",
+    ));
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.say(GENERAL, "天気調べて").await;
+    assert_eq!(drain_purposes(&mut h), vec![(Purpose::Main, None)]);
+
+    h.process_next_job().await;
+    let run_id = runs(&h.store, RunStatus::Finished).await[0].run_id.clone();
+    assert_eq!(drain_purposes(&mut h), vec![(Purpose::Join, Some(run_id))]);
+}
+
+#[tokio::test]
+async fn run_saves_meter_events_before_exit() {
+    let store = Store::open_memory().await.unwrap();
+    let channel = Arc::new(MockChannel::default());
+    channel
+        .scripted
+        .lock()
+        .unwrap()
+        .push(incoming(GENERAL, "general", "Noth、いる?", 1));
+    let router = Arc::new(MockRouter::default());
+    router.set(answers("reply_only", 0.0, 0.0));
+    let (meter, meter_rx) = tokio::sync::mpsc::unbounded_channel();
+    let provider = Arc::new(MeteredProvider::new(
+        Arc::new(MockProvider::new()),
+        "provider-mock",
+        meter.clone(),
+    ));
+    let modules = Modules {
+        channel: channel.clone(),
+        router,
+        provider,
+        worker: None,
+        compactor: None,
+        tools: Vec::new(),
+        meter: meter.clone(),
+        meter_rx,
+    };
+    let table: toml::Table = toml::from_str("[channel.discord]\ndebounce_secs = 0.05").unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(noth_core::actor::run(
+        config(80_000, table),
+        modules,
+        store.clone(),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    let sent = channel.clone();
+    wait_until(|| !sent.sent.lock().unwrap().is_empty()).await;
+    // tool の課金とレート制限も同じ経路で届く。停止の直前に届いた分も保存される
+    meter
+        .send(MeterEvent::RateLimit(RateLimitSnapshot {
+            source: "tool-web-search".into(),
+            bucket: "search".into(),
+            limit: 100,
+            remaining: 99,
+            reset_at: None,
+        }))
+        .unwrap();
+    stop_tx.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+
+    let by_purpose = store
+        .cost_summary(GUILD, 0, CostGroup::Purpose)
+        .await
+        .unwrap();
+    assert_eq!(by_purpose.len(), 1);
+    assert_eq!(by_purpose[0].key, "main");
+    assert_eq!(by_purpose[0].calls, 1);
+    assert_eq!(by_purpose[0].input_tokens, 10);
+    assert_eq!(by_purpose[0].unpriced_calls, 1);
+    let limits = store.rate_limits(GUILD).await.unwrap();
+    assert_eq!(limits.len(), 1);
+    assert_eq!(limits[0].0.remaining, 99);
 }

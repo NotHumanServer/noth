@@ -1,7 +1,11 @@
 use noth_core::traits::{Completion, LayeredPrompt};
-use noth_core::types::{CompletionParams, ExchangeItem, Role, ToolCall, Turn, Usage};
+use noth_core::types::{
+    Billing, CompletionParams, CostRecord, ExchangeItem, Purpose, Role, ToolCall, Turn, Usage,
+};
 use noth_core::{Error, Result};
 use serde_json::{Value, json};
+
+use crate::pricing::{self, Overrides, TokenCounts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -272,6 +276,45 @@ fn typed_message_parts(input: &mut [Value]) {
     }
 }
 
+/// 費用計算に必要な、リクエスト側の情報
+pub struct CostContext<'a> {
+    pub request_model: &'a str,
+    pub billing: Billing,
+    /// 内蔵の単価表を引くか。互換サーバーはモデル ID が同じでも価格が違うので引かない
+    pub use_table: bool,
+    pub overrides: &'a Overrides,
+}
+
+fn cost_record(resp: &Value, ctx: &CostContext, counts: TokenCounts) -> CostRecord {
+    let model = resp
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(ctx.request_model);
+    // 定額プランは枠を消費するだけで、従量の金額は発生しない
+    let amount_usd = match ctx.billing {
+        Billing::Metered => {
+            pricing::lookup(model, counts.prompt_tokens(), ctx.use_table, ctx.overrides)
+                .map(|rates| pricing::amount_usd(&rates, &counts))
+        }
+        _ => None,
+    };
+    CostRecord {
+        source: "provider-openai".into(),
+        model: model.to_string(),
+        // Core の計測が呼び出し元の値で上書きする
+        purpose: Purpose::Main,
+        run_id: None,
+        input_tokens: counts.input,
+        cache_read_tokens: counts.cache_read,
+        cache_write_tokens: counts.cache_write,
+        output_tokens: counts.output,
+        unit: None,
+        amount_usd,
+        billing: ctx.billing,
+    }
+}
+
 /// モデルは不正な JSON を返すことがある。落とさず `_raw` に入れ、tool 側のエラーとして モデルに返す
 fn parse_arguments(args: &Value, name: &str) -> Value {
     match args {
@@ -294,7 +337,7 @@ fn str_at<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
-pub fn parse_chat_response(resp: &Value) -> Result<Completion> {
+pub fn parse_chat_response(resp: &Value, cost_ctx: &CostContext) -> Result<Completion> {
     let choice = resp
         .pointer("/choices/0")
         .ok_or_else(|| Error::Other("openai: 応答に choices がありません".into()))?;
@@ -338,20 +381,26 @@ pub fn parse_chat_response(resp: &Value) -> Result<Completion> {
         ));
     }
 
+    let prompt = u64_at(resp, "/usage/prompt_tokens");
+    let cached = u64_at(resp, "/usage/prompt_tokens_details/cached_tokens");
+    let written = u64_at(resp, "/usage/prompt_tokens_details/cache_write_tokens");
+    let output = u64_at(resp, "/usage/completion_tokens");
+    let counts = TokenCounts::from_reported(prompt, cached, written, output);
     Ok(Completion {
         text,
         tool_calls,
         usage: Usage {
             // prompt_tokens はキャッシュ分を含む
-            input_tokens: u64_at(resp, "/usage/prompt_tokens"),
-            cached_tokens: u64_at(resp, "/usage/prompt_tokens_details/cached_tokens"),
-            output_tokens: u64_at(resp, "/usage/completion_tokens"),
+            input_tokens: prompt,
+            cached_tokens: cached,
+            output_tokens: output,
         },
         raw_assistant: None,
+        cost: Some(cost_record(resp, cost_ctx, counts)),
     })
 }
 
-pub fn parse_responses_response(resp: &Value) -> Result<Completion> {
+pub fn parse_responses_response(resp: &Value, cost_ctx: &CostContext) -> Result<Completion> {
     let output = resp
         .get("output")
         .and_then(Value::as_array)
@@ -403,15 +452,21 @@ pub fn parse_responses_response(resp: &Value) -> Result<Completion> {
 
     let text = (!text.trim().is_empty()).then_some(text);
     let raw_assistant = (!tool_calls.is_empty()).then(|| Value::Array(output.clone()));
+    let prompt = u64_at(resp, "/usage/input_tokens");
+    let cached = u64_at(resp, "/usage/input_tokens_details/cached_tokens");
+    let written = u64_at(resp, "/usage/input_tokens_details/cache_write_tokens");
+    let output = u64_at(resp, "/usage/output_tokens");
+    let counts = TokenCounts::from_reported(prompt, cached, written, output);
     Ok(Completion {
         text,
         tool_calls,
         usage: Usage {
-            input_tokens: u64_at(resp, "/usage/input_tokens"),
-            cached_tokens: u64_at(resp, "/usage/input_tokens_details/cached_tokens"),
-            output_tokens: u64_at(resp, "/usage/output_tokens"),
+            input_tokens: prompt,
+            cached_tokens: cached,
+            output_tokens: output,
         },
         raw_assistant,
+        cost: Some(cost_record(resp, cost_ctx, counts)),
     })
 }
 
@@ -468,7 +523,7 @@ fn sse_error_message(event: &Value) -> String {
 
 /// SSE 全文から Completion を組み立てる。terminal の output は null や空のことがあるため、
 /// 本文と tool call は `output_item.done` を正とし、無いときだけ terminal の output に頼る
-pub fn assemble_sse(text: &str) -> Result<Completion> {
+pub fn assemble_sse(text: &str, cost_ctx: &CostContext) -> Result<Completion> {
     let mut items: Vec<Value> = Vec::new();
     let mut terminal: Option<Value> = None;
     let mut data_lines: Vec<&str> = Vec::new();
@@ -518,12 +573,12 @@ pub fn assemble_sse(text: &str) -> Result<Completion> {
         items = output.clone();
     }
     let mut synthetic = json!({"output": items});
-    for key in ["status", "incomplete_details", "usage"] {
+    for key in ["status", "incomplete_details", "usage", "model"] {
         if let Some(v) = terminal.get(key) {
             synthetic[key] = v.clone();
         }
     }
-    parse_responses_response(&synthetic)
+    parse_responses_response(&synthetic, cost_ctx)
 }
 
 #[cfg(test)]
@@ -559,7 +614,26 @@ mod tests {
     }
 
     fn params() -> CompletionParams {
-        CompletionParams { max_tokens: 100 }
+        CompletionParams {
+            max_tokens: 100,
+            ..Default::default()
+        }
+    }
+
+    const NO_OVERRIDES: Overrides = Overrides {
+        input: None,
+        cached_input: None,
+        cache_write: None,
+        output: None,
+    };
+
+    fn cx() -> CostContext<'static> {
+        CostContext {
+            request_model: "gpt-5.4",
+            billing: Billing::Metered,
+            use_table: true,
+            overrides: &NO_OVERRIDES,
+        }
     }
 
     fn call() -> ToolCall {
@@ -734,7 +808,7 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "やあ"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 50, "completion_tokens": 7, "prompt_tokens_details": {"cached_tokens": 40}},
         });
-        let c = parse_chat_response(&resp).unwrap();
+        let c = parse_chat_response(&resp, &cx()).unwrap();
         assert_eq!(c.text.as_deref(), Some("やあ"));
         assert!(c.tool_calls.is_empty());
         assert!(c.raw_assistant.is_none());
@@ -757,7 +831,7 @@ mod tests {
                 {"id": "c3", "type": "function", "function": {"name": "c", "arguments": ""}},
             ]}, "finish_reason": "tool_calls"}],
         });
-        let c = parse_chat_response(&resp).unwrap();
+        let c = parse_chat_response(&resp, &cx()).unwrap();
         assert!(c.text.is_none());
         assert_eq!(c.tool_calls.len(), 3);
         assert_eq!(c.tool_calls[0].input, json!({"x": 1}));
@@ -768,9 +842,9 @@ mod tests {
 
     #[test]
     fn parse_chat_errors() {
-        assert!(parse_chat_response(&json!({})).is_err());
+        assert!(parse_chat_response(&json!({}), &cx()).is_err());
         let resp = json!({"choices": [{"message": {"content": null}, "finish_reason": "length"}]});
-        assert!(parse_chat_response(&resp).is_err());
+        assert!(parse_chat_response(&resp, &cx()).is_err());
     }
 
     #[test]
@@ -784,7 +858,7 @@ mod tests {
             ],
             "usage": {"input_tokens": 30, "input_tokens_details": {"cached_tokens": 20}, "output_tokens": 5},
         });
-        let c = parse_responses_response(&resp).unwrap();
+        let c = parse_responses_response(&resp, &cx()).unwrap();
         assert_eq!(c.text.as_deref(), Some("調べるね"));
         assert_eq!(c.tool_calls[0].id, "call_9");
         assert_eq!(c.tool_calls[0].input, json!({"q": "y"}));
@@ -802,19 +876,24 @@ mod tests {
     #[test]
     fn parse_responses_no_raw_without_calls() {
         let resp = json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}]});
-        let c = parse_responses_response(&resp).unwrap();
+        let c = parse_responses_response(&resp, &cx()).unwrap();
         assert!(c.raw_assistant.is_none());
-        assert!(parse_responses_response(&json!({})).is_err());
+        assert!(parse_responses_response(&json!({}), &cx()).is_err());
     }
 
     #[test]
     fn parse_responses_incomplete() {
         let empty = json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": [{"type": "reasoning", "id": "rs"}]});
-        let err = parse_responses_response(&empty).unwrap_err().to_string();
+        let err = parse_responses_response(&empty, &cx())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("max_output_tokens"), "{err}");
         let partial = json!({"status": "incomplete", "output": [{"type": "message", "content": [{"type": "output_text", "text": "途中"}]}]});
         assert_eq!(
-            parse_responses_response(&partial).unwrap().text.as_deref(),
+            parse_responses_response(&partial, &cx())
+                .unwrap()
+                .text
+                .as_deref(),
             Some("途中")
         );
     }
@@ -845,7 +924,7 @@ data: [DONE]\n";
 
     #[test]
     fn assemble_sse_text_call_usage() {
-        let c = assemble_sse(SSE).unwrap();
+        let c = assemble_sse(SSE, &cx()).unwrap();
         assert_eq!(c.text.as_deref(), Some("こんにちは"));
         assert_eq!(c.tool_calls.len(), 1);
         assert_eq!(c.tool_calls[0].id, "call_7");
@@ -866,21 +945,29 @@ data: [DONE]\n";
     #[test]
     fn assemble_sse_falls_back_to_terminal_output() {
         let sse = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}}";
-        assert_eq!(assemble_sse(sse).unwrap().text.as_deref(), Some("hi"));
+        assert_eq!(
+            assemble_sse(sse, &cx()).unwrap().text.as_deref(),
+            Some("hi")
+        );
     }
 
     #[test]
     fn assemble_sse_errors() {
         let failed = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n";
         assert!(
-            assemble_sse(failed)
+            assemble_sse(failed, &cx())
                 .unwrap_err()
                 .to_string()
                 .contains("boom")
         );
         let err = "data: {\"type\":\"error\",\"message\":\"bad\"}\n\n";
-        assert!(assemble_sse(err).unwrap_err().to_string().contains("bad"));
-        assert!(assemble_sse("").is_err());
+        assert!(
+            assemble_sse(err, &cx())
+                .unwrap_err()
+                .to_string()
+                .contains("bad")
+        );
+        assert!(assemble_sse("", &cx()).is_err());
     }
 
     #[test]
@@ -934,13 +1021,123 @@ data: [DONE]\n";
     #[test]
     fn assemble_sse_requires_terminal_event() {
         let sse = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"x\"}]}}\n\n";
-        assert!(assemble_sse(sse).is_err());
+        assert!(assemble_sse(sse, &cx()).is_err());
     }
 
     #[test]
     fn sse_error_message_is_one_line() {
         let e = "data: {\"type\":\"error\",\"message\":\"a\\nb   c\"}\n\n";
-        let msg = assemble_sse(e).unwrap_err().to_string();
+        let msg = assemble_sse(e, &cx()).unwrap_err().to_string();
         assert!(!msg.contains('\n') && msg.contains("a b c"), "{msg}");
+    }
+
+    fn cost_cx<'a>(billing: Billing, use_table: bool, o: &'a Overrides) -> CostContext<'a> {
+        CostContext {
+            request_model: "gpt-5.4",
+            billing,
+            use_table,
+            overrides: o,
+        }
+    }
+
+    fn chat_resp(model: &str) -> Value {
+        json!({
+            "model": model,
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 200000, "completion_tokens": 1000000, "prompt_tokens_details": {"cached_tokens": 100000}},
+        })
+    }
+
+    #[test]
+    fn chat_cost_splits_cached_and_uses_response_model() {
+        let c = parse_chat_response(&chat_resp("gpt-5.4-2026-03-05"), &cx())
+            .unwrap()
+            .cost
+            .unwrap();
+        assert_eq!(c.source, "provider-openai");
+        assert_eq!(c.model, "gpt-5.4-2026-03-05");
+        assert_eq!((c.input_tokens, c.cache_read_tokens), (100_000, 100_000));
+        assert_eq!(c.billing, Billing::Metered);
+        // 0.1M*2.5 + 0.1M*0.25 + 1M*15
+        assert!((c.amount_usd.unwrap() - (0.25 + 0.025 + 15.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn responses_cost_long_context_and_cache_write() {
+        let resp = json!({
+            "model": "gpt-6-sol",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "x"}]}],
+            "usage": {"input_tokens": 300000, "output_tokens": 1000000,
+                "input_tokens_details": {"cached_tokens": 100000, "cache_write_tokens": 50000}},
+        });
+        let c = parse_responses_response(&resp, &cx())
+            .unwrap()
+            .cost
+            .unwrap();
+        assert_eq!(c.cache_write_tokens, 50_000);
+        assert_eq!(c.input_tokens, 150_000);
+        // 272K 超なので long 単価: 0.15M*4 + 0.1M*0.4 + 0.05M*5 + 1M*15
+        assert!((c.amount_usd.unwrap() - (0.6 + 0.04 + 0.25 + 15.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compatible_server_has_no_amount_unless_overridden() {
+        let none = Overrides::default();
+        let c = parse_chat_response(
+            &chat_resp("gpt-5.4"),
+            &cost_cx(Billing::Metered, false, &none),
+        )
+        .unwrap()
+        .cost
+        .unwrap();
+        assert_eq!(c.amount_usd, None);
+        assert_eq!(c.input_tokens, 100_000);
+        let o = Overrides {
+            input: Some(1.0),
+            output: Some(2.0),
+            ..Default::default()
+        };
+        let c = parse_chat_response(&chat_resp("kimi"), &cost_cx(Billing::Metered, false, &o))
+            .unwrap()
+            .cost
+            .unwrap();
+        // 0.1M*1 + 0.1M*1(cached は input に揃う) + 1M*2
+        assert!((c.amount_usd.unwrap() - 2.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unknown_model_has_no_amount() {
+        let c = parse_chat_response(&chat_resp("mystery-1"), &cx())
+            .unwrap()
+            .cost
+            .unwrap();
+        assert_eq!(c.amount_usd, None);
+        assert_eq!(c.output_tokens, 1_000_000);
+    }
+
+    #[test]
+    fn codex_is_subscription_without_amount() {
+        let none = Overrides::default();
+        let cx = cost_cx(Billing::Subscription, false, &none);
+        let c = assemble_sse(SSE, &cx).unwrap().cost.unwrap();
+        assert_eq!(c.billing, Billing::Subscription);
+        assert_eq!(c.amount_usd, None);
+        assert_eq!(
+            (c.input_tokens, c.cache_read_tokens, c.output_tokens),
+            (4, 8, 3)
+        );
+    }
+
+    #[test]
+    fn overrides_apply_to_table_models() {
+        let o = Overrides {
+            output: Some(100.0),
+            ..Default::default()
+        };
+        let c = parse_chat_response(&chat_resp("gpt-5.4"), &cost_cx(Billing::Metered, true, &o))
+            .unwrap()
+            .cost
+            .unwrap();
+        assert!((c.amount_usd.unwrap() - (0.25 + 0.025 + 100.0)).abs() < 1e-9);
     }
 }
