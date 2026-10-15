@@ -103,21 +103,17 @@ impl MentionRouter {
 
     fn answer(&self, state: &Value, key: &str, q: &Question) -> Answer {
         match key {
-            "intervention_action" => choice(
+            "addressee" => choice(
                 q,
                 if self.addressed(state) {
-                    "reply_only"
+                    "noth_request"
                 } else {
-                    "silent"
+                    "other"
                 },
             ),
             "is_topic_shift" => Answer::Noul {
                 p: if self.topic_shift(state) { 1.0 } else { 0.0 },
             },
-            "addressed_to_noth" => Answer::Noul {
-                p: if self.addressed(state) { 1.0 } else { 0.0 },
-            },
-            "task_category" => choice(q, "none"),
             _ => match q {
                 Question::Noul { .. } => Answer::Noul { p: 0.0 },
                 Question::Choice { criteria, .. } => {
@@ -179,10 +175,6 @@ impl Router for MentionRouter {
         })
     }
 
-    fn max_questions(&self) -> usize {
-        64
-    }
-
     fn model_label(&self) -> String {
         "router-mention".into()
     }
@@ -204,10 +196,10 @@ mod tests {
         }
     }
 
-    fn intervention() -> Question {
+    fn addressee() -> Question {
         Question::Choice {
             instructions: String::new(),
-            criteria: ["silent", "reply_only", "spawn_task"]
+            criteria: ["other", "about_noth", "other_bot", "noth_request"]
                 .map(|n| (n.to_string(), String::new()))
                 .to_vec(),
         }
@@ -230,22 +222,22 @@ mod tests {
     }
 
     fn action(d: &Decision) -> String {
-        match &d.answers["intervention_action"] {
+        match &d.answers["addressee"] {
             Answer::Choice { choice, .. } => choice.clone(),
             _ => panic!("not choice"),
         }
     }
 
     #[tokio::test]
-    async fn mention_and_reply_trigger_reply_only() {
+    async fn mention_and_reply_are_noth_request() {
         for t in [trigger("hi", true, false), trigger("hi", false, true)] {
             let d = run(
                 &router(&[]),
                 json!({"trigger":[t]}),
-                vec![("intervention_action", intervention())],
+                vec![("addressee", addressee())],
             )
             .await;
-            assert_eq!(action(&d), "reply_only");
+            assert_eq!(action(&d), "noth_request");
         }
     }
 
@@ -254,10 +246,10 @@ mod tests {
         let d = run(
             &router(&["Noth"]),
             json!({"trigger":[trigger("hey NOTH!", false, false)]}),
-            vec![("intervention_action", intervention())],
+            vec![("addressee", addressee())],
         )
         .await;
-        assert_eq!(action(&d), "reply_only");
+        assert_eq!(action(&d), "noth_request");
     }
 
     #[test]
@@ -280,25 +272,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn otherwise_silent_with_full_probabilities() {
+    async fn otherwise_other_with_full_probabilities() {
         let d = run(
             &router(&["noth"]),
             json!({"trigger":[trigger("hello", false, false)]}),
-            vec![("intervention_action", intervention())],
+            vec![("addressee", addressee())],
         )
         .await;
         let Answer::Choice {
             choice,
             probabilities,
             confidence,
-        } = &d.answers["intervention_action"]
+        } = &d.answers["addressee"]
         else {
             panic!()
         };
-        assert_eq!(choice, "silent");
-        assert_eq!(probabilities.len(), 3);
-        assert_eq!(probabilities["silent"], 1.0);
-        assert_eq!(probabilities["spawn_task"], 0.0);
+        assert_eq!(choice, "other");
+        assert_eq!(probabilities.len(), 4);
+        assert_eq!(probabilities["other"], 1.0);
+        assert_eq!(probabilities["noth_request"], 0.0);
         assert_eq!(*confidence, 1.0);
     }
 
@@ -355,9 +347,9 @@ mod tests {
             instructions: String::new(),
             criteria: vec![("x".into(), String::new()), ("y".into(), String::new())],
         };
-        let tc = Question::Choice {
+        let reaction = Question::Choice {
             instructions: String::new(),
-            criteria: ["none", "web_research"]
+            criteria: ["none", "r0"]
                 .map(|n| (n.to_string(), String::new()))
                 .to_vec(),
         };
@@ -365,9 +357,9 @@ mod tests {
             &router(&[]),
             json!({}),
             vec![
-                ("is_noise_or_meme", noul()),
-                ("relevant_chunk_5", noul()),
-                ("task_category", tc),
+                ("needs_outside_work", noul()),
+                ("worth_supplement", noul()),
+                ("reaction", reaction),
                 ("mystery", noul()),
                 ("mystery_choice", unknown_choice),
                 ("mystery_score", score),
@@ -375,11 +367,11 @@ mod tests {
         )
         .await;
         assert_eq!(d.answers.len(), 6);
-        assert_eq!(d.answers["is_noise_or_meme"], Answer::Noul { p: 0.0 });
-        assert_eq!(d.answers["relevant_chunk_5"], Answer::Noul { p: 0.0 });
+        assert_eq!(d.answers["needs_outside_work"], Answer::Noul { p: 0.0 });
+        assert_eq!(d.answers["worth_supplement"], Answer::Noul { p: 0.0 });
         assert_eq!(d.answers["mystery"], Answer::Noul { p: 0.0 });
         assert!(
-            matches!(&d.answers["task_category"], Answer::Choice { choice, .. } if choice == "none")
+            matches!(&d.answers["reaction"], Answer::Choice { choice, .. } if choice == "none")
         );
         assert!(
             matches!(&d.answers["mystery_choice"], Answer::Choice { choice, .. } if choice == "x")
@@ -390,35 +382,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn addressed_to_noth_follows_mentions_replies_and_keywords() {
+    async fn addressee_follows_mentions_replies_and_keywords() {
         let ask = |trigger: serde_json::Value| async move {
             let d = run(
                 &router(&["noth"]),
                 json!({ "trigger": [trigger] }),
-                vec![("addressed_to_noth", noul())],
+                vec![("addressee", addressee())],
             )
             .await;
-            let Answer::Noul { p } = d.answers["addressed_to_noth"] else {
-                panic!("noul ではない");
+            let Answer::Choice { choice, .. } = &d.answers["addressee"] else {
+                panic!("choice ではない");
             };
-            p
+            choice == "noth_request"
         };
-        assert_eq!(
-            ask(json!({"content": "こんにちは", "mentions_self": true})).await,
-            1.0
-        );
-        assert_eq!(
-            ask(json!({"content": "はい", "reply_to_self": true})).await,
-            1.0
-        );
-        assert_eq!(ask(json!({"content": "noth、いる?"})).await, 1.0);
-        assert_eq!(ask(json!({"content": "ただの雑談"})).await, 0.0);
+        assert!(ask(json!({"content": "こんにちは", "mentions_self": true})).await);
+        assert!(ask(json!({"content": "はい", "reply_to_self": true})).await);
+        assert!(ask(json!({"content": "noth、いる?"})).await);
+        assert!(!ask(json!({"content": "ただの雑談"})).await);
     }
 
     #[tokio::test]
-    async fn health_and_limit() {
+    async fn health_check() {
         let r = router(&[]);
-        assert_eq!(r.max_questions(), 64);
         assert_eq!(r.health_check().await.unwrap(), "rule-based");
     }
 }

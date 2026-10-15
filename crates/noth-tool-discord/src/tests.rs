@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 use noth_core::store::Store;
-use noth_core::types::{IncomingMessage, ReplyTo, TaskCategory};
+use noth_core::types::{IncomingMessage, Origin, ReplyTo};
 
 const EVERYONE_READ: u64 = (1 << 10) | (1 << 16);
 const VIEW: u64 = 1 << 10;
@@ -157,7 +157,7 @@ fn tool_with(api: Arc<FakeApi>, actions: &[&'static str]) -> DiscordTool {
 fn ctx(history: Option<Arc<dyn noth_core::history::MessageHistory>>) -> ToolContext {
     ToolContext {
         run_id: "r".into(),
-        task_category: TaskCategory::WebResearch,
+        origin: Origin::Request,
         work_dir: std::env::temp_dir(),
         meter: None,
         history,
@@ -615,6 +615,7 @@ fn incoming(
         mentions_self: false,
         reply_to_self: false,
         reply_to: None,
+        bot_marker: None,
     }
 }
 

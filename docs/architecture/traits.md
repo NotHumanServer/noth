@@ -9,8 +9,8 @@ trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`as
 | 型 | 内容 |
 |---|---|
 | `Member` | `user_id`、表示名、ロール名の一覧 |
-| `IncomingMessage` | `guild_id`、`channel_id`、チャンネル名、`message_id`、`user_id`、投稿者の表示名、本文(`content` のみ)、時刻、`is_self`、Noth 宛てのメンションか、Noth の発言へのリプライか、Noth 以外の Bot の目印か(`bot_marker`。本文の代わりに目印の文字列を持つ)。チャンネル名と表示名は router の state に入れるため、メンション・リプライの有無は `router-mention` が使うため |
-| `Turn` | Layer 3 / 4 の1ブロック。`role`(user / assistant)、本文、種別(バッファ / トリガー / 応答 / 結論メモ / 関連チャンク)、`chunk_id` |
+| `IncomingMessage` | `guild_id`、`channel_id`、チャンネル名、`message_id`、`user_id`、投稿者の表示名、本文(`content` のみ)、時刻、`is_self`、Noth 宛てのメンションか、Noth の発言へのリプライか、Noth 以外の Bot の目印(`bot_marker: Option<BotMarker>`。`BotMarker` は Bot の表示名、リプライ先の表示名、字数(embed を含む)を持ち、`content` は空。目印は判定を起動しない: `triggers_judge()`)。チャンネル名と表示名は router の state に入れるため、メンション・リプライの有無は `router-mention` が使うため |
+| `Turn` | Layer 3 / 4 の1ブロック。`role`(user / assistant)、本文、種別(バッファ / トリガー / 応答 / 結論メモ。関連チャンクの種別は旧データの読み出し用に残す)、`chunk_id` |
 | `RouterState` | [context-layers.md §4.1](../context-layers.md#41-state-の組み立て) の JSON。`recent` には Bot の目印も同じ並びで入る |
 | `CompletionParams` | `max_tokens`。effort のようにモデルに依存する生成パラメータは provider の設定(例: `[provider.anthropic] effort`)に置き、Core は関与しない |
 | `ToolContext` | `run_id`、`origin`(`request` / `supplement` / `correction`)、作業ディレクトリ、承認ポリシーへの参照 |
@@ -70,8 +70,6 @@ pub struct Decision {
 #[async_trait]
 pub trait Router: Send + Sync {
     async fn decide(&self, state: &RouterState, questions: &[(String, Question)]) -> Result<Decision>;
-    /// 1リクエストに載せられる質問数。候補チャンクの数を決めるのに使う(Clef は 64。他の質問が 7 問なので候補は最大 57)
-    fn max_questions(&self) -> usize;
     /// `decisions.model` に記録する識別子(例: `jev/<版を固定した名前>`)。モデルごとの判定傾向を比べるため
     fn model_label(&self) -> String;
     async fn health_check(&self) -> Result<String>;

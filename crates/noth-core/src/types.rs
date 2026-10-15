@@ -31,6 +31,60 @@ pub struct IncomingMessage {
     /// Noth の発言へのリプライか。引用本文は読まず、参照先の author だけを見る
     pub reply_to_self: bool,
     pub reply_to: Option<ReplyTo>,
+    /// Noth 以外の Bot の発言の目印。Some のとき `content` は空で、判定の起動もデバウンスの更新もしない
+    #[serde(default)]
+    pub bot_marker: Option<BotMarker>,
+}
+
+impl IncomingMessage {
+    /// Bot どうしの応酬を起こさないため、目印と Noth 自身の発言は判定を起動しない
+    pub fn triggers_judge(&self) -> bool {
+        !self.is_self && self.bot_marker.is_none()
+    }
+}
+
+/// Noth 以外の Bot の発言を、本文を持たずに残す目印。Bot の本文は長く、外部の指示が紛れうるため
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotMarker {
+    /// 表示名。改行を除き、長さは Channel で制限済み
+    pub author_name: String,
+    /// リプライ先の表示名。`allowed_users` でなければ `<user>`。リプライでなければ None
+    pub reply_to_author: Option<String>,
+    /// `content` に embed のタイトル・説明・フィールドを足した文字数
+    pub chars: usize,
+}
+
+impl BotMarker {
+    /// Layer 3 / Layer 4 の発言行に入れる文字列。`message_id` は tool-discord で本文を読むための手がかり
+    pub fn render(&self, message_id: MessageId) -> String {
+        let reply = match &self.reply_to_author {
+            Some(a) => format!("{a} への返信、"),
+            None => String::new(),
+        };
+        format!(
+            "[Bot {} が発言({reply}約{}字。embed を含む) message_id: {message_id}]",
+            self.author_name,
+            approx_chars(self.chars),
+        )
+    }
+}
+
+/// 桁を丸めて「約」と読める字数にする。小さい数はそのまま
+pub(crate) fn approx_chars(chars: usize) -> String {
+    let rounded = match chars {
+        0..100 => chars,
+        100..1000 => chars.div_ceil(10) * 10,
+        _ => chars.div_ceil(100) * 100,
+    };
+    let s = rounded.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Discord のリプライ先。router の state と主 LLM の発言行に出す
@@ -105,6 +159,10 @@ pub struct Turn {
     pub chunk_id: Option<i64>,
 }
 
+/// router に渡す `state`(context-layers.md §4.1)。キーは `noth`(省略可)、`members`(省略可)、`trigger`、`recent`。
+/// `trigger[]` の `in_conversation_window` は、Noth が応答してから `conversation_window_secs` 以内の、話していた相手の発言であることを示す(決定的な noth_request ではなく、router への合図)。
+/// `recent` の各要素は `{channel_id, channel, author, at, is_self, reply_to?}` に、通常の発言なら `content` を、
+/// Bot の目印なら `content` の代わりに `bot_marker: {chars, count, reply_to?}` を持つ(同じチャンネルで同じ Bot の連続した目印は 1 つにまとめ、`count` は元の件数)。まとめた後の目印が 20 を超えると古い方を落とし、代わりに `{channel, at, omitted_bot_messages}` の要素を 1 つ入れる。関連チャンクの候補(`candidates`)は含めない
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterState(pub serde_json::Value);
 
@@ -245,13 +303,35 @@ pub enum ExchangeItem {
     ToolResults(Vec<ToolResult>),
 }
 
+/// Worker を起こした経緯。run の記録と、tool・Worker の指示文での扱いの区別に使う
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskCategory {
-    None,
-    WebResearch,
-    FactCheck,
-    CodeOrTool,
+pub enum Origin {
+    /// Noth への依頼(Ack を出して調べる)
+    Request,
+    /// 人どうしの発言の事実を黙って確かめる。投稿は必要なときだけ
+    Supplement,
+    /// Noth の誤りの指摘を受けて黙って調べ直す。投稿は必要なときだけ
+    Correction,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Request => "request",
+            Origin::Supplement => "supplement",
+            Origin::Correction => "correction",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "request" => Origin::Request,
+            "supplement" => Origin::Supplement,
+            "correction" => Origin::Correction,
+            _ => return None,
+        })
+    }
 }
 
 /// Worker を起動させた人と場所。tool が「依頼した人に見えるものだけ」を返すために使う
@@ -268,7 +348,7 @@ pub struct Audience {
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub run_id: String,
-    pub task_category: TaskCategory,
+    pub origin: Origin,
     pub work_dir: std::path::PathBuf,
     /// 有料 API の課金やレート制限の残りを Core に知らせる。None なら記録しない
     pub meter: Option<MeterSink>,
@@ -281,4 +361,36 @@ pub struct ToolContext {
 pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bot_marker_renders_like_the_design_example() {
+        let m = BotMarker {
+            author_name: "秘書ちゃん".into(),
+            reply_to_author: Some("くらず".into()),
+            chars: 1180,
+        };
+        assert_eq!(
+            m.render(123456789012345678),
+            "[Bot 秘書ちゃん が発言(くらず への返信、約1,200字。embed を含む) message_id: 123456789012345678]"
+        );
+        let m = BotMarker {
+            reply_to_author: None,
+            chars: 42,
+            ..m
+        };
+        assert!(m.render(1).contains("(約42字。"));
+    }
+
+    #[test]
+    fn origin_round_trips() {
+        for o in [Origin::Request, Origin::Supplement, Origin::Correction] {
+            assert_eq!(Origin::parse(o.as_str()), Some(o));
+        }
+        assert_eq!(Origin::parse("web_research"), None);
+    }
 }

@@ -24,7 +24,7 @@ Noth は少人数の Discord サーバーに常駐する AI エージェント�
 | module | Core の trait を実装する差し替え単位。`<種別>-<実装>` の名前を feature・クレート・設定・CLI で共通に使う |
 | 本線(Main Profile Engine) | サーバーの仲間として対話する LLM。Layer 0〜4 のプロンプトを受け取る |
 | Worker(Ephemeral Task Worker) | 本線から Fork して tool を使い、結論メモだけを返す使い捨ての LLM |
-| router(System One) | 文字列を生成せず確率付きの判定だけを返す。介入判定・ノイズ判定・話題区切り・関連チャンク選択・合流判定 |
+| router(System One) | 文字列を生成せず確率付きの判定だけを返す。介入判定・ノイズ判定・話題区切り・合流判定 |
 | TopicChunk | 話題の区切りでまとめた Layer 3 の単位。チャンネルごとに持つ |
 | Layer 0〜4 | 本線プロンプトの層。0 は Harness Rules、1 は Profile、2 は Episodic Digest、3 は Active Clean Log、4 は Ephemeral Tail。Layer 0〜3 は追記専用で、Layer 4 だけを毎ターン差し替える |
 | 本線 actor | Context Layer Manager。本線の状態を持つ唯一の writer で、`Judge` / `Join` / `Compact` を1本のキューから順に処理する |

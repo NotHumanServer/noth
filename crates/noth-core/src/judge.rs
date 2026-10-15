@@ -1,29 +1,27 @@
-//! router に渡す質問セットと state の構築、回答の二値化。context-layers.md §4
-use std::collections::{HashMap, HashSet};
+//! router に渡す質問セットと state の構築、回答の二値化、行動の決定。context-layers.md §4
+use std::collections::HashSet;
 
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
-use crate::config::{Reaction, RouterSection, Thresholds};
-use crate::store::{ChunkRow, MessageRow};
+use crate::config::{QuestionTexts, Reaction, RouterSection, Thresholds};
+use crate::markers::{self, Folded};
+use crate::store::MessageRow;
 use crate::text::contains_any_name;
 use crate::traits::{Answer, Decision, Question};
 use crate::types::*;
 
 pub const KEY_NOISE: &str = "is_noise_or_meme";
-pub const KEY_TOPIC_SHIFT: &str = "is_topic_shift";
-pub const KEY_ADDRESSED: &str = "addressed_to_noth";
-pub const KEY_ACTION: &str = "intervention_action";
-pub const KEY_TASK_CATEGORY: &str = "task_category";
-pub const KEY_DELIVERY: &str = "delivery_style";
+pub const KEY_ADDRESSEE: &str = "addressee";
+pub const KEY_NEEDS_OUTSIDE_WORK: &str = "needs_outside_work";
+pub const KEY_CORRECTS_NOTH: &str = "corrects_noth";
+pub const KEY_WORTH_SUPPLEMENT: &str = "worth_supplement";
 pub const KEY_REACTION: &str = "reaction";
+pub const KEY_TOPIC_SHIFT: &str = "is_topic_shift";
+pub const KEY_DELIVERY: &str = "delivery_style";
 
-/// `is_noise_or_meme` など固定の質問の数。候補チャンクの上限は `max_questions() - FIXED_QUESTIONS`
-pub const FIXED_QUESTIONS: usize = 6;
-
-pub fn relevant_key(chunk_id: i64) -> String {
-    format!("relevant_chunk_{chunk_id}")
-}
+/// `reaction` の「付けない」。先頭に置く(同点は先頭が選ばれ、付けない側が安全なため)
+pub const REACTION_NONE: &str = "none";
 
 /// デバウンス後の発言群。ingest がチャンネル単位でまとめるので、複数チャンネルにまたがらない
 #[derive(Debug, Clone)]
@@ -47,13 +45,81 @@ pub struct PendingMessage {
     pub reply_to: Option<ReplyTo>,
 }
 
+/// 最後の発言は誰に向けたものか。宣言順が `addressee` の選択肢の並びで、同点は先頭(`Other`)が採られる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Addressee {
+    Other,
+    AboutNoth,
+    OtherBot,
+    NothRequest,
+}
+
+impl Addressee {
+    pub const ALL: [Addressee; 4] = [
+        Addressee::Other,
+        Addressee::AboutNoth,
+        Addressee::OtherBot,
+        Addressee::NothRequest,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Addressee::Other => "other",
+            Addressee::AboutNoth => "about_noth",
+            Addressee::OtherBot => "other_bot",
+            Addressee::NothRequest => "noth_request",
+        }
+    }
+}
+
+/// router の回答を二値化したもの。回答が欠けている・型が違う項目は安全側(`safe()`)の値になる
+#[derive(Debug, Clone, PartialEq)]
+pub struct JudgeAnswers {
+    pub is_noise: bool,
+    pub addressee: Addressee,
+    pub needs_outside_work: bool,
+    pub corrects_noth: bool,
+    pub worth_supplement: bool,
+    /// 付ける絵文字。`none` が選ばれたとき、絵文字が決まらないとき、`[[router.reactions]]` が空のときは None
+    pub reaction: Option<String>,
+    pub is_topic_shift: bool,
+}
+
+impl JudgeAnswers {
+    /// 名指しされた発言をノイズとして落とすと、応答した発言が Layer 3 に無く会話が成り立たないので、Noth への依頼はノイズにしない
+    pub fn is_noise_for(&self, cued: bool) -> bool {
+        self.is_noise && !cued && self.addressee != Addressee::NothRequest
+    }
+
+    /// router が使えないときの値。何も起こさず、バッファには通常どおり入る
+    pub fn safe() -> Self {
+        Self {
+            is_noise: false,
+            addressee: Addressee::Other,
+            needs_outside_work: false,
+            corrects_noth: false,
+            worth_supplement: false,
+            reaction: None,
+            is_topic_shift: false,
+        }
+    }
+}
+
+/// 二値化した回答から Core が決める動き方(§4.3)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// 何もしない
     Silent,
     /// 発言はせず、トリガーの最後の発言に絵文字リアクションだけ付ける
     React,
+    /// main が返事をする(パターン B)
     ReplyOnly,
+    /// Worker に回す。Ack を出して調べる(パターン C)
     SpawnTask,
+    /// 黙って Worker を起動し、人どうしの発言の事実を確かめる(パターン C'。`Origin::Supplement`)
+    SilentSupplement,
+    /// 黙って Worker を起動し、Noth の誤りの指摘を調べ直す(パターン C'。`Origin::Correction`)
+    SilentCorrection,
 }
 
 impl Action {
@@ -63,11 +129,123 @@ impl Action {
             Action::React => "react",
             Action::ReplyOnly => "reply_only",
             Action::SpawnTask => "spawn_task",
+            Action::SilentSupplement => "silent_supplement",
+            Action::SilentCorrection => "silent_correction",
+        }
+    }
+
+    /// Worker を起こす動きなら、その `Origin`
+    pub fn origin(self) -> Option<Origin> {
+        match self {
+            Action::SpawnTask => Some(Origin::Request),
+            Action::SilentSupplement => Some(Origin::Supplement),
+            Action::SilentCorrection => Some(Origin::Correction),
+            _ => None,
         }
     }
 }
 
-/// Worker 合流時の報告の仕方(§4.3)
+/// `decide_action` の入力。閾値は二値化(`binarize`)で適用済み
+#[derive(Debug, Clone, Copy)]
+pub struct ActionInput<'a> {
+    pub answers: &'a JudgeAnswers,
+    /// Noth へのメンション、または Noth の発言へのリプライ。続きの窓は含まない(router への合図で、決定的には扱わない)。
+    /// router の回答や失敗に関係なく `noth_request` として扱う
+    pub cued: bool,
+    /// `JudgeAnswers::is_noise_for(cued)` の結果。ノイズには補足も訂正もリアクションも起こさない
+    pub noise: bool,
+    pub worker_enabled: bool,
+    /// 補足の最短間隔と 1 日の上限に当たっていないか。当たっていれば補足せず、訂正の判定に進む
+    pub supplement_allowed: bool,
+}
+
+/// §4.3 の表。Worker を起こす行は、`worker_enabled` が false なら `ReplyOnly`(noth_request)か、
+/// それ以外の行(リアクションの判定を含む)に進む
+pub fn decide_action(input: &ActionInput) -> Action {
+    let a = input.answers;
+    if input.noise {
+        return Action::Silent;
+    }
+    let addressee = if input.cued {
+        Addressee::NothRequest
+    } else {
+        a.addressee
+    };
+    let worker = input.worker_enabled;
+    match addressee {
+        Addressee::NothRequest if worker && (a.needs_outside_work || a.corrects_noth) => {
+            Action::SpawnTask
+        }
+        Addressee::NothRequest => Action::ReplyOnly,
+        Addressee::AboutNoth if worker && a.corrects_noth => Action::SilentCorrection,
+        Addressee::AboutNoth if a.reaction.is_some() => Action::React,
+        Addressee::Other if worker && a.worth_supplement && input.supplement_allowed => {
+            Action::SilentSupplement
+        }
+        Addressee::Other if worker && a.corrects_noth => Action::SilentCorrection,
+        // other_bot は corrects_noth が高くても調べ直さない
+        _ => Action::Silent,
+    }
+}
+
+fn reaction_key(index: usize) -> String {
+    format!("r{index}")
+}
+
+/// `reactions` が空ならリアクションの質問は出さない
+pub fn build_questions(texts: &QuestionTexts, reactions: &[Reaction]) -> Vec<(String, Question)> {
+    let t = &texts.addressee;
+    let criteria_of = |a: Addressee| {
+        let text = match a {
+            Addressee::Other => &t.other,
+            Addressee::AboutNoth => &t.about_noth,
+            Addressee::OtherBot => &t.other_bot,
+            Addressee::NothRequest => &t.noth_request,
+        };
+        (a.as_str().to_string(), text.clone())
+    };
+    let noul = |key: &str, instructions: &str| {
+        (
+            key.to_string(),
+            Question::Noul {
+                instructions: instructions.to_string(),
+            },
+        )
+    };
+    let mut qs = vec![
+        noul(KEY_NOISE, &texts.is_noise_or_meme),
+        (
+            KEY_ADDRESSEE.to_string(),
+            Question::Choice {
+                instructions: t.instructions.clone(),
+                criteria: Addressee::ALL.into_iter().map(criteria_of).collect(),
+            },
+        ),
+        noul(KEY_NEEDS_OUTSIDE_WORK, &texts.needs_outside_work),
+        noul(KEY_CORRECTS_NOTH, &texts.corrects_noth),
+        noul(KEY_WORTH_SUPPLEMENT, &texts.worth_supplement),
+    ];
+    if !reactions.is_empty() {
+        let mut criteria = vec![(REACTION_NONE.to_string(), texts.reaction.none.clone())];
+        criteria.extend(
+            reactions
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (reaction_key(i), format!("{} {}", r.emoji, r.meaning))),
+        );
+        qs.push((
+            KEY_REACTION.to_string(),
+            Question::Choice {
+                instructions: texts.reaction.instructions.clone(),
+                criteria,
+            },
+        ));
+    }
+    qs.push(noul(KEY_TOPIC_SHIFT, &texts.is_topic_shift));
+    qs
+}
+
+/// Worker 合流時の報告の仕方(§4.5)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryStyle {
     NormalReport,
@@ -89,181 +267,10 @@ impl DeliveryStyle {
 
 const DELIVERY_STYLES: [&str; 4] = ["normal_report", "brief_supplement", "reply_anchor", "abort"];
 
-const ACTIONS: [&str; 4] = ["silent", "react", "reply_only", "spawn_task"];
-const CATEGORIES: [&str; 4] = ["none", "web_research", "fact_check", "code_or_tool"];
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Binarized {
-    pub is_noise: bool,
-    pub is_topic_shift: bool,
-    pub action: Action,
-    pub task_category: TaskCategory,
-    /// 関連と判定された候補チャンクの ID(候補の並び順)
-    pub relevant: Vec<i64>,
-    /// action が React のときに付ける絵文字
-    pub reaction: Option<String>,
-}
-
-impl Binarized {
-    /// router が使えないときの値。何も起こさず、バッファにも通常どおり入る
-    pub fn safe() -> Self {
-        Self {
-            is_noise: false,
-            is_topic_shift: false,
-            action: Action::Silent,
-            task_category: TaskCategory::None,
-            relevant: Vec::new(),
-            reaction: None,
-        }
-    }
-
-    /// 名指しされたのに確率や confidence 次第で無視すると利用者には故障に見えるので、router の判定より優先して応答する。
-    /// リアクションは無視ではなく応答なので、お礼への 🙏 のような判定はそのまま活かす
-    pub fn answer_direct_call(&mut self) {
-        self.is_noise = false;
-        if self.action == Action::Silent {
-            self.action = Action::ReplyOnly;
-        }
-    }
-
-    /// worker 無効、または category が none の spawn_task は reply_only に読み替える(§4.2, パターン C)
-    pub fn effective_action(&self, worker_enabled: bool) -> Action {
-        match self.action {
-            Action::SpawnTask if !worker_enabled || self.task_category == TaskCategory::None => {
-                Action::ReplyOnly
-            }
-            a => a,
-        }
-    }
-}
-
-fn reaction_key(index: usize) -> String {
-    format!("r{index}")
-}
-
-/// `reactions` が空ならリアクションの選択肢も質問も出さない
-pub fn build_questions(candidates: &[ChunkRow], reactions: &[Reaction]) -> Vec<(String, Question)> {
-    let mut action_criteria = vec![(
-        "silent".to_string(),
-        "静観する。Noth は何も発言しない".to_string(),
-    )];
-    if !reactions.is_empty() {
-        action_criteria.push((
-            "react".into(),
-            "発言はせず、絵文字リアクションだけ付ける。話すほどではないが気になる・興味があるとき"
-                .into(),
-        ));
-    }
-    action_criteria.extend([
-        (
-            "reply_only".to_string(),
-            "Noth が会話に返答する。調査や作業は要らない".to_string(),
-        ),
-        (
-            "spawn_task".to_string(),
-            "Noth が返答し、同時にウェブ調査やツールを使った作業を背景で始める".to_string(),
-        ),
-    ]);
-    let react_hint = if reactions.is_empty() {
-        ""
-    } else {
-        "口を挟むほどではないが、Noth が興味を持ちそうな話題、気になる知らせ、思わず反応したくなる発言には react を選びます。\
-            ただし何にでも反応すると鬱陶しいので、ありふれた雑談や事務的なやりとりには付けません。"
-    };
-    let mut qs = vec![
-        (
-            KEY_NOISE.to_string(),
-            Question::Noul {
-                instructions: "今回のトリガー発言群が、スタンプや絵文字の連打、同じ文面のコピペ連投、意味のない短い反応の羅列など、\
-                    後から読み返しても文脈上の価値がないノイズやミームかを判定してください。\
-                    短くても質問・意見・情報・感情の表明を含む発言はノイズではありません。迷うときはノイズではないとしてください。"
-                    .into(),
-            },
-        ),
-        (
-            KEY_TOPIC_SHIFT.to_string(),
-            Question::Noul {
-                instructions: "今回のトリガー発言群が、同じチャンネルの直前の会話(recent のうち同じ channel_id の発言)から\
-                    話題が切り替わったかを判定してください。同じ話題の続きや、少し脱線しただけの発言は切り替わりではありません。\
-                    別のチャンネルの発言は無関係として扱い、そのチャンネルに直前の発言がなければ切り替わりではないとしてください。"
-                    .into(),
-            },
-        ),
-        (
-            KEY_ADDRESSED.to_string(),
-            Question::Noul {
-                instructions: "今回のトリガー発言群が、Noth に向けたものかを判定してください。\
-                    Noth への質問や依頼、Noth 自身(その仕組みや設定、できることを含む)についての問いかけ、\
-                    Noth の発言への返事は、Noth に向けたものです。Noth が何者かは state.noth を参考にしてください。\
-                    人間同士が Noth を話題にしているだけで、Noth に話しかけていない発言は含みません。"
-                    .into(),
-            },
-        ),
-        (
-            KEY_ACTION.to_string(),
-            Question::Choice {
-                instructions: format!("Noth はこのサーバーの仲間の一人で、少人数の自然な雑談には口を挟みすぎない存在です。\
-                    トリガー発言群に対して Noth が何をするかを選んでください。\
-                    Noth への呼びかけ(メンション、Noth の発言へのリプライ、Noth に向けた質問や依頼)には応えます。\
-                    calls_noth_by_name が true の発言は本文に Noth の呼び名を含みます。Noth に話しかけているなら応え、\
-                    Noth の開発や設定について人間同士で話しているだけなら静観します。\
-                    Noth が直前に答えた話題の続きで、明らかに Noth に向けた返事のときも応えます。\
-                    人間同士の雑談や独り言、すでに会話が成立している流れには入らず、静観します。{react_hint}\
-                    迷うときは静観を選んでください。"
-                ),
-                criteria: action_criteria,
-            },
-        ),
-        (
-            KEY_TASK_CATEGORY.to_string(),
-            Question::Choice {
-                instructions: "トリガー発言群が Noth に求めている作業の種類を選んでください。\
-                    ウェブでの調べもの、事実確認、コードの実行やツールを使った作業のいずれにも当たらない会話は none です。"
-                    .into(),
-                criteria: vec![
-                    ("none".into(), "調査や作業は不要".into()),
-                    ("web_research".into(), "ウェブで情報を調べる必要がある".into()),
-                    ("fact_check".into(), "発言内容の事実確認が必要".into()),
-                    ("code_or_tool".into(), "コードの実行やツールを使った作業が必要".into()),
-                ],
-            },
-        ),
-    ];
-    if !reactions.is_empty() {
-        qs.push((
-            KEY_REACTION.to_string(),
-            Question::Choice {
-                instructions: "Noth がトリガー発言群の最後の発言に絵文字リアクションを付けるとしたら、どれが一番自然かを選んでください。\
-                    発言の内容と、それを読んだ Noth の気持ちに合うものを選びます。"
-                    .into(),
-                criteria: reactions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (reaction_key(i), format!("{} {}", r.emoji, r.meaning)))
-                    .collect(),
-            },
-        ));
-    }
-    for c in candidates {
-        qs.push((
-            relevant_key(c.id),
-            Question::Noul {
-                instructions: format!(
-                    "candidates のうち id={} (要約: {}) の過去の会話が、今回のトリガー発言群に答えたり文脈を補ったりするために\
-                     読み返す価値があるほど関連しているかを判定してください。話題が同じでも、今回の発言の理解に役立たないなら関連なしとしてください。",
-                    c.id, c.summary
-                ),
-            },
-        ));
-    }
-    qs
-}
-
-pub fn join_questions() -> Vec<(String, Question)> {
-    vec![(
-        KEY_DELIVERY.to_string(),
-        Question::Choice {
-            instructions: "Noth はメンバーに頼まれた調べものや作業を背景で進めていて、それが終わりました。\
+pub fn join_questions(origin: Origin) -> Vec<(String, Question)> {
+    let (instructions, criteria) = match origin {
+        Origin::Request => (
+            "Noth はメンバーに頼まれた調べものや作業を背景で進めていて、それが終わりました。\
                 task は依頼の内容(goal)と結果です。result が concluded なら memo は結論メモ、failed なら memo は失敗の理由です。\
                 since_fork は作業を始めてから今までに届いた全チャンネルの発言で、is_self が true のものは Noth 自身の発言です。\
                 since_fork を読んで、この結果をどう伝えるかを選んでください。\
@@ -271,14 +278,51 @@ pub fn join_questions() -> Vec<(String, Question)> {
                 task.channel の会話がすでに別の話題に移っていて、普通に報告すると流れを遮るなら reply_anchor です。\
                 依頼が取り消された、もう誰も気にしていない、結果に伝える価値がないなら abort です。\
                 調べられなかった(failed)ことも、依頼した人が答えを待っているなら伝える価値があります。\
-                どれにも当たらず、会話がまだその話題の上にあるなら normal_report です。"
-                .into(),
-            criteria: vec![
-                ("normal_report".into(), "会話の流れの中で結果を普通に報告する".into()),
-                ("brief_supplement".into(), "人間側で自己解決しているので、補足として短く伝える".into()),
-                ("reply_anchor".into(), "話題が移っているので、元の依頼へのリプライとして報告する".into()),
-                ("abort".into(), "報告しない".into()),
+                どれにも当たらず、会話がまだその話題の上にあるなら normal_report です。",
+            [
+                ("normal_report", "会話の流れの中で結果を普通に報告する"),
+                (
+                    "brief_supplement",
+                    "人間側で自己解決しているので、補足として短く伝える",
+                ),
+                (
+                    "reply_anchor",
+                    "話題が移っているので、元の依頼へのリプライとして報告する",
+                ),
+                ("abort", "報告しない"),
             ],
+        ),
+        // 誰にも頼まれていない調べ直しなので、人どうしの会話がすでに解決していれば黙る側に倒す
+        Origin::Supplement | Origin::Correction => (
+            "Noth は、人どうしの会話の中の発言を、誰にも頼まれずに黙って調べました。\
+                task は調べた発言(goal)と結果で、memo は結論メモです。\
+                since_fork は調べ始めてから今までに届いた全チャンネルの発言で、is_self が true のものは Noth 自身の発言です。\
+                since_fork を読んで、補足や訂正を投稿する価値がまだあるかを選んでください。\
+                人どうしですでに解決した、誰かが同じ指摘をした、話題が移って割り込むと流れを遮るなら abort です。\
+                会話がまだその話題の上にあり、この結果が役に立つなら normal_report です。\
+                迷うときは abort にしてください。",
+            [
+                ("normal_report", "会話の流れの中で補足を投稿する"),
+                (
+                    "brief_supplement",
+                    "すでに一部は出ているので、足りない点だけを短く投稿する",
+                ),
+                (
+                    "reply_anchor",
+                    "話題は移ったが、元の発言へのリプライなら通じるので投稿する",
+                ),
+                ("abort", "投稿しない"),
+            ],
+        ),
+    };
+    vec![(
+        KEY_DELIVERY.to_string(),
+        Question::Choice {
+            instructions: instructions.into(),
+            criteria: criteria
+                .into_iter()
+                .map(|(n, d)| (n.to_string(), d.to_string()))
+                .collect(),
         },
     )]
 }
@@ -295,22 +339,7 @@ pub struct JoinInput<'a> {
 
 /// `state_max_chars` を超える間は since_fork の古い発言から捨て、それでも超えるなら memo を削る
 pub fn build_join_state(input: &JoinInput, cfg: &RouterSection) -> RouterState {
-    let since_fork: Vec<Value> = input
-        .since_fork
-        .iter()
-        .map(|r| {
-            let mut v = json!({
-                "channel_id": r.channel_id.to_string(),
-                "channel": r.channel_name,
-                "author": r.author_name,
-                "content": r.content,
-                "at": rfc3339(r.created_at),
-                "is_self": r.is_self,
-            });
-            insert_reply_to(&mut v, r.reply_to.as_ref());
-            v
-        })
-        .collect();
+    let since_fork = fold_entries(input.since_fork);
     let mut state = json!({
         "task": {
             "run_id": input.run_id,
@@ -384,10 +413,9 @@ pub struct Roster<'a> {
 pub fn build_state(
     batch: &JudgeBatch,
     recent: &[MessageRow],
-    candidates: &[ChunkRow],
-    channel_names: &HashMap<ChannelId, String>,
     roster: &Roster,
     cfg: &RouterSection,
+    in_window: &dyn Fn(&PendingMessage) -> bool,
 ) -> RouterState {
     let trigger_ids: HashSet<i64> = batch.messages.iter().map(|m| m.row_id).collect();
     let trigger: Vec<Value> = batch
@@ -403,42 +431,22 @@ pub fn build_state(
                 "mentions_self": m.mentions_self,
                 "reply_to_self": m.reply_to_self,
                 "calls_noth_by_name": contains_any_name(&m.content, &cfg.call_names),
+                "in_conversation_window": in_window(m),
             });
             insert_reply_to(&mut v, m.reply_to.as_ref());
             v
         })
         .collect();
 
-    let mut recent: Vec<Value> = recent
+    let others: Vec<MessageRow> = recent
         .iter()
         .filter(|r| !trigger_ids.contains(&r.id))
-        .map(|r| {
-            let mut v = json!({
-                "channel_id": r.channel_id.to_string(),
-                "channel": r.channel_name,
-                "author": r.author_name,
-                "content": r.content,
-                "at": rfc3339(r.created_at),
-                "is_self": r.is_self,
-            });
-            insert_reply_to(&mut v, r.reply_to.as_ref());
-            v
-        })
+        .cloned()
         .collect();
+    let mut recent = fold_entries(&others);
     if recent.len() > cfg.recent_messages {
         recent.drain(..recent.len() - cfg.recent_messages);
     }
-
-    let candidates: Vec<Value> = candidates
-        .iter()
-        .map(|c| {
-            let channel = channel_names
-                .get(&c.channel_id)
-                .cloned()
-                .unwrap_or_else(|| c.channel_id.to_string());
-            json!({ "id": c.id, "channel": channel, "summary": c.summary })
-        })
-        .collect();
 
     let mut state = json!({});
     if !roster.noth.is_empty() {
@@ -467,7 +475,6 @@ pub fn build_state(
     }
     state["trigger"] = json!(trigger);
     state["recent"] = json!(recent);
-    state["candidates"] = json!(candidates);
     while char_len(&state) > cfg.state_max_chars {
         let recent = state["recent"].as_array_mut().expect("recent は配列");
         if recent.is_empty() {
@@ -485,7 +492,7 @@ pub fn build_state(
     if excess > 0 {
         shrink_text_at(&mut state, &["noth"], excess);
     }
-    // recent を空にしても収まらないのは、trigger か候補要約が単独で大きいとき。router に上限を超えて渡さない
+    // recent を空にしても収まらないのは、trigger が単独で大きいとき。router に上限を超えて渡さない
     loop {
         let excess = char_len(&state).saturating_sub(cfg.state_max_chars);
         if excess == 0 || !shrink_longest_text(&mut state, excess) {
@@ -493,6 +500,51 @@ pub fn build_state(
         }
     }
     RouterState(state)
+}
+
+/// 連続した目印はまとめ、まとめた後の数が上限を超えたら古い方を落とす。router が「Bot とのやりとりの最中だ」と分かればよい
+fn fold_entries(rows: &[MessageRow]) -> Vec<Value> {
+    markers::fold(rows, markers::MAX_MARKER_RUNS)
+        .into_iter()
+        .map(|item| match item {
+            Folded::Row(r) => {
+                let mut v = json!({
+                    "channel_id": r.channel_id.to_string(),
+                    "channel": r.channel_name,
+                    "author": r.author_name,
+                    "content": r.content,
+                    "at": rfc3339(r.created_at),
+                    "is_self": r.is_self,
+                });
+                insert_reply_to(&mut v, r.reply_to.as_ref());
+                v
+            }
+            // 目印は本文を持たないので `content` の代わりに `bot_marker` を入れる
+            Folded::Markers(run) => {
+                let mut marker = json!({ "chars": run.chars, "count": run.count });
+                if let Some(reply_to) = &run.reply_to_author {
+                    marker["reply_to"] = json!(reply_to);
+                }
+                json!({
+                    "channel_id": run.channel_id.to_string(),
+                    "channel": run.channel_name,
+                    "author": run.author_name,
+                    "at": rfc3339(run.at),
+                    "is_self": false,
+                    "bot_marker": marker,
+                })
+            }
+            Folded::Omitted {
+                count,
+                channel_name,
+                at,
+            } => json!({
+                "channel": channel_name,
+                "at": rfc3339(at),
+                "omitted_bot_messages": count,
+            }),
+        })
+        .collect()
 }
 
 /// `path` の文字列を末尾から `excess` 文字ぶん削る。空になったら key ごと外す
@@ -556,26 +608,23 @@ fn shrink_longest_member_memory(state: &mut Value, excess: usize) -> bool {
     true
 }
 
-/// trigger の本文と候補の要約のうち最長のものを `excess` 文字ぶん削る。削れるものが無ければ false
+/// trigger の本文のうち最長のものを `excess` 文字ぶん削る。削れるものが無ければ false
 fn shrink_longest_text(state: &mut Value, excess: usize) -> bool {
-    let mut longest: Option<(&str, usize, &str, usize)> = None;
-    for (section, field) in [("trigger", "content"), ("candidates", "summary")] {
-        let Some(items) = state[section].as_array() else {
-            continue;
-        };
-        for (i, item) in items.iter().enumerate() {
-            let len = item[field].as_str().map_or(0, |t| t.chars().count());
-            if len > 0 && longest.is_none_or(|(_, _, _, l)| len > l) {
-                longest = Some((section, i, field, len));
-            }
-        }
-    }
-    let Some((section, i, field, len)) = longest else {
+    let Some(items) = state["trigger"].as_array() else {
         return false;
     };
-    let text = state[section][i][field].as_str().unwrap_or_default();
+    let longest = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| (i, item["content"].as_str().map_or(0, |t| t.chars().count())))
+        .filter(|(_, len)| *len > 0)
+        .max_by_key(|(_, len)| *len);
+    let Some((i, len)) = longest else {
+        return false;
+    };
+    let text = state["trigger"][i]["content"].as_str().unwrap_or_default();
     let shortened: String = text.chars().take(len.saturating_sub(excess)).collect();
-    state[section][i][field] = Value::String(shortened);
+    state["trigger"][i]["content"] = Value::String(shortened);
     true
 }
 
@@ -617,97 +666,32 @@ fn pick_choice(
     }
 }
 
-/// `none` が他の category と同点のとき、none 以外のうち先頭を採る。
-/// Noth 宛ての依頼で none を採ると依頼が直答に読み替えられ、作業が始まらない
-fn pick_task_category(decision: &Decision, min_confidence: f32, addressed: bool) -> Option<String> {
-    let picked = pick_choice(decision, KEY_TASK_CATEGORY, &CATEGORIES, min_confidence);
-    if !addressed || picked.as_deref() != Some("none") {
-        return picked;
-    }
-    let Some(Answer::Choice { probabilities, .. }) = decision.answers.get(KEY_TASK_CATEGORY) else {
-        return picked;
-    };
-    let none_p = probabilities.get("none").copied().unwrap_or(0.0);
-    CATEGORIES[1..]
-        .iter()
-        .find(|c| {
-            probabilities
-                .get(**c)
-                .is_some_and(|p| *p > 0.0 && *p >= none_p)
-        })
-        .map(|c| c.to_string())
-        .or(picked)
-}
-
-/// 回答が欠けている・型が違う・confidence が足りない項目は安全側の値になる
-/// `called_by_name` のときは介入判定の confidence を問わず、応答側の確率の合計が `name_call_reply` 以上なら応答する。
-/// Clef は「のすくーん？」のような呼びかけでも静観を最大確率にしがちなため
-pub fn binarize(
-    decision: &Decision,
-    candidate_ids: &[i64],
-    reactions: &[Reaction],
-    th: &Thresholds,
-    called_by_name: bool,
-    addressed_to_noth: bool,
-) -> Binarized {
+/// 回答が欠けている・型が違う項目は安全側の値になる。
+/// `addressee` と `reaction` に confidence の足切りはかけない(Jev の confidence は1位の確率の言い直しで効かないため)
+pub fn binarize(decision: &Decision, reactions: &[Reaction], th: &Thresholds) -> JudgeAnswers {
     let noul = |key: &str, threshold: f32| matches!(decision.answers.get(key), Some(Answer::Noul { p }) if *p >= threshold);
 
-    let action_min_confidence = if called_by_name {
-        0.0
-    } else {
-        th.min_confidence
-    };
-    let mut action =
-        match pick_choice(decision, KEY_ACTION, &ACTIONS, action_min_confidence).as_deref() {
-            Some("react") if !reactions.is_empty() => Action::React,
-            Some("reply_only") => Action::ReplyOnly,
-            Some("spawn_task") => Action::SpawnTask,
-            _ => Action::Silent,
-        };
+    let addressee_names: Vec<&str> = Addressee::ALL.iter().map(|a| a.as_str()).collect();
+    let addressee = pick_choice(decision, KEY_ADDRESSEE, &addressee_names, 0.0)
+        .and_then(|name| Addressee::ALL.into_iter().find(|a| a.as_str() == name))
+        .unwrap_or(Addressee::Other);
+
     let reaction_keys: Vec<String> = (0..reactions.len()).map(reaction_key).collect();
-    let reaction_options: Vec<&str> = reaction_keys.iter().map(String::as_str).collect();
-    let reaction = pick_choice(decision, KEY_REACTION, &reaction_options, th.min_confidence)
+    let mut reaction_options: Vec<&str> = vec![REACTION_NONE];
+    reaction_options.extend(reaction_keys.iter().map(String::as_str));
+    let reaction = pick_choice(decision, KEY_REACTION, &reaction_options, 0.0)
         .and_then(|key| reaction_keys.iter().position(|k| *k == key))
         .map(|i| reactions[i].emoji.clone());
-    // 絵文字が決まらないなら付けようがないので、何もしない側に倒す
-    if action == Action::React && reaction.is_none() {
-        action = Action::Silent;
-    }
-    if called_by_name
-        && matches!(action, Action::Silent | Action::React)
-        && let Some(Answer::Choice { probabilities, .. }) = decision.answers.get(KEY_ACTION)
-    {
-        let p = |k: &str| probabilities.get(k).copied().unwrap_or(0.0);
-        if p("reply_only") + p("spawn_task") >= th.name_call_reply {
-            action = Action::ReplyOnly;
-        }
-    }
-    let addressed =
-        called_by_name || addressed_to_noth || noul(KEY_ADDRESSED, th.addressed_to_noth);
-    let task_category = match pick_task_category(decision, th.min_confidence, addressed).as_deref()
-    {
-        Some("web_research") => TaskCategory::WebResearch,
-        Some("fact_check") => TaskCategory::FactCheck,
-        Some("code_or_tool") => TaskCategory::CodeOrTool,
-        _ => TaskCategory::None,
-    };
-    let mut binarized = Binarized {
+
+    JudgeAnswers {
         is_noise: noul(KEY_NOISE, th.is_noise_or_meme),
-        is_topic_shift: noul(KEY_TOPIC_SHIFT, th.is_topic_shift),
-        action,
-        task_category,
-        relevant: candidate_ids
-            .iter()
-            .copied()
-            .filter(|id| noul(&relevant_key(*id), th.relevant_chunk))
-            .collect(),
+        addressee,
+        needs_outside_work: noul(KEY_NEEDS_OUTSIDE_WORK, th.needs_outside_work),
+        corrects_noth: noul(KEY_CORRECTS_NOTH, th.corrects_noth),
+        worth_supplement: noul(KEY_WORTH_SUPPLEMENT, th.worth_supplement),
         reaction,
-    };
-    // 「誰に向けた発言か」と「割り込むべきか」を 1 問で聞くと Noth の仕組みの質問が静観されやすいので、宛先だけを別に聞く
-    if noul(KEY_ADDRESSED, th.addressed_to_noth) {
-        binarized.answer_direct_call();
+        is_topic_shift: noul(KEY_TOPIC_SHIFT, th.is_topic_shift),
     }
-    binarized
 }
 
 /// `decisions.answers` に入れる JSON。閾値の調整や分析のため、二値化前の確率と confidence をそのまま残す
@@ -768,118 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn name_call_replies_when_reply_side_is_likely_enough() {
-        let th = Thresholds::default();
-        let silent_top = |reply: f32| {
-            let mut probabilities = HashMap::new();
-            probabilities.insert("silent".to_string(), 1.0 - reply);
-            probabilities.insert("reply_only".to_string(), reply);
-            probabilities.insert("spawn_task".to_string(), 0.0);
-            decision(vec![(
-                KEY_ACTION,
-                Answer::Choice {
-                    choice: "silent".into(),
-                    probabilities,
-                    confidence: 0.3,
-                },
-            )])
-        };
-        assert_eq!(
-            binarize(&silent_top(0.29), &[], &[], &th, true, false).action,
-            Action::ReplyOnly
-        );
-        assert_eq!(
-            binarize(&silent_top(0.29), &[], &[], &th, false, false).action,
-            Action::Silent
-        );
-        assert_eq!(
-            binarize(&silent_top(0.1), &[], &[], &th, true, false).action,
-            Action::Silent
-        );
-    }
-
-    #[test]
-    fn category_tie_with_none_yields_to_task_when_addressed() {
-        let th = Thresholds::default();
-        let tied = || Answer::Choice {
-            choice: "none".into(),
-            probabilities: [
-                ("none", 0.45),
-                ("web_research", 0.1),
-                ("code_or_tool", 0.45),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-            confidence: 0.9,
-        };
-        let d = decision(vec![(KEY_TASK_CATEGORY, tied())]);
-        assert_eq!(
-            binarize(&d, &[], &[], &th, false, false).task_category,
-            TaskCategory::None
-        );
-        assert_eq!(
-            binarize(&d, &[], &[], &th, false, true).task_category,
-            TaskCategory::CodeOrTool
-        );
-        assert_eq!(
-            binarize(&d, &[], &[], &th, true, false).task_category,
-            TaskCategory::CodeOrTool
-        );
-        // 宛先の確率が足りていれば、引数なしでも同じ
-        let d = decision(vec![
-            (KEY_TASK_CATEGORY, tied()),
-            (KEY_ADDRESSED, Answer::Noul { p: 0.9 }),
-        ]);
-        assert_eq!(
-            binarize(&d, &[], &[], &th, false, false).task_category,
-            TaskCategory::CodeOrTool
-        );
-        // 全部 0 なら採るものが無いので none のまま
-        let zero = Answer::Choice {
-            choice: "none".into(),
-            probabilities: CATEGORIES.iter().map(|c| (c.to_string(), 0.0)).collect(),
-            confidence: 0.9,
-        };
-        let d = decision(vec![(KEY_TASK_CATEGORY, zero)]);
-        assert_eq!(
-            binarize(&d, &[], &[], &th, false, true).task_category,
-            TaskCategory::None
-        );
-        // none の方が高ければ none のまま
-        let d = decision(vec![(
-            KEY_TASK_CATEGORY,
-            choice("none", 0.9, 0.9, &CATEGORIES),
-        )]);
-        assert_eq!(
-            binarize(&d, &[], &[], &th, false, true).task_category,
-            TaskCategory::None
-        );
-    }
-
-    #[test]
-    fn thresholds_and_low_confidence() {
-        let th = Thresholds::default();
-        let d = decision(vec![
-            (KEY_NOISE, Answer::Noul { p: 0.7 }),
-            (KEY_TOPIC_SHIFT, Answer::Noul { p: 0.59 }),
-            (KEY_ACTION, choice("reply_only", 0.9, 0.05, &ACTIONS)),
-            (
-                KEY_TASK_CATEGORY,
-                choice("web_research", 0.9, 0.9, &CATEGORIES),
-            ),
-            ("relevant_chunk_5", Answer::Noul { p: 0.5 }),
-            ("relevant_chunk_6", Answer::Noul { p: 0.1 }),
-        ]);
-        let b = binarize(&d, &[5, 6], &[], &th, false, false);
-        assert!(b.is_noise);
-        assert!(!b.is_topic_shift);
-        assert_eq!(b.action, Action::Silent);
-        assert_eq!(b.task_category, TaskCategory::WebResearch);
-        assert_eq!(b.relevant, vec![5]);
-    }
-
-    #[test]
     fn oversized_trigger_is_truncated_to_fit() {
         let cfg = RouterSection {
             state_max_chars: 500,
@@ -899,7 +771,7 @@ mod tests {
                 reply_to: None,
             }],
         };
-        let state = build_state(&batch, &[], &[], &HashMap::new(), &Roster::default(), &cfg);
+        let state = build_state(&batch, &[], &Roster::default(), &cfg, &|_| false);
         assert!(char_len(&state.0) <= 500);
         assert!(
             !state.0["trigger"][0]["content"]
@@ -907,19 +779,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn missing_answers_are_safe() {
-        let b = binarize(
-            &decision(vec![]),
-            &[1],
-            &[],
-            &Thresholds::default(),
-            false,
-            false,
-        );
-        assert_eq!(b, Binarized::safe());
     }
 
     #[test]
@@ -959,17 +818,6 @@ mod tests {
         assert_eq!(state.0["task"]["result"], "concluded");
     }
 
-    #[test]
-    fn spawn_task_reads_as_reply_only_without_worker() {
-        let mut b = Binarized::safe();
-        b.action = Action::SpawnTask;
-        b.task_category = TaskCategory::WebResearch;
-        assert_eq!(b.effective_action(false), Action::ReplyOnly);
-        assert_eq!(b.effective_action(true), Action::SpawnTask);
-        b.task_category = TaskCategory::None;
-        assert_eq!(b.effective_action(true), Action::ReplyOnly);
-    }
-
     fn reactions() -> Vec<Reaction> {
         vec![
             Reaction {
@@ -981,45 +829,6 @@ mod tests {
                 meaning: "気になる".into(),
             },
         ]
-    }
-
-    #[test]
-    fn react_is_offered_only_with_reactions() {
-        let with = build_questions(&[], &reactions());
-        assert!(with.iter().any(|(k, _)| k == KEY_REACTION));
-        let Some((_, Question::Choice { criteria, .. })) =
-            with.iter().find(|(k, _)| k == KEY_ACTION)
-        else {
-            panic!("intervention_action が無い");
-        };
-        assert!(criteria.iter().any(|(n, _)| n == "react"));
-        assert_eq!(with.len(), FIXED_QUESTIONS);
-
-        let without = build_questions(&[], &[]);
-        assert!(!without.iter().any(|(k, _)| k == KEY_REACTION));
-        let Some((_, Question::Choice { criteria, .. })) =
-            without.iter().find(|(k, _)| k == KEY_ACTION)
-        else {
-            panic!("intervention_action が無い");
-        };
-        assert!(!criteria.iter().any(|(n, _)| n == "react"));
-    }
-
-    #[test]
-    fn react_picks_emoji_and_survives_direct_call() {
-        let d = decision(vec![
-            (KEY_ACTION, choice("react", 0.9, 0.9, &ACTIONS)),
-            (KEY_REACTION, choice("r1", 0.9, 0.9, &["r0", "r1"])),
-        ]);
-        let mut b = binarize(&d, &[], &reactions(), &Thresholds::default(), false, false);
-        assert_eq!(b.action, Action::React);
-        assert_eq!(b.reaction.as_deref(), Some("👀"));
-        b.answer_direct_call();
-        assert_eq!(b.action, Action::React);
-
-        // 設定でリアクションを空にしていれば react の回答は静観になる
-        let b = binarize(&d, &[], &[], &Thresholds::default(), false, false);
-        assert_eq!(b.action, Action::Silent);
     }
 
     #[test]
@@ -1046,7 +855,7 @@ mod tests {
             messages: vec![pending(1, Some(reply)), pending(2, None)],
         };
         let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
-        let state = build_state(&batch, &[], &[], &HashMap::new(), &Roster::default(), &cfg);
+        let state = build_state(&batch, &[], &Roster::default(), &cfg, &|_| false);
         assert_eq!(
             state.0["trigger"][0]["reply_to"],
             json!({"author": "bob", "is_self": true, "excerpt": "元の発言"})
@@ -1096,14 +905,7 @@ mod tests {
                 (3, "- 他人".into()),
             ],
         };
-        let state = build_state(
-            &one_message_batch(),
-            &[],
-            &[],
-            &HashMap::new(),
-            &roster,
-            &cfg,
-        );
+        let state = build_state(&one_message_batch(), &[], &roster, &cfg, &|_| false);
         assert_eq!(state.0["noth"], "Noth は Bot");
         assert_eq!(
             state.0["members"],
@@ -1116,14 +918,9 @@ mod tests {
         );
 
         // 記憶もメンバーも無ければ key ごと省く
-        let state = build_state(
-            &one_message_batch(),
-            &[],
-            &[],
-            &HashMap::new(),
-            &Roster::default(),
-            &cfg,
-        );
+        let state = build_state(&one_message_batch(), &[], &Roster::default(), &cfg, &|_| {
+            false
+        });
         assert!(state.0.get("noth").is_none());
         assert!(state.0.get("members").is_none());
     }
@@ -1149,6 +946,7 @@ mod tests {
                 is_noise: None,
                 decision_id: None,
                 promoted_turn_id: None,
+                bot_marker: None,
             })
             .collect();
         let members = [member("alice", &[]), member("bob", &[])];
@@ -1163,15 +961,7 @@ mod tests {
                 state_max_chars: max,
                 ..serde_json::from_value(json!({})).unwrap()
             };
-            build_state(
-                &one_message_batch(),
-                recent,
-                &[],
-                &HashMap::new(),
-                &roster,
-                &cfg,
-            )
-            .0
+            build_state(&one_message_batch(), recent, &roster, &cfg, &|_| false).0
         };
         let full = char_len(&build(usize::MAX, &recent));
         let base = char_len(&build(usize::MAX, &[]));
@@ -1211,42 +1001,6 @@ mod tests {
     }
 
     #[test]
-    fn addressed_to_noth_lifts_silent_to_reply() {
-        let th = Thresholds::default();
-        let silent = || (KEY_ACTION, choice("silent", 0.9, 0.9, &ACTIONS));
-        let b = binarize(
-            &decision(vec![silent(), (KEY_ADDRESSED, Answer::Noul { p: 0.6 })]),
-            &[],
-            &[],
-            &th,
-            false,
-            false,
-        );
-        assert_eq!(b.action, Action::ReplyOnly);
-
-        let b = binarize(
-            &decision(vec![silent(), (KEY_ADDRESSED, Answer::Noul { p: 0.59 })]),
-            &[],
-            &[],
-            &th,
-            false,
-            false,
-        );
-        assert_eq!(b.action, Action::Silent);
-
-        // ノイズ判定より優先し、react はそのまま残す
-        let d = decision(vec![
-            (KEY_NOISE, Answer::Noul { p: 0.9 }),
-            (KEY_ADDRESSED, Answer::Noul { p: 0.9 }),
-            (KEY_ACTION, choice("react", 0.9, 0.9, &ACTIONS)),
-            (KEY_REACTION, choice("r0", 0.9, 0.9, &["r0", "r1"])),
-        ]);
-        let b = binarize(&d, &[], &reactions(), &th, false, false);
-        assert!(!b.is_noise);
-        assert_eq!(b.action, Action::React);
-    }
-
-    #[test]
     fn recent_carries_reply_to_when_present() {
         let row = |id: i64, reply_to: Option<ReplyTo>| MessageRow {
             id,
@@ -1266,6 +1020,7 @@ mod tests {
             is_noise: None,
             decision_id: None,
             promoted_turn_id: None,
+            bot_marker: None,
         };
         let reply = ReplyTo {
             message_id: 7,
@@ -1278,10 +1033,9 @@ mod tests {
         let state = build_state(
             &one_message_batch(),
             &recent,
-            &[],
-            &HashMap::new(),
             &Roster::default(),
             &cfg,
+            &|_| false,
         );
         assert_eq!(
             state.0["recent"][0]["reply_to"],
@@ -1298,18 +1052,392 @@ mod tests {
         };
         let mut batch = one_message_batch();
         batch.messages[0].content = "あ".repeat(2000);
-        let state = build_state(&batch, &[], &[], &HashMap::new(), &Roster::default(), &cfg);
+        let state = build_state(&batch, &[], &Roster::default(), &cfg, &|_| false);
         assert!(state.0.get("members").is_none());
         assert!(state.0.get("noth").is_none());
         assert!(char_len(&state.0) <= 600);
     }
 
+    const ADDRESSEES: [&str; 4] = ["other", "about_noth", "other_bot", "noth_request"];
+
+    fn texts() -> QuestionTexts {
+        QuestionTexts::default()
+    }
+
+    fn answers(f: impl FnOnce(&mut JudgeAnswers)) -> JudgeAnswers {
+        let mut a = JudgeAnswers::safe();
+        f(&mut a);
+        a
+    }
+
+    fn act(a: &JudgeAnswers, cued: bool, worker_enabled: bool) -> Action {
+        decide_action(&ActionInput {
+            answers: a,
+            cued,
+            noise: false,
+            worker_enabled,
+            supplement_allowed: true,
+        })
+    }
+
     #[test]
-    fn addressed_question_is_a_noul() {
-        let qs = build_questions(&[], &[]);
+    fn questions_follow_the_set_and_reaction_starts_with_none() {
+        let qs = build_questions(&texts(), &reactions());
+        let keys: Vec<&str> = qs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "is_noise_or_meme",
+                "addressee",
+                "needs_outside_work",
+                "corrects_noth",
+                "worth_supplement",
+                "reaction",
+                "is_topic_shift"
+            ]
+        );
+        assert_eq!(qs.len(), 7);
+        let Some((_, Question::Choice { criteria, .. })) =
+            qs.iter().find(|(k, _)| k == KEY_ADDRESSEE)
+        else {
+            panic!("addressee は choice");
+        };
+        let names: Vec<&str> = criteria.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ADDRESSEES);
+        let Some((_, Question::Choice { criteria, .. })) =
+            qs.iter().find(|(k, _)| k == KEY_REACTION)
+        else {
+            panic!("reaction は choice");
+        };
+        let names: Vec<&str> = criteria.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["none", "r0", "r1"]);
+        assert_eq!(criteria[1].1, "👍 同意");
+
+        let without = build_questions(&texts(), &[]);
+        assert!(!without.iter().any(|(k, _)| k == KEY_REACTION));
+        assert_eq!(without.len(), 6);
+    }
+
+    #[test]
+    fn question_texts_can_be_overridden_from_config() {
+        let cfg: RouterSection = serde_json::from_value(json!({
+            "questions": { "addressee": { "other_bot": "別の Bot" }, "corrects_noth": "訂正？" }
+        }))
+        .unwrap();
+        let qs = build_questions(&cfg.questions, &[]);
+        let Some((
+            _,
+            Question::Choice {
+                criteria,
+                instructions,
+            },
+        )) = qs.iter().find(|(k, _)| k == KEY_ADDRESSEE)
+        else {
+            panic!("addressee は choice");
+        };
+        assert_eq!(criteria[2].1, "別の Bot");
+        assert_eq!(instructions, "最後の発言は誰に向けたものか");
         assert!(matches!(
-            qs.iter().find(|(k, _)| k == KEY_ADDRESSED),
-            Some((_, Question::Noul { .. }))
+            qs.iter().find(|(k, _)| k == KEY_CORRECTS_NOTH),
+            Some((_, Question::Noul { instructions })) if instructions == "訂正？"
         ));
+    }
+
+    #[test]
+    fn binarize_applies_thresholds_and_picks_first_on_tie() {
+        let th = Thresholds::default();
+        let d = decision(vec![
+            (
+                KEY_ADDRESSEE,
+                choice("noth_request", 0.9, 0.05, &ADDRESSEES),
+            ),
+            (KEY_NEEDS_OUTSIDE_WORK, Answer::Noul { p: 0.5 }),
+            (KEY_CORRECTS_NOTH, Answer::Noul { p: 0.49 }),
+            (KEY_WORTH_SUPPLEMENT, Answer::Noul { p: 0.7 }),
+            (KEY_TOPIC_SHIFT, Answer::Noul { p: 0.59 }),
+            (KEY_REACTION, choice("r1", 0.9, 0.0, &["none", "r0", "r1"])),
+        ]);
+        let b = binarize(&d, &reactions(), &th);
+        // confidence が低くても addressee は足切りしない
+        assert_eq!(b.addressee, Addressee::NothRequest);
+        assert!(b.needs_outside_work && !b.corrects_noth && b.worth_supplement);
+        assert!(!b.is_topic_shift);
+        assert_eq!(b.reaction.as_deref(), Some("👀"));
+
+        let tied = Answer::Choice {
+            choice: "noth_request".into(),
+            probabilities: ADDRESSEES.iter().map(|a| (a.to_string(), 0.25)).collect(),
+            confidence: 0.5,
+        };
+        let b = binarize(&decision(vec![(KEY_ADDRESSEE, tied)]), &[], &th);
+        assert_eq!(b.addressee, Addressee::Other);
+    }
+
+    #[test]
+    fn reaction_none_and_empty_reactions_give_no_emoji() {
+        let th = Thresholds::default();
+        let d = decision(vec![(
+            KEY_REACTION,
+            choice("none", 0.9, 0.9, &["none", "r0", "r1"]),
+        )]);
+        assert_eq!(binarize(&d, &reactions(), &th).reaction, None);
+        let d = decision(vec![(
+            KEY_REACTION,
+            choice("r0", 0.9, 0.9, &["none", "r0"]),
+        )]);
+        assert_eq!(binarize(&d, &[], &th).reaction, None);
+    }
+
+    #[test]
+    fn missing_answers_are_safe() {
+        assert_eq!(
+            binarize(&decision(vec![]), &reactions(), &Thresholds::default()),
+            JudgeAnswers::safe()
+        );
+    }
+
+    #[test]
+    fn cue_makes_noth_request_regardless_of_router() {
+        let safe = JudgeAnswers::safe();
+        assert_eq!(act(&safe, true, true), Action::ReplyOnly);
+        let outside = answers(|a| a.needs_outside_work = true);
+        assert_eq!(act(&outside, true, true), Action::SpawnTask);
+        assert_eq!(act(&outside, true, false), Action::ReplyOnly);
+        assert_eq!(act(&outside, false, true), Action::Silent);
+        let corrects = answers(|a| a.corrects_noth = true);
+        assert_eq!(act(&corrects, true, true), Action::SpawnTask);
+    }
+
+    #[test]
+    fn about_noth_reacts_or_corrects_but_other_does_not_react() {
+        let about = |f: fn(&mut JudgeAnswers)| {
+            answers(|a| {
+                a.addressee = Addressee::AboutNoth;
+                f(a);
+            })
+        };
+        assert_eq!(act(&about(|_| {}), false, true), Action::Silent);
+        assert_eq!(
+            act(&about(|a| a.reaction = Some("👍".into())), false, true),
+            Action::React
+        );
+        assert_eq!(
+            act(&about(|a| a.corrects_noth = true), false, true),
+            Action::SilentCorrection
+        );
+        // worker が無ければ訂正はできないので、リアクションの判定に進む
+        assert_eq!(
+            act(&about(|a| a.corrects_noth = true), false, false),
+            Action::Silent
+        );
+        assert_eq!(
+            act(
+                &about(|a| {
+                    a.corrects_noth = true;
+                    a.reaction = Some("👍".into());
+                }),
+                false,
+                false
+            ),
+            Action::React
+        );
+        let other_with_reaction = answers(|a| a.reaction = Some("👍".into()));
+        assert_eq!(act(&other_with_reaction, false, true), Action::Silent);
+    }
+
+    #[test]
+    fn other_supplements_within_budget_and_other_bot_stays_silent() {
+        let supplement = answers(|a| a.worth_supplement = true);
+        assert_eq!(act(&supplement, false, true), Action::SilentSupplement);
+        assert_eq!(act(&supplement, false, false), Action::Silent);
+        let over_budget = ActionInput {
+            answers: &supplement,
+            cued: false,
+            noise: false,
+            worker_enabled: true,
+            supplement_allowed: false,
+        };
+        assert_eq!(decide_action(&over_budget), Action::Silent);
+
+        let both = answers(|a| {
+            a.worth_supplement = true;
+            a.corrects_noth = true;
+        });
+        assert_eq!(act(&both, false, true), Action::SilentSupplement);
+        let over_budget = ActionInput {
+            answers: &both,
+            ..over_budget
+        };
+        assert_eq!(decide_action(&over_budget), Action::SilentCorrection);
+
+        let bot = answers(|a| {
+            a.addressee = Addressee::OtherBot;
+            a.corrects_noth = true;
+            a.worth_supplement = true;
+        });
+        assert_eq!(act(&bot, false, true), Action::Silent);
+    }
+
+    #[test]
+    fn action_maps_to_origin() {
+        assert_eq!(Action::SpawnTask.origin(), Some(Origin::Request));
+        assert_eq!(Action::SilentSupplement.origin(), Some(Origin::Supplement));
+        assert_eq!(Action::SilentCorrection.origin(), Some(Origin::Correction));
+        assert_eq!(Action::ReplyOnly.origin(), None);
+    }
+
+    #[test]
+    fn recent_carries_bot_marker_without_content() {
+        let marker = MessageRow {
+            id: 101,
+            guild_id: 1,
+            channel_id: 1,
+            channel_name: "general".into(),
+            message_id: 9,
+            user_id: 5,
+            author_name: "秘書ちゃん".into(),
+            is_self: false,
+            mentions_self: false,
+            reply_to_self: false,
+            reply_to: None,
+            content: String::new(),
+            created_at: Timestamp::UNIX_EPOCH,
+            chunk_id: None,
+            is_noise: None,
+            decision_id: None,
+            promoted_turn_id: None,
+            bot_marker: Some(BotMarker {
+                author_name: "秘書ちゃん".into(),
+                reply_to_author: Some("くらず".into()),
+                chars: 1200,
+            }),
+        };
+        let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
+        let state = build_state(
+            &one_message_batch(),
+            &[marker],
+            &Roster::default(),
+            &cfg,
+            &|_| false,
+        );
+        let entry = &state.0["recent"][0];
+        assert_eq!(entry["author"], "秘書ちゃん");
+        assert_eq!(
+            entry["bot_marker"],
+            json!({"chars": 1200, "count": 1, "reply_to": "くらず"})
+        );
+        assert!(entry.get("content").is_none());
+        assert!(state.0.get("candidates").is_none());
+    }
+
+    #[test]
+    fn join_state_since_fork_carries_bot_marker_without_content() {
+        let marker = MessageRow {
+            id: 101,
+            guild_id: 1,
+            channel_id: 1,
+            channel_name: "general".into(),
+            message_id: 9,
+            user_id: 5,
+            author_name: "秘書ちゃん".into(),
+            is_self: false,
+            mentions_self: false,
+            reply_to_self: false,
+            reply_to: None,
+            content: String::new(),
+            created_at: Timestamp::UNIX_EPOCH,
+            chunk_id: None,
+            is_noise: None,
+            decision_id: None,
+            promoted_turn_id: None,
+            bot_marker: Some(BotMarker {
+                author_name: "秘書ちゃん".into(),
+                reply_to_author: None,
+                chars: 300,
+            }),
+        };
+        let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
+        let state = build_join_state(
+            &JoinInput {
+                run_id: "r1",
+                goal: "g",
+                channel: "general",
+                concluded: true,
+                memo: "m",
+                since_fork: &[marker],
+            },
+            &cfg,
+        );
+        let entry = &state.0["since_fork"][0];
+        assert_eq!(entry["bot_marker"]["chars"], 300);
+        assert!(entry.get("content").is_none());
+    }
+
+    #[test]
+    fn noise_is_dropped_unless_addressed_to_noth() {
+        let th = Thresholds::default();
+        let d = decision(vec![
+            (KEY_NOISE, Answer::Noul { p: 0.5 }),
+            (KEY_ADDRESSEE, choice("other", 0.9, 0.9, &ADDRESSEES)),
+        ]);
+        let b = binarize(&d, &[], &th);
+        assert!(b.is_noise_for(false));
+        assert!(
+            !b.is_noise_for(true),
+            "メンションやリプライはノイズにしない"
+        );
+
+        let d = decision(vec![
+            (KEY_NOISE, Answer::Noul { p: 0.9 }),
+            (KEY_ADDRESSEE, choice("noth_request", 0.9, 0.9, &ADDRESSEES)),
+        ]);
+        assert!(!binarize(&d, &[], &th).is_noise_for(false));
+        let d = decision(vec![(KEY_NOISE, Answer::Noul { p: 0.49 })]);
+        assert!(!binarize(&d, &[], &th).is_noise);
+    }
+
+    #[test]
+    fn window_hint_is_carried_per_trigger_message() {
+        let cfg: RouterSection = serde_json::from_value(json!({})).unwrap();
+        let mut batch = one_message_batch();
+        let mut second = batch.messages[0].clone();
+        second.row_id = 2;
+        second.author_name = "bob".into();
+        batch.messages.push(second);
+        let state = build_state(&batch, &[], &Roster::default(), &cfg, &|m| {
+            m.author_name == "alice"
+        });
+        assert_eq!(state.0["trigger"][0]["in_conversation_window"], true);
+        assert_eq!(state.0["trigger"][1]["in_conversation_window"], false);
+    }
+
+    #[test]
+    fn noise_wakes_nothing_up() {
+        let a = answers(|a| {
+            a.worth_supplement = true;
+            a.corrects_noth = true;
+            a.addressee = Addressee::AboutNoth;
+            a.reaction = Some("👍".into());
+        });
+        let input = |noise, cued| ActionInput {
+            answers: &a,
+            cued,
+            noise,
+            worker_enabled: true,
+            supplement_allowed: true,
+        };
+        assert_eq!(decide_action(&input(true, false)), Action::Silent);
+        // 依頼はノイズにならない(`is_noise_for` が false を返す)ので、noise=false で呼ばれ、行動する
+        assert_eq!(decide_action(&input(false, true)), Action::SpawnTask);
+    }
+
+    #[test]
+    fn join_questions_for_silent_runs_default_to_abort_wording() {
+        let text = |o| match &join_questions(o)[0].1 {
+            Question::Choice { instructions, .. } => instructions.clone(),
+            _ => panic!("choice"),
+        };
+        assert!(text(Origin::Request).contains("頼まれた"));
+        assert!(text(Origin::Supplement).contains("迷うときは abort"));
     }
 }

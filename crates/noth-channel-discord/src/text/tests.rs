@@ -158,3 +158,66 @@ fn split_hard_cuts_multibyte_by_char() {
     );
     assert_eq!(chunks.concat(), text);
 }
+
+#[test]
+fn bot_account_becomes_marker_but_webhook_is_dropped() {
+    assert_eq!(
+        classify_author(false, true, false, false, false),
+        AuthorKind::Bot
+    );
+    assert_eq!(
+        classify_author(false, true, false, false, true),
+        AuthorKind::Bot
+    );
+    assert_eq!(
+        classify_author(false, true, true, false, false),
+        AuthorKind::Drop
+    );
+    assert_eq!(
+        classify_author(false, false, true, true, false),
+        AuthorKind::Drop
+    );
+}
+
+#[test]
+fn self_and_humans_keep_existing_rules() {
+    assert_eq!(
+        classify_author(true, true, false, false, true),
+        AuthorKind::Own
+    );
+    assert_eq!(
+        classify_author(false, false, false, true, false),
+        AuthorKind::Member
+    );
+    assert_eq!(
+        classify_author(false, false, false, false, false),
+        AuthorKind::Drop
+    );
+    assert_eq!(
+        classify_author(false, false, false, true, true),
+        AuthorKind::Drop
+    );
+}
+
+#[test]
+fn bot_name_drops_newlines_and_is_limited() {
+    assert_eq!(bot_display_name("秘書\nちゃん\r"), "秘書 ちゃん");
+    assert_eq!(bot_display_name(&"あ".repeat(100)).chars().count(), 32);
+}
+
+#[test]
+fn message_chars_counts_content_and_embed_text() {
+    let embed: sn::Embed = serde_json::from_value(serde_json::json!({
+        "title": "title",
+        "description": "あいう",
+        "fields": [{"name": "ab", "value": "cde", "inline": false}],
+    }))
+    .unwrap();
+    assert_eq!(message_chars("hello", &[embed]), 5 + 5 + 3 + 2 + 3);
+    assert_eq!(message_chars("", &[]), 0);
+}
+
+#[test]
+fn bot_name_cannot_fake_marker_brackets() {
+    assert_eq!(bot_display_name("x] [Bot 偽"), "x］ ［Bot 偽");
+}

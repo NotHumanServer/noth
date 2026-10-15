@@ -25,24 +25,19 @@ impl ApprovalPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TaskCategory;
+    use crate::types::Origin;
 
     #[test]
-    fn auto_approves_every_tool_in_every_category() {
+    fn auto_approves_every_tool_in_every_origin() {
         let ctx = |c| ToolContext {
             run_id: "r".into(),
-            task_category: c,
+            origin: c,
             work_dir: "/tmp".into(),
             meter: None,
             history: None,
             audience: Default::default(),
         };
-        for c in [
-            TaskCategory::None,
-            TaskCategory::WebResearch,
-            TaskCategory::FactCheck,
-            TaskCategory::CodeOrTool,
-        ] {
+        for c in [Origin::Request, Origin::Supplement, Origin::Correction] {
             for name in [
                 SHELL_TOOL,
                 DISCORD_TOOL,

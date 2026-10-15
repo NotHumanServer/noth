@@ -50,6 +50,8 @@ pub struct MessageRow {
     pub is_noise: Option<bool>,
     pub decision_id: Option<i64>,
     pub promoted_turn_id: Option<i64>,
+    /// Some なら Noth 以外の Bot の目印で、`content` は空
+    pub bot_marker: Option<BotMarker>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,8 +61,6 @@ pub struct ChunkRow {
     pub channel_id: ChannelId,
     pub started_at: Timestamp,
     pub ended_at: Timestamp,
-    /// 候補用の機械要約(冒頭数件の発言をつないだもの)
-    pub summary: String,
     pub compacted: bool,
 }
 
@@ -119,7 +119,7 @@ impl RunStatus {
 pub struct WorkerRunRow {
     pub run_id: String,
     pub status: RunStatus,
-    pub task_category: TaskCategory,
+    pub origin: Origin,
     pub goal: String,
     /// queued の間は None。running になった時刻
     pub started_at: Option<Timestamp>,
@@ -167,19 +167,16 @@ pub struct CostSummaryRow {
 pub struct NewWorkerRun {
     pub run_id: String,
     pub goal: String,
-    pub task_category: TaskCategory,
+    pub origin: Origin,
     pub channel_id: ChannelId,
     pub chunk_id: i64,
     pub trigger_message_id: Option<MessageId>,
     pub fork_message_id: i64,
 }
 
-/// 機械要約の上限。候補用なので短く保つ
-const SUMMARY_MAX_CHARS: usize = 200;
-
-const MESSAGE_COLUMNS: &str = "id, guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, reply_to_message_id, reply_to_author, reply_to_is_self, reply_to_excerpt, content, created_at, chunk_id, is_noise, decision_id, promoted_turn_id";
-const CHUNK_COLUMNS: &str = "id, guild_id, channel_id, started_at, ended_at, summary, compacted";
-const RUN_COLUMNS: &str = "run_id, status, task_category, goal, started_at, finished_at, channel_id, chunk_id, trigger_message_id, fork_message_id, conclusion, delivery_style";
+const MESSAGE_COLUMNS: &str = "id, guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, reply_to_message_id, reply_to_author, reply_to_is_self, reply_to_excerpt, content, created_at, chunk_id, is_noise, decision_id, promoted_turn_id, is_bot_marker, bot_marker_chars";
+const CHUNK_COLUMNS: &str = "id, guild_id, channel_id, started_at, ended_at, compacted";
+const RUN_COLUMNS: &str = "run_id, status, origin, goal, started_at, finished_at, channel_id, chunk_id, trigger_message_id, fork_message_id, conclusion, delivery_style";
 
 fn ts(ms: i64) -> Timestamp {
     // 範囲外の値は壊れた行なので epoch に倒す(読み出しで panic させない)
@@ -209,7 +206,21 @@ fn message_row(r: &SqliteRow) -> Result<MessageRow> {
         is_noise: r.try_get("is_noise")?,
         decision_id: r.try_get("decision_id")?,
         promoted_turn_id: r.try_get("promoted_turn_id")?,
+        bot_marker: bot_marker_of(r)?,
     })
+}
+
+fn bot_marker_of(r: &SqliteRow) -> Result<Option<BotMarker>> {
+    if !r.try_get::<bool, _>("is_bot_marker")? {
+        return Ok(None);
+    }
+    Ok(Some(BotMarker {
+        author_name: r.try_get("author_name")?,
+        reply_to_author: r.try_get("reply_to_author")?,
+        chars: r
+            .try_get::<Option<i64>, _>("bot_marker_chars")?
+            .unwrap_or(0) as usize,
+    }))
 }
 
 fn reply_to_of(r: &SqliteRow) -> Result<Option<ReplyTo>> {
@@ -237,21 +248,19 @@ fn chunk_row(r: &SqliteRow) -> Result<ChunkRow> {
         channel_id: r.try_get::<i64, _>("channel_id")? as u64,
         started_at: ts(r.try_get("started_at")?),
         ended_at: ts(r.try_get("ended_at")?),
-        summary: r.try_get("summary")?,
         compacted: r.try_get("compacted")?,
     })
 }
 
 fn run_row(r: &SqliteRow) -> Result<WorkerRunRow> {
     let status: String = r.try_get("status")?;
-    let category: String = r.try_get("task_category")?;
+    let origin: String = r.try_get("origin")?;
     Ok(WorkerRunRow {
         run_id: r.try_get("run_id")?,
         status: RunStatus::parse(&status)
             .ok_or_else(|| Error::Other(format!("worker_runs: 未知の status {status:?}")))?,
-        task_category: parse_category(&category).ok_or_else(|| {
-            Error::Other(format!("worker_runs: 未知の task_category {category:?}"))
-        })?,
+        origin: Origin::parse(&origin)
+            .ok_or_else(|| Error::Other(format!("worker_runs: 未知の origin {origin:?}")))?,
         goal: r.try_get("goal")?,
         started_at: r.try_get::<Option<i64>, _>("started_at")?.map(ts),
         finished_at: r.try_get::<Option<i64>, _>("finished_at")?.map(ts),
@@ -263,25 +272,6 @@ fn run_row(r: &SqliteRow) -> Result<WorkerRunRow> {
         fork_message_id: r.try_get("fork_message_id")?,
         conclusion: r.try_get("conclusion")?,
         delivery_style: r.try_get("delivery_style")?,
-    })
-}
-
-pub fn category_str(c: TaskCategory) -> &'static str {
-    match c {
-        TaskCategory::None => "none",
-        TaskCategory::WebResearch => "web_research",
-        TaskCategory::FactCheck => "fact_check",
-        TaskCategory::CodeOrTool => "code_or_tool",
-    }
-}
-
-fn parse_category(s: &str) -> Option<TaskCategory> {
-    Some(match s {
-        "none" => TaskCategory::None,
-        "web_research" => TaskCategory::WebResearch,
-        "fact_check" => TaskCategory::FactCheck,
-        "code_or_tool" => TaskCategory::CodeOrTool,
-        _ => return None,
     })
 }
 
@@ -338,8 +328,8 @@ impl Store {
     // --- messages ---
     pub async fn insert_message(&self, msg: &IncomingMessage) -> Result<i64> {
         let r = sqlx::query(
-            "INSERT INTO messages (guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, content, created_at, reply_to_message_id, reply_to_author, reply_to_is_self, reply_to_excerpt)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, content, created_at, reply_to_message_id, reply_to_author, reply_to_is_self, reply_to_excerpt, is_bot_marker, bot_marker_chars)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(msg.guild_id as i64)
         .bind(msg.channel_id as i64)
@@ -352,10 +342,20 @@ impl Store {
         .bind(msg.reply_to_self)
         .bind(&msg.content)
         .bind(msg.timestamp.as_millisecond())
-        .bind(msg.reply_to.as_ref().map(|r| r.message_id as i64))
-        .bind(msg.reply_to.as_ref().map(|r| r.author_name.as_str()))
+        .bind(
+            msg.reply_to
+                .as_ref()
+                .filter(|_| msg.bot_marker.is_none())
+                .map(|r| r.message_id as i64),
+        )
+        .bind(match &msg.bot_marker {
+            Some(m) => m.reply_to_author.as_deref(),
+            None => msg.reply_to.as_ref().map(|r| r.author_name.as_str()),
+        })
         .bind(msg.reply_to.as_ref().map(|r| r.is_self))
         .bind(msg.reply_to.as_ref().map(|r| r.excerpt.as_str()))
+        .bind(msg.bot_marker.is_some())
+        .bind(msg.bot_marker.as_ref().map(|m| m.chars as i64))
         .execute(&self.pool)
         .await?;
         Ok(r.last_insert_rowid())
@@ -376,6 +376,20 @@ impl Store {
             .bind(chunk_id)
             .bind(is_noise)
             .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // 目印は判定を起こさないので、次の判定に付き添って recent と Layer 3 に現れる
+        if let Some(last) = ids.iter().max() {
+            sqlx::query(
+                "UPDATE messages SET decision_id = ?, chunk_id = ?, is_noise = 0
+                 WHERE is_bot_marker = 1 AND decision_id IS NULL AND id < ?
+                   AND (guild_id, channel_id) = (SELECT guild_id, channel_id FROM messages WHERE id = ?)",
+            )
+            .bind(decision_id)
+            .bind(chunk_id)
+            .bind(last)
+            .bind(last)
             .execute(&mut *tx)
             .await?;
         }
@@ -437,7 +451,7 @@ impl Store {
     pub async fn search_messages(&self, q: &HistoryQuery) -> Result<Vec<MessageRow>> {
         let lower = |s: &Option<String>| s.as_ref().map(|s| s.to_ascii_lowercase());
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ?
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND is_bot_marker = 0
                AND (? IS NULL OR channel_id = ?)
                AND (? IS NULL OR lower(channel_name) = ?)
                AND (? IS NULL OR instr(lower(content), ?) > 0)
@@ -477,7 +491,7 @@ impl Store {
     /// アイドル判定に使う、Noth 以外の最後の発言の (行 ID, 時刻)
     pub async fn last_human_message(&self, guild: GuildId) -> Result<Option<(i64, Timestamp)>> {
         let row = sqlx::query(
-            "SELECT id, created_at FROM messages WHERE guild_id = ? AND is_self = 0 ORDER BY id DESC LIMIT 1",
+            "SELECT id, created_at FROM messages WHERE guild_id = ? AND is_self = 0 AND is_bot_marker = 0 ORDER BY id DESC LIMIT 1",
         )
         .bind(guild as i64)
         .fetch_optional(&self.pool)
@@ -490,7 +504,7 @@ impl Store {
     /// Noth 自身の発言は判定対象にしない
     pub async fn unjudged_messages(&self, guild: GuildId) -> Result<Vec<MessageRow>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND decision_id IS NULL AND is_self = 0 ORDER BY id ASC"
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND decision_id IS NULL AND is_self = 0 AND is_bot_marker = 0 ORDER BY id ASC"
         )))
         .bind(guild as i64)
         .fetch_all(&self.pool)
@@ -524,17 +538,16 @@ impl Store {
         guild: GuildId,
         channel: ChannelId,
         started_at: Timestamp,
-        summary: &str,
     ) -> Result<i64> {
         let ms = started_at.as_millisecond();
+        // summary 列は候補チャンクの機械要約だった。誰も読まなくなったので書かない(NOT NULL なので空を入れる)
         let r = sqlx::query(
-            "INSERT INTO topic_chunks (guild_id, channel_id, started_at, ended_at, summary) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO topic_chunks (guild_id, channel_id, started_at, ended_at, summary) VALUES (?, ?, ?, ?, '')",
         )
         .bind(guild as i64)
         .bind(channel as i64)
         .bind(ms)
         .bind(ms)
-        .bind(truncate_chars(summary, SUMMARY_MAX_CHARS))
         .execute(&self.pool)
         .await?;
         Ok(r.last_insert_rowid())
@@ -553,48 +566,13 @@ impl Store {
         .await?;
         row.as_ref().map(chunk_row).transpose()
     }
-    /// 読んでから書くと deferred トランザクションの昇格で SQLITE_BUSY になりうるので、1 文で済ませる
-    pub async fn touch_chunk(
-        &self,
-        chunk_id: i64,
-        ended_at: Timestamp,
-        append_summary: Option<&str>,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE topic_chunks SET ended_at = ?1,
-               summary = CASE
-                 WHEN ?2 IS NOT NULL AND ?2 <> '' AND length(summary) < ?3
-                 THEN substr(CASE WHEN summary = '' THEN ?2 ELSE summary || ' / ' || ?2 END, 1, ?3)
-                 ELSE summary
-               END
-             WHERE id = ?4",
-        )
-        .bind(ended_at.as_millisecond())
-        .bind(append_summary)
-        .bind(SUMMARY_MAX_CHARS as i64)
-        .bind(chunk_id)
-        .execute(&self.pool)
-        .await?;
+    pub async fn touch_chunk(&self, chunk_id: i64, ended_at: Timestamp) -> Result<()> {
+        sqlx::query("UPDATE topic_chunks SET ended_at = ? WHERE id = ?")
+            .bind(ended_at.as_millisecond())
+            .bind(chunk_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
-    }
-    pub async fn candidate_chunks(
-        &self,
-        guild: GuildId,
-        limit: usize,
-        exclude: &[i64],
-    ) -> Result<Vec<ChunkRow>> {
-        let mut sql = format!("SELECT {CHUNK_COLUMNS} FROM topic_chunks WHERE guild_id = ?");
-        if !exclude.is_empty() {
-            let marks = vec!["?"; exclude.len()].join(", ");
-            sql.push_str(&format!(" AND id NOT IN ({marks})"));
-        }
-        sql.push_str(" ORDER BY ended_at DESC, id DESC LIMIT ?");
-        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(guild as i64);
-        for id in exclude {
-            q = q.bind(*id);
-        }
-        let rows = q.bind(limit as i64).fetch_all(&self.pool).await?;
-        rows.iter().map(chunk_row).collect()
     }
     pub async fn chunk(&self, chunk_id: i64) -> Result<Option<ChunkRow>> {
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -872,6 +850,29 @@ impl Store {
         .await?;
         row.as_ref().map(run_row).transpose()
     }
+    /// 黙って起動した補足の run のうち、そのチャンネルでの直近の作成時刻と、`since` 以降の guild 全体の件数。
+    /// 失敗した run も費用がかかっているので数える。訂正は数えない
+    pub async fn supplement_usage(
+        &self,
+        guild: GuildId,
+        channel: ChannelId,
+        since: Timestamp,
+    ) -> Result<(Option<Timestamp>, u32)> {
+        let row = sqlx::query(
+            "SELECT
+               (SELECT MAX(created_at) FROM worker_runs WHERE guild_id = ? AND channel_id = ? AND origin = 'supplement') AS last_in_channel,
+               (SELECT COUNT(*) FROM worker_runs WHERE guild_id = ? AND origin = 'supplement' AND created_at >= ?) AS today",
+        )
+        .bind(guild as i64)
+        .bind(channel as i64)
+        .bind(guild as i64)
+        .bind(since.as_millisecond())
+        .fetch_one(&self.pool)
+        .await?;
+        let last: Option<i64> = row.try_get("last_in_channel")?;
+        let count: i64 = row.try_get("today")?;
+        Ok((last.filter(|ms| *ms > 0).map(ts), count as u32))
+    }
     pub async fn insert_worker_run(&self, guild: GuildId, run: &NewWorkerRun) -> Result<()> {
         insert_run(&self.pool, guild, run).await
     }
@@ -1102,17 +1103,18 @@ async fn insert_run<'e>(
     run: &NewWorkerRun,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO worker_runs (run_id, guild_id, goal, task_category, trigger_message_id, channel_id, status, chunk_id, fork_message_id)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+        "INSERT INTO worker_runs (run_id, guild_id, goal, origin, trigger_message_id, channel_id, status, chunk_id, fork_message_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
     )
     .bind(&run.run_id)
     .bind(guild as i64)
     .bind(&run.goal)
-    .bind(category_str(run.task_category))
+    .bind(run.origin.as_str())
     .bind(run.trigger_message_id.map(|id| id as i64))
     .bind(run.channel_id as i64)
     .bind(run.chunk_id)
     .bind(run.fork_message_id)
+    .bind(now_ms())
     .execute(exec)
     .await?;
     Ok(())
@@ -1176,10 +1178,6 @@ fn restrict_sidecar_files(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,6 +1200,7 @@ mod tests {
             mentions_self: false,
             reply_to_self: false,
             reply_to: None,
+            bot_marker: None,
         }
     }
 
@@ -1211,7 +1210,7 @@ mod tests {
             .await
             .unwrap();
         let c = s
-            .create_chunk(G, C, Timestamp::from_millisecond(1000).unwrap(), "")
+            .create_chunk(G, C, Timestamp::from_millisecond(1000).unwrap())
             .await
             .unwrap();
         (d, c)
@@ -1279,54 +1278,22 @@ mod tests {
         let s = Store::open_memory().await.unwrap();
         assert!(s.current_chunk(G, C).await.unwrap().is_none());
         let t = |ms| Timestamp::from_millisecond(ms).unwrap();
-        let c1 = s.create_chunk(G, C, t(1000), "first").await.unwrap();
-        let c2 = s.create_chunk(G, C, t(2000), "second").await.unwrap();
-        let c3 = s.create_chunk(G, 11, t(3000), "other").await.unwrap();
+        let c1 = s.create_chunk(G, C, t(1000)).await.unwrap();
+        let c2 = s.create_chunk(G, C, t(2000)).await.unwrap();
+        let _c3 = s.create_chunk(G, 11, t(3000)).await.unwrap();
 
         assert_eq!(s.current_chunk(G, C).await.unwrap().unwrap().id, c2);
-        assert_eq!(s.chunk(c1).await.unwrap().unwrap().summary, "first");
         assert!(s.chunk(999).await.unwrap().is_none());
 
-        let ids = |v: Vec<ChunkRow>| v.into_iter().map(|c| c.id).collect::<Vec<_>>();
+        s.touch_chunk(c1, t(9000)).await.unwrap();
         assert_eq!(
-            ids(s.candidate_chunks(G, 10, &[]).await.unwrap()),
-            vec![c3, c2, c1]
-        );
-        assert_eq!(
-            ids(s.candidate_chunks(G, 10, &[c3]).await.unwrap()),
-            vec![c2, c1]
-        );
-        assert_eq!(
-            ids(s.candidate_chunks(G, 1, &[c3]).await.unwrap()),
-            vec![c2]
-        );
-
-        // touch で ended_at が進むと並びも変わる
-        s.touch_chunk(c1, t(9000), Some("more")).await.unwrap();
-        let got = s.chunk(c1).await.unwrap().unwrap();
-        assert_eq!(got.summary, "first / more");
-        assert_eq!(got.ended_at.as_millisecond(), 9000);
-        assert_eq!(
-            ids(s.candidate_chunks(G, 10, &[]).await.unwrap()),
-            vec![c1, c3, c2]
-        );
-
-        s.touch_chunk(c1, t(9001), None).await.unwrap();
-        assert_eq!(s.chunk(c1).await.unwrap().unwrap().summary, "first / more");
-
-        let long = "あ".repeat(190);
-        let c4 = s.create_chunk(G, 12, t(1), &long).await.unwrap();
-        s.touch_chunk(c4, t(2), Some(&"い".repeat(50)))
-            .await
-            .unwrap();
-        assert_eq!(
-            s.chunk(c4).await.unwrap().unwrap().summary.chars().count(),
-            200
-        );
-        s.touch_chunk(c4, t(3), Some("again")).await.unwrap();
-        assert_eq!(
-            s.chunk(c4).await.unwrap().unwrap().summary.chars().count(),
-            200
+            s.chunk(c1)
+                .await
+                .unwrap()
+                .unwrap()
+                .ended_at
+                .as_millisecond(),
+            9000
         );
     }
 
@@ -1416,7 +1383,7 @@ mod tests {
         NewWorkerRun {
             run_id: run_id.into(),
             goal: format!("goal {run_id}"),
-            task_category: TaskCategory::WebResearch,
+            origin: Origin::Request,
             channel_id: C,
             chunk_id: 3,
             trigger_message_id: Some(42),
@@ -1445,7 +1412,7 @@ mod tests {
         let r3 = s.worker_run("r3").await.unwrap().unwrap();
         assert_eq!(r3.status, RunStatus::Finished);
         assert_eq!(r3.conclusion.as_deref(), Some("memo"));
-        assert_eq!(r3.task_category, TaskCategory::WebResearch);
+        assert_eq!(r3.origin, Origin::Request);
         assert_eq!(r3.trigger_message_id, Some(42));
         assert_eq!(r3.fork_message_id, 7);
         assert_eq!(r3.chunk_id, Some(3));
@@ -1520,7 +1487,7 @@ mod tests {
         );
 
         let c = s
-            .create_chunk(G, C, Timestamp::from_millisecond(1).unwrap(), "")
+            .create_chunk(G, C, Timestamp::from_millisecond(1).unwrap())
             .await
             .unwrap();
         s.replace_with_digest(G, "digest", &[turns[0].id.unwrap()], &[c])
@@ -1826,5 +1793,42 @@ mod tests {
         let rows = s.unjudged_messages(G).await.unwrap();
         assert_eq!(rows[0].reply_to, m.reply_to);
         assert_eq!(rows[1].reply_to, None);
+    }
+
+    #[tokio::test]
+    async fn supplement_usage_counts_only_supplements_per_channel_and_day() {
+        let s = Store::open_memory().await.unwrap();
+        let run = |id: &str, origin, channel| NewWorkerRun {
+            run_id: id.into(),
+            goal: "g".into(),
+            origin,
+            channel_id: channel,
+            chunk_id: 1,
+            trigger_message_id: None,
+            fork_message_id: 0,
+        };
+        let long_ago = Timestamp::UNIX_EPOCH;
+        assert_eq!(s.supplement_usage(G, C, long_ago).await.unwrap(), (None, 0));
+
+        s.insert_worker_run(G, &run("a", Origin::Supplement, C))
+            .await
+            .unwrap();
+        s.insert_worker_run(G, &run("b", Origin::Supplement, 11))
+            .await
+            .unwrap();
+        s.insert_worker_run(G, &run("c", Origin::Correction, C))
+            .await
+            .unwrap();
+        s.insert_worker_run(G, &run("d", Origin::Request, C))
+            .await
+            .unwrap();
+
+        let (last, today) = s.supplement_usage(G, C, long_ago).await.unwrap();
+        assert!(last.is_some());
+        assert_eq!(today, 2, "訂正と依頼は数えない。guild 全体の補足");
+        let (last, _) = s.supplement_usage(G, 12, long_ago).await.unwrap();
+        assert!(last.is_none());
+        let future = Timestamp::now() + std::time::Duration::from_secs(3600);
+        assert_eq!(s.supplement_usage(G, C, future).await.unwrap().1, 0);
     }
 }

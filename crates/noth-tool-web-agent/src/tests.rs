@@ -1,11 +1,11 @@
 use super::*;
 use noth_backend_tinyfish::testing::{MockServer, Recorded, Reply, load_config};
-use noth_core::types::{Billing, MeterEvent, TaskCategory};
+use noth_core::types::{Billing, MeterEvent, Origin};
 
 fn ctx() -> ToolContext {
     ToolContext {
         run_id: "r".into(),
-        task_category: TaskCategory::WebResearch,
+        origin: Origin::Request,
         work_dir: std::env::temp_dir(),
         meter: None,
         history: None,

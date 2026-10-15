@@ -126,9 +126,6 @@ impl Router for MockRouter {
             latency: Duration::from_millis(1),
         })
     }
-    fn max_questions(&self) -> usize {
-        64
-    }
     fn model_label(&self) -> String {
         "mock".into()
     }
@@ -213,6 +210,8 @@ struct MockWorker {
     fail: AtomicBool,
     /// run の冒頭で、各待ち時間の後に進捗を送る
     progress: Mutex<Vec<(Duration, WorkerProgress)>>,
+    /// Some なら結論メモをこの文字列にする
+    conclusion: Mutex<Option<String>>,
 }
 
 impl MockWorker {
@@ -223,6 +222,7 @@ impl MockWorker {
             delay: Mutex::new(Duration::ZERO),
             fail: AtomicBool::new(false),
             progress: Mutex::default(),
+            conclusion: Mutex::default(),
         }
     }
 
@@ -264,6 +264,9 @@ impl Worker for MockWorker {
         if self.fail.load(Ordering::SeqCst) {
             return WorkerOutcome::Failed("API エラー".into());
         }
+        if let Some(memo) = self.conclusion.lock().unwrap().clone() {
+            return WorkerOutcome::Concluded(memo);
+        }
         WorkerOutcome::Concluded(format!("結論: {goal}"))
     }
 }
@@ -304,24 +307,33 @@ fn choice(name: &str, options: &[&str], confidence: f32) -> Answer {
     }
 }
 
-fn action(name: &str) -> Answer {
-    choice(name, &["silent", "react", "reply_only", "spawn_task"], 1.0)
+const ADDRESSEES: [&str; 4] = ["other", "about_noth", "other_bot", "noth_request"];
+
+fn addressee(name: &str) -> Answer {
+    choice(name, &ADDRESSEES, 1.0)
 }
 
-fn category(name: &str) -> Answer {
-    choice(
-        name,
-        &["none", "web_research", "fact_check", "code_or_tool"],
-        1.0,
-    )
+fn reaction(name: &str) -> Answer {
+    choice(name, &["none", "r0"], 1.0)
 }
 
+/// 旧い語彙(`silent` / `react` / `reply_only` / `spawn_task`)で書かれたテストを v2.1 の問いの回答に直す。
 fn answers(action_name: &str, noise: f32, shift: f32) -> Vec<(&'static str, Answer)> {
+    let (who, outside, react) = match action_name {
+        "silent" => ("other", 0.0, "none"),
+        "react" => ("about_noth", 0.0, "r0"),
+        "reply_only" => ("noth_request", 0.0, "none"),
+        "spawn_task" => ("noth_request", 1.0, "none"),
+        other => panic!("未知の動き: {other}"),
+    };
     vec![
         ("is_noise_or_meme", noul(noise)),
         ("is_topic_shift", noul(shift)),
-        ("intervention_action", action(action_name)),
-        ("task_category", category("none")),
+        ("addressee", addressee(who)),
+        ("needs_outside_work", noul(outside)),
+        ("corrects_noth", noul(0.0)),
+        ("worth_supplement", noul(0.0)),
+        ("reaction", reaction(react)),
     ]
 }
 
@@ -354,9 +366,11 @@ fn config(hard_limit: u64, table: toml::Table) -> Config {
         router: RouterSection {
             recent_messages: 30,
             state_max_chars: 24_000,
-            candidate_chunks: 32,
             call_names: vec!["noth".into()],
             conversation_window_secs: 120,
+            supplement_min_interval_secs: 300,
+            supplement_max_per_day: 50,
+            questions: Default::default(),
             thresholds: Thresholds::default(),
             reactions: vec![Reaction {
                 emoji: "👀".into(),
@@ -570,6 +584,7 @@ fn incoming(
         mentions_self: false,
         reply_to_self: false,
         reply_to: None,
+        bot_marker: None,
     }
 }
 
@@ -616,9 +631,7 @@ async fn silent_buffers_then_reply_promotes_one_block() {
 #[tokio::test]
 async fn react_adds_emoji_to_last_message_without_speaking() {
     let mut h = Harness::new().await;
-    let mut a = answers("react", 0.0, 0.0);
-    a.push(("reaction", choice("r0", &["r0"], 1.0)));
-    h.router.set(a);
+    h.router.set(answers("react", 0.0, 0.0));
     h.say(GENERAL, "新しいキーボード買った").await;
     h.say(GENERAL, "打鍵感が最高").await;
 
@@ -637,9 +650,11 @@ async fn react_adds_emoji_to_last_message_without_speaking() {
 }
 
 #[tokio::test]
-async fn react_without_emoji_answer_stays_silent() {
+async fn about_noth_with_reaction_none_stays_silent() {
     let mut h = Harness::new().await;
-    h.router.set(answers("react", 0.0, 0.0));
+    let mut a = answers("react", 0.0, 0.0);
+    a.push(("reaction", reaction("none")));
+    h.router.set(a);
     h.say(GENERAL, "新しいキーボード買った").await;
 
     assert!(h.channel.reactions.lock().unwrap().is_empty());
@@ -742,20 +757,16 @@ async fn provider_error_message_follows_the_cause() {
 #[tokio::test]
 async fn join_failure_is_not_swallowed_by_a_reply_failure() {
     let mut h = Harness::with_worker().await;
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     h.provider.fail.store(true, Ordering::SeqCst);
     h.router.set(answers("reply_only", 0.0, 0.0));
     h.say(GENERAL, "Noth ところで").await;
     assert_eq!(h.sent().len(), 2);
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.process_next_job().await;
 
     let sent = h.sent();
@@ -769,25 +780,9 @@ async fn join_failure_is_not_swallowed_by_a_reply_failure() {
 }
 
 #[tokio::test]
-async fn noise_never_enters_buffer() {
-    let mut h = Harness::new().await;
-    h.router.set(answers("silent", 0.95, 0.0));
-    h.say(GENERAL, "wwwwwww").await;
-    assert!(h.store.buffered_messages(GUILD).await.unwrap().is_empty());
-
-    h.router.set(answers("reply_only", 0.0, 0.0));
-    h.say(GENERAL, "Noth").await;
-    let turns = h.store.active_turns(GUILD).await.unwrap();
-    assert!(turns.iter().all(|t| !t.text.contains("wwwwwww")));
-}
-
-#[tokio::test]
 async fn spawn_task_runs_as_reply_only_without_worker() {
     let mut h = Harness::new().await;
-    let mut a = answers("spawn_task", 0.0, 0.0);
-    a.retain(|(k, _)| *k != "task_category");
-    a.push(("task_category", category("web_research")));
-    h.router.set(a);
+    h.router.set(answers("spawn_task", 0.0, 0.0));
     h.say(GENERAL, "これ調べて").await;
 
     assert_eq!(h.sent().len(), 1);
@@ -795,213 +790,13 @@ async fn spawn_task_runs_as_reply_only_without_worker() {
 }
 
 #[tokio::test]
-async fn low_confidence_is_silent() {
-    let mut h = Harness::new().await;
-    let mut a = answers("reply_only", 0.0, 0.0);
-    a.retain(|(k, _)| *k != "intervention_action");
-    a.push((
-        "intervention_action",
-        choice("reply_only", &["silent", "reply_only", "spawn_task"], 0.05),
-    ));
-    h.router.set(a);
-    h.say(GENERAL, "どうかな").await;
-
-    assert!(h.sent().is_empty());
-    assert_eq!(h.store.buffered_messages(GUILD).await.unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn name_call_ignores_min_confidence_but_not_router_choice() {
-    let mut h = Harness::new().await;
-    let low = |name: &str| {
-        let mut a = answers(name, 0.0, 0.0);
-        a.retain(|(k, _)| *k != "intervention_action");
-        a.push((
-            "intervention_action",
-            choice(name, &["silent", "reply_only", "spawn_task"], 0.01),
-        ));
-        a
-    };
-    h.router.set(low("silent"));
-    h.say(GENERAL, "Nothの実装どうする").await;
-    assert!(h.sent().is_empty());
-
-    h.router.set(low("reply_only"));
-    h.say(GENERAL, "nothing").await;
-    assert!(h.sent().is_empty());
-
-    h.router.set(low("reply_only"));
-    h.say(GENERAL, "noth〜？").await;
-    assert_eq!(h.sent().len(), 1);
-}
-
-#[tokio::test]
-async fn mention_is_answered_even_if_router_says_silent_noise() {
+async fn mention_is_answered_even_if_router_says_other() {
     let mut h = Harness::new().await;
     h.router.set(answers("silent", 0.9, 0.0));
     h.say_as(GENERAL, "@Noth", true).await;
 
     assert_eq!(h.sent().len(), 1);
     assert!(h.store.buffered_messages(GUILD).await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn relevant_chunk_goes_to_layer4_before_trigger() {
-    let mut h = Harness::new().await;
-    h.router.set(answers("silent", 0.0, 0.0));
-    h.say(RANDOM, "旅行の計画を立てよう").await;
-    // 別の話題に切り替えて、旅行のチャンクを Layer 3 にも現在チャンクにも残らない候補にする
-    h.router.set(answers("silent", 0.0, 0.9));
-    h.say(RANDOM, "ところで晩ごはん").await;
-    h.say(GENERAL, "別チャンネルの話").await;
-    let chunks = h.store.candidate_chunks(GUILD, 10, &[]).await.unwrap();
-    let travel = chunks
-        .iter()
-        .find(|c| c.summary.contains("旅行"))
-        .unwrap()
-        .id;
-    // 圧縮済み相当にして、バッファにも Layer 3 にも残らない状態にする
-    let travel_rows: Vec<i64> = h
-        .store
-        .chunk_messages(travel)
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.id)
-        .collect();
-    h.store.mark_promoted(&travel_rows, 9_999).await.unwrap();
-
-    let mut a = answers("reply_only", 0.0, 0.0);
-    a.push((
-        Box::leak(format!("relevant_chunk_{travel}").into_boxed_str()),
-        noul(0.9),
-    ));
-    h.router.set(a);
-    h.say(GENERAL, "旅行の話どうなった?").await;
-
-    let tail = &h.prompts()[0].ephemeral_tail;
-    assert_eq!(tail.len(), 3);
-    assert_eq!(tail[0].kind, TurnKind::RelevantChunk);
-    assert!(tail[0].text.contains("旅行の計画を立てよう"));
-    assert_eq!(tail[1].kind, TurnKind::Trigger);
-    assert_eq!(tail[2].kind, TurnKind::Instruction);
-    let turns = h.store.active_turns(GUILD).await.unwrap();
-    assert!(turns.iter().all(|t| t.kind != TurnKind::RelevantChunk));
-}
-
-#[tokio::test]
-async fn buffered_chunk_is_not_offered_as_relevant_chunk() {
-    let mut h = Harness::new().await;
-    h.router.set(answers("silent", 0.0, 0.0));
-    h.say(RANDOM, "旅行の計画を立てよう").await;
-    h.router.set(answers("silent", 0.0, 0.9));
-    h.say(RANDOM, "ところで晩ごはん").await;
-    let travel = h
-        .store
-        .candidate_chunks(GUILD, 10, &[])
-        .await
-        .unwrap()
-        .iter()
-        .find(|c| c.summary.contains("旅行"))
-        .unwrap()
-        .id;
-
-    let mut a = answers("reply_only", 0.0, 0.0);
-    a.push((
-        Box::leak(format!("relevant_chunk_{travel}").into_boxed_str()),
-        noul(0.9),
-    ));
-    h.router.set(a);
-    h.say(GENERAL, "旅行の話どうなった?").await;
-
-    let prompt = &h.prompts()[0];
-    assert!(
-        prompt
-            .ephemeral_tail
-            .iter()
-            .all(|t| t.kind != TurnKind::RelevantChunk)
-    );
-    for tail in &prompt.ephemeral_tail {
-        for log in &prompt.active_log {
-            assert!(
-                !(tail.text.contains("旅行の計画を立てよう")
-                    && log.text.contains("旅行の計画を立てよう"))
-            );
-        }
-    }
-    assert!(
-        prompt
-            .active_log
-            .iter()
-            .any(|t| t.text.contains("旅行の計画を立てよう"))
-    );
-}
-
-fn silent_with_reply_p(reply: f32) -> Vec<(&'static str, Answer)> {
-    let mut a = answers("silent", 0.0, 0.0);
-    a.retain(|(k, _)| *k != "intervention_action");
-    a.push((
-        "intervention_action",
-        Answer::Choice {
-            choice: "silent".into(),
-            probabilities: [
-                ("silent".to_string(), 1.0 - reply),
-                ("reply_only".to_string(), reply),
-                ("spawn_task".to_string(), 0.0),
-            ]
-            .into(),
-            confidence: 0.3,
-        },
-    ));
-    a
-}
-
-#[tokio::test]
-async fn follow_up_after_reply_counts_as_name_call() {
-    let mut h = Harness::new().await;
-    h.router.set(silent_with_reply_p(0.44));
-    h.say(GENERAL, "ココナッツ食べたことない").await;
-    assert!(h.sent().is_empty(), "応答前の会話では静観のまま");
-
-    h.router.set(answers("reply_only", 0.0, 0.0));
-    h.say_as(GENERAL, "@Noth", true).await;
-    assert_eq!(h.sent().len(), 1);
-
-    h.router.set(silent_with_reply_p(0.44));
-    h.say(GENERAL, "ココナッツ食べたことない").await;
-    assert_eq!(h.sent().len(), 2);
-
-    h.router.set(silent_with_reply_p(0.1));
-    h.say(GENERAL, "w").await;
-    assert_eq!(h.sent().len(), 2);
-
-    h.router.set(silent_with_reply_p(0.44));
-    h.say(RANDOM, "別チャンネル").await;
-    assert_eq!(h.sent().len(), 2);
-}
-
-#[tokio::test]
-async fn noise_does_not_extend_summary_or_open_chunk() {
-    let mut h = Harness::new().await;
-    h.router.set(answers("silent", 0.0, 0.0));
-    h.say(GENERAL, "本題").await;
-    let before = h
-        .store
-        .current_chunk(GUILD, GENERAL)
-        .await
-        .unwrap()
-        .unwrap();
-
-    h.router.set(answers("silent", 0.9, 0.9));
-    h.say(GENERAL, "wwww").await;
-    let after = h
-        .store
-        .current_chunk(GUILD, GENERAL)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after.id, before.id);
-    assert_eq!(after.summary, before.summary);
 }
 
 #[tokio::test]
@@ -1020,14 +815,14 @@ async fn hard_limit_drops_oldest_chunk_only() {
 }
 
 #[tokio::test]
-async fn router_failure_still_answers_when_called_by_name() {
+async fn router_failure_still_answers_when_mentioned() {
     let mut h = Harness::new().await;
     h.router.fail.store(true, Ordering::SeqCst);
 
     h.say(GENERAL, "今日は寒いね").await;
     assert!(h.sent().is_empty());
 
-    h.say(GENERAL, "Noth はどう思う?").await;
+    h.say_as(GENERAL, "@Noth どう思う?", true).await;
     assert_eq!(h.sent(), vec![(GENERAL, "応答1".to_string())]);
 }
 
@@ -1203,11 +998,8 @@ async fn run_replies_end_to_end_and_marks_disconnected() {
     );
 }
 
-fn spawn_answers(cat: &str) -> Vec<(&'static str, Answer)> {
-    let mut a = answers("spawn_task", 0.0, 0.0);
-    a.retain(|(k, _)| *k != "task_category");
-    a.push(("task_category", category(cat)));
-    a
+fn spawn_answers() -> Vec<(&'static str, Answer)> {
+    answers("spawn_task", 0.0, 0.0)
 }
 
 fn delivery(style: &str) -> Answer {
@@ -1245,7 +1037,7 @@ async fn worker_task_carries_distinct_requesters_without_noth() {
         ..Setup::default()
     })
     .await;
-    h.router.set(spawn_answers("web_research"));
+    h.router.set(spawn_answers());
     h.provider.script_text("調べるね\n[Goal]\n調査");
     let mut pending = Vec::new();
     // 発言者 1, 2, 1(重複)と、Noth 自身(99)
@@ -1290,7 +1082,7 @@ async fn worker_task_has_no_requesters_when_a_trigger_row_is_missing() {
         ..Setup::default()
     })
     .await;
-    h.router.set(spawn_answers("web_research"));
+    h.router.set(spawn_answers());
     h.provider.script_text("調べるね\n[Goal]\n調査");
     h.next_message_id += 1;
     let m = incoming(GENERAL, "general", "調べて", h.next_message_id);
@@ -1330,7 +1122,7 @@ async fn spawn_task_posts_ack_and_records_goal_before_fork() {
         ..Setup::default()
     })
     .await;
-    h.router.set(spawn_answers("web_research"));
+    h.router.set(spawn_answers());
     h.provider
         .script_text("ちょっと調べるね\n[Goal]\n東京の明日の天気を調べる");
     h.say(GENERAL, "明日の東京の天気わかる?").await;
@@ -1353,7 +1145,7 @@ async fn spawn_task_posts_ack_and_records_goal_before_fork() {
     wait_until(|| worker.started() == 1).await;
     let task = h.worker.tasks.lock().unwrap()[0].clone();
     assert_eq!(task.goal, "東京の明日の天気を調べる");
-    assert_eq!(task.task_category, TaskCategory::WebResearch);
+    assert_eq!(task.origin, Origin::Request);
     assert_eq!(task.audience.requesters, vec![1]);
     assert_eq!(task.base.active_log, turns);
     assert!(task.base.ephemeral_tail.is_empty());
@@ -1391,10 +1183,8 @@ async fn spawn_task_posts_ack_and_records_goal_before_fork() {
 #[tokio::test]
 async fn join_normal_report_appends_conclusion_and_posts() {
     let mut h = Harness::with_worker().await;
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
 
@@ -1428,8 +1218,7 @@ async fn join_normal_report_appends_conclusion_and_posts() {
 #[tokio::test]
 async fn join_reply_anchor_replies_to_trigger() {
     let mut h = Harness::with_worker().await;
-    h.router
-        .set(with_delivery(spawn_answers("web_research"), "reply_anchor"));
+    h.router.set(with_delivery(spawn_answers(), "reply_anchor"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     let trigger_message_id = h.next_message_id;
@@ -1443,8 +1232,7 @@ async fn join_reply_anchor_replies_to_trigger() {
 #[tokio::test]
 async fn join_abort_posts_nothing() {
     let mut h = Harness::with_worker().await;
-    h.router
-        .set(with_delivery(spawn_answers("web_research"), "abort"));
+    h.router.set(with_delivery(spawn_answers(), "abort"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     let before = h.store.active_turns(GUILD).await.unwrap();
@@ -1461,7 +1249,7 @@ async fn join_abort_posts_nothing() {
 #[tokio::test]
 async fn join_router_error_is_abort() {
     let mut h = Harness::with_worker().await;
-    h.router.set(spawn_answers("web_research"));
+    h.router.set(spawn_answers());
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     h.router.fail.store(true, Ordering::SeqCst);
@@ -1474,10 +1262,8 @@ async fn join_router_error_is_abort() {
 #[tokio::test]
 async fn join_provider_failure_keeps_conclusion_only() {
     let mut h = Harness::with_worker().await;
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     h.provider.fail.store(true, Ordering::SeqCst);
@@ -1505,10 +1291,8 @@ async fn worker_timeout_becomes_failure_memo() {
     })
     .await;
     *h.worker.delay.lock().unwrap() = Duration::from_secs(10);
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
 
@@ -1528,10 +1312,8 @@ async fn worker_timeout_becomes_failure_memo() {
 async fn worker_failure_becomes_failure_memo() {
     let mut h = Harness::with_worker().await;
     h.worker.fail.store(true, Ordering::SeqCst);
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     h.process_next_job().await;
@@ -1552,8 +1334,7 @@ async fn second_run_waits_when_max_concurrent_is_one() {
         ..Setup::default()
     })
     .await;
-    h.router
-        .set(with_delivery(spawn_answers("web_research"), "abort"));
+    h.router.set(with_delivery(spawn_answers(), "abort"));
     h.provider.script_text("調べるね\n[Goal]\n一つ目");
     h.say(GENERAL, "一つ目を調べて").await;
     h.provider.script_text("調べるね\n[Goal]\n二つ目");
@@ -1614,7 +1395,7 @@ async fn tool_calls_become_fixed_ack_and_goal() {
         .chain(runs(&h.store, RunStatus::Running).await)
         .next()
         .unwrap();
-    assert_eq!(run.task_category, TaskCategory::WebResearch);
+    assert_eq!(run.origin, Origin::Request);
 
     h.worker.release.add_permits(1);
 }
@@ -1632,7 +1413,7 @@ fn shell_call() -> Completion {
 }
 
 #[tokio::test]
-async fn run_category_follows_router_regardless_of_tools() {
+async fn main_initiated_runs_are_requests_regardless_of_router_and_tools() {
     let mut h = Harness::setup(Setup {
         worker: true,
         worker_permits: 0,
@@ -1642,18 +1423,18 @@ async fn run_category_follows_router_regardless_of_tools() {
     .await;
     let worker = h.worker.clone();
 
-    // router が作業不要と見ていても Worker を起こしたら none にはしない
+    // router が作業不要と見ていても、main が Worker に回したなら依頼として記録する
     h.router.set(answers("reply_only", 0.0, 0.0));
     h.provider.scripted.lock().unwrap().push_back(shell_call());
     h.say(GENERAL, "ls して").await;
     wait_until(|| worker.started() == 1).await;
 
-    h.router.set(spawn_answers("code_or_tool"));
+    h.router.set(spawn_answers());
     h.provider.scripted.lock().unwrap().push_back(shell_call());
     h.say(GENERAL, "ls して").await;
     wait_until(|| worker.started() == 2).await;
 
-    // tool の種類でラベルは変えない。router が code_or_tool なら Web の tool を呼んでも code_or_tool
+    // tool の種類で origin は変えない
     h.provider.scripted.lock().unwrap().push_back(Completion {
         text: None,
         tool_calls: vec![ToolCall {
@@ -1666,47 +1447,16 @@ async fn run_category_follows_router_regardless_of_tools() {
     h.say(GENERAL, "調べて").await;
     wait_until(|| worker.started() == 3).await;
 
-    let categories: Vec<TaskCategory> = h
+    let origins: Vec<Origin> = h
         .worker
         .tasks
         .lock()
         .unwrap()
         .iter()
-        .map(|t| t.task_category)
+        .map(|t| t.origin)
         .collect();
-    assert_eq!(
-        categories,
-        vec![
-            TaskCategory::WebResearch,
-            TaskCategory::CodeOrTool,
-            TaskCategory::CodeOrTool
-        ]
-    );
+    assert_eq!(origins, vec![Origin::Request; 3]);
     h.worker.release.add_permits(3);
-}
-
-#[tokio::test]
-async fn spawn_task_without_goal_line_is_plain_reply() {
-    let mut h = Harness::with_worker().await;
-    h.router.set(spawn_answers("web_research"));
-    h.provider.script_text("それなら知ってるよ、晴れだって");
-    h.say(GENERAL, "天気調べて").await;
-
-    assert_eq!(
-        h.sent(),
-        vec![(GENERAL, "それなら知ってるよ、晴れだって".to_string())]
-    );
-    assert_eq!(h.actor.in_flight(), 0);
-    assert!(
-        h.store
-            .worker_runs(
-                GUILD,
-                &[RunStatus::Queued, RunStatus::Running, RunStatus::Finished]
-            )
-            .await
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[tokio::test]
@@ -1813,8 +1563,7 @@ async fn idle_compact_waits_for_running_worker() {
         ..Setup::default()
     })
     .await;
-    h.router
-        .set(with_delivery(spawn_answers("web_research"), "abort"));
+    h.router.set(with_delivery(spawn_answers(), "abort"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     let later = Timestamp::now() + jiff::SignedDuration::from_mins(11);
@@ -1865,7 +1614,7 @@ async fn restore_aborts_queued_and_running_runs() {
                 &NewWorkerRun {
                     run_id: id.into(),
                     goal: "g".into(),
-                    task_category: TaskCategory::WebResearch,
+                    origin: Origin::Request,
                     channel_id: GENERAL,
                     chunk_id: 1,
                     trigger_message_id: None,
@@ -1902,10 +1651,7 @@ async fn run_waits_for_worker_join_on_shutdown() {
         .unwrap()
         .push(incoming(GENERAL, "general", "Noth、天気調べて", 1));
     let router = Arc::new(MockRouter::default());
-    router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    router.set(with_delivery(spawn_answers(), "normal_report"));
     let provider = Arc::new(MockProvider::new());
     provider.script_text("調べるね\n[Goal]\n天気");
     let worker = Arc::new(MockWorker::new(100));
@@ -2045,8 +1791,7 @@ async fn typing_continues_while_worker_runs_and_stops_after() {
     })
     .await;
     h.actor.set_typing_interval(Duration::from_millis(20));
-    h.router
-        .set(with_delivery(spawn_answers("web_research"), "abort"));
+    h.router.set(with_delivery(spawn_answers(), "abort"));
     h.provider.script_text("調べるね\n[Goal]\n一つ目");
     h.say(GENERAL, "一つ目を調べて").await;
     h.provider.script_text("調べるね\n[Goal]\n二つ目");
@@ -2091,8 +1836,7 @@ async fn progress_harness(show_progress: bool) -> Harness {
     })
     .await;
     h.actor.set_progress_interval(Duration::from_millis(300));
-    h.router
-        .set(with_delivery(spawn_answers("web_research"), "abort"));
+    h.router.set(with_delivery(spawn_answers(), "abort"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h
 }
@@ -2181,10 +1925,8 @@ fn drain_purposes(h: &mut Harness) -> Vec<(Purpose, Option<String>)> {
 #[tokio::test]
 async fn main_and_join_calls_are_metered_with_purpose() {
     let mut h = Harness::with_worker().await;
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     assert_eq!(drain_purposes(&mut h), vec![(Purpose::Main, None)]);
@@ -2360,7 +2102,7 @@ async fn memo_in_ack_is_stripped_and_goal_keeps_its_own_memo_lines() {
         ..Setup::default()
     })
     .await;
-    h.router.set(spawn_answers("web_research"));
+    h.router.set(spawn_answers());
     h.provider.script_text(
         "調べるね\n[Memo] carol は Rust 勉強中\n[Goal]\n調査\n[Memo] これは Goal の一部",
     );
@@ -2407,16 +2149,6 @@ async fn router_state_carries_noth_and_members_from_memory_file() {
 }
 
 #[tokio::test]
-async fn addressed_to_noth_lifts_silent_to_reply() {
-    let mut h = Harness::new().await;
-    let mut a = answers("silent", 0.0, 0.0);
-    a.push(("addressed_to_noth", noul(0.9)));
-    h.router.set(a);
-    h.say(GENERAL, "この Bot の設定ってどこにあるの?").await;
-    assert_eq!(h.sent().len(), 1);
-}
-
-#[tokio::test]
 async fn memo_disabled_leaves_text_untouched_and_writes_nothing() {
     let mut h = Harness::setup(Setup {
         memo: false,
@@ -2439,10 +2171,8 @@ async fn memo_disabled_leaves_text_untouched_and_writes_nothing() {
 #[tokio::test]
 async fn memo_only_join_report_is_not_posted_but_is_remembered() {
     let mut h = Harness::with_worker().await;
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.provider.script_text("[Memo] 東京は雨が多い");
     h.say(GENERAL, "天気調べて").await;
@@ -2478,10 +2208,8 @@ async fn memo_in_plain_reply_with_worker_enabled_is_stripped() {
 #[tokio::test]
 async fn posted_join_report_strips_memo_and_appends_it() {
     let mut h = Harness::with_worker().await;
-    h.router.set(with_delivery(
-        spawn_answers("web_research"),
-        "normal_report",
-    ));
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.provider.script_text("晴れでした\n[Memo] 東京は今日晴れ");
     h.say(GENERAL, "天気調べて").await;
@@ -2496,4 +2224,597 @@ async fn posted_join_report_strips_memo_and_appends_it() {
             .unwrap()
             .contains("東京は今日晴れ")
     );
+}
+
+#[tokio::test]
+async fn name_call_follows_addressee_but_mention_does_not() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("silent", 0.0, 0.0));
+    h.say(GENERAL, "noth〜？").await;
+    assert!(h.sent().is_empty(), "名前だけでは決定的に応答しない");
+
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.say(GENERAL, "noth〜？").await;
+    assert_eq!(h.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn conversation_window_is_a_hint_to_router_not_a_reply_rule() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("silent", 0.0, 0.0));
+    h.say_as(GENERAL, "@Noth", true).await;
+    assert_eq!(h.sent().len(), 1);
+
+    h.say(GENERAL, "ココナッツ食べたことない").await;
+    assert_eq!(
+        h.sent().len(),
+        1,
+        "窓の中でも router が other と答えれば静観"
+    );
+    h.say(RANDOM, "別チャンネル").await;
+
+    let states = h.router.states.lock().unwrap().clone();
+    let window = |i: usize| states[i].0["trigger"][0]["in_conversation_window"].clone();
+    assert_eq!(window(0), false);
+    assert_eq!(window(1), true);
+    assert_eq!(window(2), false);
+
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.say(GENERAL, "ココナッツ食べたことない").await;
+    assert_eq!(h.sent().len(), 2);
+}
+
+#[tokio::test]
+async fn other_never_reacts_even_with_reaction_answer() {
+    let mut h = Harness::new().await;
+    let mut a = answers("silent", 0.0, 0.0);
+    a.push(("reaction", reaction("r0")));
+    h.router.set(a);
+    h.say(GENERAL, "新しいキーボード買った").await;
+
+    assert!(h.channel.reactions.lock().unwrap().is_empty());
+    assert!(h.sent().is_empty());
+}
+
+fn bot_marker_message(channel_id: ChannelId, message_id: MessageId) -> IncomingMessage {
+    let mut msg = incoming(channel_id, "general", "", message_id);
+    msg.user_id = 500;
+    msg.author_name = "秘書ちゃん".into();
+    msg.bot_marker = Some(BotMarker {
+        author_name: "秘書ちゃん".into(),
+        reply_to_author: Some("alice".into()),
+        chars: 1180,
+    });
+    msg
+}
+
+#[tokio::test]
+async fn ingest_stores_bot_marker_without_starting_a_judge() {
+    let store = Store::open_memory().await.unwrap();
+    let (bus, rx) = bus::channel(16);
+    let (jobs_tx, mut jobs_rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
+    tokio::spawn(noth_core::ingest::run(
+        store.clone(),
+        Arc::new(MockChannel::default()),
+        rx,
+        Duration::from_millis(50),
+        jobs_tx,
+    ));
+
+    bus.publish(BusEvent::MessageReceived(bot_marker_message(GENERAL, 1)))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), jobs_rx.recv())
+            .await
+            .is_err(),
+        "目印だけでは判定を起動しない"
+    );
+    let stored = store.recent_messages(GUILD, i64::MAX, 10).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].bot_marker.is_some() && stored[0].content.is_empty());
+    assert!(store.unjudged_messages(GUILD).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bot_marker_rides_along_with_the_next_judge() {
+    let mut h = Harness::new().await;
+    h.store
+        .insert_message(&bot_marker_message(GENERAL, 900))
+        .await
+        .unwrap();
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.say_as(GENERAL, "@Noth これ見て", true).await;
+
+    let states = h.router.states.lock().unwrap().clone();
+    let recent = &states[0].0["recent"];
+    assert_eq!(
+        recent[0]["bot_marker"],
+        serde_json::json!({"chars": 1180, "count": 1, "reply_to": "alice"})
+    );
+    assert!(recent[0].get("content").is_none());
+
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert!(turns.iter().any(|t| {
+        t.text.contains(
+            "[Bot 秘書ちゃん が発言(alice への返信、約1,200字。embed を含む) message_id: 900]",
+        )
+    }));
+    assert!(h.store.buffered_messages(GUILD).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bot_marker_between_batch_messages_reaches_router_state() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("silent", 0.0, 0.0));
+    let mut ids = Vec::new();
+    let mut pending = Vec::new();
+    for (i, content) in ["一つ目", "二つ目"].into_iter().enumerate() {
+        let msg = incoming(GENERAL, "general", content, 700 + i as u64 * 2);
+        let row_id = h.store.insert_message(&msg).await.unwrap();
+        ids.push(row_id);
+        pending.push(PendingMessage {
+            row_id,
+            message_id: msg.message_id,
+            author_name: "alice".into(),
+            content: content.into(),
+            at: msg.timestamp,
+            mentions_self: false,
+            reply_to_self: false,
+            reply_to: None,
+        });
+        if i == 0 {
+            h.store
+                .insert_message(&bot_marker_message(GENERAL, 701))
+                .await
+                .unwrap();
+        }
+    }
+    h.actor
+        .handle_judge(JudgeBatch {
+            channel_id: GENERAL,
+            channel_name: "general".into(),
+            messages: pending,
+        })
+        .await
+        .unwrap();
+
+    let states = h.router.states.lock().unwrap().clone();
+    let recent = states[0].0["recent"].as_array().unwrap();
+    assert!(
+        recent.iter().any(|e| e.get("bot_marker").is_some()),
+        "バッチの間に挟まった目印が recent に出る: {recent:?}"
+    );
+}
+
+#[tokio::test]
+async fn message_older_than_the_reply_is_not_in_the_conversation_window() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("silent", 0.0, 0.0));
+    h.say_as(GENERAL, "@Noth", true).await;
+
+    let mut msg = incoming(GENERAL, "general", "前の発言", 800);
+    msg.timestamp = Timestamp::UNIX_EPOCH;
+    let row_id = h.store.insert_message(&msg).await.unwrap();
+    h.actor
+        .handle_judge(JudgeBatch {
+            channel_id: GENERAL,
+            channel_name: "general".into(),
+            messages: vec![PendingMessage {
+                row_id,
+                message_id: 800,
+                author_name: "alice".into(),
+                content: "前の発言".into(),
+                at: msg.timestamp,
+                mentions_self: false,
+                reply_to_self: false,
+                reply_to: None,
+            }],
+        })
+        .await
+        .unwrap();
+    let states = h.router.states.lock().unwrap().clone();
+    assert_eq!(states[1].0["trigger"][0]["in_conversation_window"], false);
+}
+
+#[tokio::test]
+async fn corrections_do_not_use_up_the_daily_supplement_budget() {
+    let mut h = Harness::with_worker().await;
+    let old = |i: u32| NewWorkerRun {
+        run_id: format!("old{i}"),
+        goal: "g".into(),
+        origin: Origin::Supplement,
+        channel_id: 999,
+        chunk_id: 1,
+        trigger_message_id: None,
+        fork_message_id: 0,
+    };
+    // 上限 50 の残りが 1 回
+    for i in 0..49 {
+        h.store.insert_worker_run(GUILD, &old(i)).await.unwrap();
+    }
+    h.router.set(correction_answers());
+    let worker = h.worker.clone();
+    for (i, text) in ["それ違うよ", "いや違うって", "やっぱり違う"]
+        .into_iter()
+        .enumerate()
+    {
+        h.say(GENERAL, text).await;
+        wait_until(|| worker.started() == i + 1).await;
+        assert_eq!(h.process_next_job().await, "join");
+    }
+    h.router.set(supplement_answers());
+    h.say(RANDOM, "別の話 $5 らしい").await;
+    wait_until(|| worker.started() == 4).await;
+}
+
+#[tokio::test]
+async fn silent_run_is_not_started_between_finish_and_join() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(supplement_answers());
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    // Worker は finished にして Join を積んだが、actor はまだ Join を処理していない
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h
+            .store
+            .worker_runs(GUILD, &[RunStatus::Finished])
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("run が finished にならない");
+    h.router.set(supplement_answers());
+    h.say(GENERAL, "上限は 100 件だって").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.worker.started(), 1);
+}
+
+fn with_answer(
+    mut a: Vec<(&'static str, Answer)>,
+    key: &'static str,
+    answer: Answer,
+) -> Vec<(&'static str, Answer)> {
+    a.retain(|(k, _)| *k != key);
+    a.push((key, answer));
+    a
+}
+
+fn reactions_of(h: &Harness) -> Vec<(ChannelId, MessageId, String)> {
+    h.channel.reactions.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn noise_never_enters_buffer_but_a_request_is_kept() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("silent", 0.95, 0.0));
+    h.say(GENERAL, "wwwwwww").await;
+    assert!(h.store.buffered_messages(GUILD).await.unwrap().is_empty());
+
+    // ノイズと判定されても Noth への依頼なら応答を優先し、Layer 3 に入れる
+    h.router.set(answers("reply_only", 0.95, 0.0));
+    h.say(GENERAL, "Noth").await;
+    assert_eq!(h.sent().len(), 1);
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert!(turns.iter().any(|t| t.text.contains("Noth")));
+    assert!(turns.iter().all(|t| !t.text.contains("wwwwwww")));
+}
+
+#[tokio::test]
+async fn noise_does_not_open_a_new_chunk() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("silent", 0.0, 0.0));
+    h.say(GENERAL, "本題").await;
+    let before = h
+        .store
+        .current_chunk(GUILD, GENERAL)
+        .await
+        .unwrap()
+        .unwrap();
+
+    h.router.set(answers("silent", 0.9, 0.9));
+    h.say(GENERAL, "wwww").await;
+    let after = h
+        .store
+        .current_chunk(GUILD, GENERAL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.id, before.id);
+}
+
+#[tokio::test]
+async fn pattern_c_without_goal_withholds_reply_and_starts_worker_with_eyes() {
+    let mut h = Harness::setup(Setup {
+        worker: true,
+        worker_permits: 0,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(spawn_answers());
+    h.provider.script_text("たぶん晴れですよ");
+    h.say(GENERAL, "明日の東京の天気わかる?").await;
+
+    assert!(h.sent().is_empty(), "main の返事は投稿しない");
+    assert_eq!(reactions_of(&h), vec![(GENERAL, 1001, "👀".to_string())]);
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    let task = h.worker.tasks.lock().unwrap()[0].clone();
+    assert_eq!(task.origin, Origin::Request);
+    assert!(task.goal.contains("明日の東京の天気わかる?"));
+    assert!(task.goal.contains("alice"));
+
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].kind, TurnKind::Trigger);
+    assert!(turns[1].text.starts_with("[Goal]\n"));
+    assert!(turns.iter().all(|t| !t.text.contains("たぶん晴れ")));
+    h.worker.release.add_permits(1);
+}
+
+#[tokio::test]
+async fn spawn_hint_tells_main_to_write_ack_and_goal() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(spawn_answers());
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.say(GENERAL, "天気調べて").await;
+    let hint = h.prompts()[0].ephemeral_tail.last().unwrap().text.clone();
+    assert!(hint.contains("Ack と `[Goal]` を書いて"));
+}
+
+fn supplement_answers() -> Vec<(&'static str, Answer)> {
+    with_answer(answers("silent", 0.0, 0.0), "worth_supplement", noul(0.9))
+}
+
+fn correction_answers() -> Vec<(&'static str, Answer)> {
+    with_answer(answers("silent", 0.0, 0.0), "corrects_noth", noul(0.9))
+}
+
+#[tokio::test]
+async fn supplement_runs_silently_and_replies_to_the_last_trigger_when_needed() {
+    let mut h = Harness::with_worker().await;
+    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
+    h.router
+        .set(with_delivery(supplement_answers(), "normal_report"));
+    h.provider.script_text("料金は月 $20 です");
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+
+    assert!(h.sent().is_empty(), "Ack は出さない");
+    assert!(reactions_of(&h).is_empty());
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    let task = h.worker.tasks.lock().unwrap()[0].clone();
+    assert_eq!(task.origin, Origin::Supplement);
+    assert!(task.goal.contains("プランは月 $10 らしい"));
+    assert!(h.prompts().is_empty(), "main は呼ばない");
+
+    assert_eq!(h.process_next_job().await, "join");
+    assert_eq!(h.sent(), vec![(GENERAL, "料金は月 $20 です".to_string())]);
+    assert_eq!(*h.channel.reply_to.lock().unwrap(), vec![Some(1001)]);
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert!(turns.iter().any(|t| t.kind == TurnKind::Conclusion));
+    assert_eq!(turns.last().unwrap().text, "料金は月 $20 です");
+    let runs = h
+        .store
+        .worker_runs(GUILD, &[RunStatus::Finished])
+        .await
+        .unwrap();
+    assert_eq!(runs[0].origin, Origin::Supplement);
+}
+
+#[tokio::test]
+async fn supplement_not_needed_keeps_conclusion_in_layer3_without_posting() {
+    let mut h = Harness::with_worker().await;
+    *h.worker.conclusion.lock().unwrap() = Some("正しかった\n補足の要否: 不要".into());
+    h.router.set(supplement_answers());
+    h.say(GENERAL, "Rust 2024 edition は最近出た").await;
+    assert_eq!(h.process_next_job().await, "join");
+
+    assert!(h.sent().is_empty());
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert!(
+        turns
+            .iter()
+            .any(|t| t.kind == TurnKind::Conclusion && t.text.contains("補足の要否: 不要"))
+    );
+    assert!(turns.iter().all(|t| t.role != Role::Assistant));
+}
+
+#[tokio::test]
+async fn supplement_is_dropped_when_the_join_judge_aborts() {
+    let mut h = Harness::with_worker().await;
+    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
+    h.router.set(with_delivery(supplement_answers(), "abort"));
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    assert_eq!(h.process_next_job().await, "join");
+
+    assert!(h.sent().is_empty());
+    assert!(h.prompts().is_empty(), "abort なら main を呼ばない");
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert!(turns.iter().any(|t| t.kind == TurnKind::Conclusion));
+    assert!(turns.iter().all(|t| t.role != Role::Assistant));
+}
+
+#[tokio::test]
+async fn supplement_is_dropped_when_main_writes_nothing() {
+    let mut h = Harness::with_worker().await;
+    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
+    h.router
+        .set(with_delivery(supplement_answers(), "normal_report"));
+    h.provider.script_text("");
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    assert_eq!(h.process_next_job().await, "join");
+
+    assert!(h.sent().is_empty());
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert!(turns.iter().any(|t| t.kind == TurnKind::Conclusion));
+    assert!(turns.iter().all(|t| t.role != Role::Assistant));
+}
+
+#[tokio::test]
+async fn noise_does_not_start_a_supplement() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(with_answer(
+        supplement_answers(),
+        "is_noise_or_meme",
+        noul(0.9),
+    ));
+    h.say(GENERAL, "www").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.worker.started(), 0);
+}
+
+#[tokio::test]
+async fn failed_silent_run_leaves_no_trace_in_conversation() {
+    let mut h = Harness::with_worker().await;
+    h.worker.fail.store(true, Ordering::SeqCst);
+    h.router.set(supplement_answers());
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    assert_eq!(h.process_next_job().await, "join");
+    assert!(h.sent().is_empty());
+    assert!(h.store.active_turns(GUILD).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn correction_runs_silently_without_counting_toward_supplement_budget() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(correction_answers());
+    let worker = h.worker.clone();
+    // 動作中の黙った Worker があると同じチャンネルでは起動しないので、1件ずつ合流させる
+    for (i, text) in ["それ違うよ", "いや違うって", "やっぱり違う"]
+        .into_iter()
+        .enumerate()
+    {
+        h.say(GENERAL, text).await;
+        wait_until(|| worker.started() == i + 1).await;
+        assert_eq!(h.process_next_job().await, "join");
+    }
+    assert!(
+        h.worker
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|t| t.origin == Origin::Correction)
+    );
+    assert!(h.sent().is_empty());
+
+    // 訂正は最短間隔にも数えられないので、その後の補足は起動できる
+    h.router.set(supplement_answers());
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    wait_until(|| worker.started() == 4).await;
+}
+
+#[tokio::test]
+async fn silent_run_is_not_started_while_another_is_active_in_the_channel() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(supplement_answers());
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    h.say(GENERAL, "上限は 100 件だって").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.worker.started(), 1);
+}
+
+#[tokio::test]
+async fn supplement_respects_min_interval_per_channel_and_daily_cap() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(supplement_answers());
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    h.say(GENERAL, "上限は 100 件だって").await;
+    h.say(RANDOM, "別のチャンネルの話 $5 らしい").await;
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        h.worker.started(),
+        2,
+        "同じチャンネルは最短間隔内なので補足しない"
+    );
+    let channels: Vec<_> = h
+        .worker
+        .tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.audience.channel_id)
+        .collect();
+    assert_eq!(channels, vec![Some(GENERAL), Some(RANDOM)]);
+
+    // 再起動後も worker_runs から数え直せる: 上限まで埋まっていれば、間隔が空いたチャンネルでも補足しない
+    let run = |i: u32| NewWorkerRun {
+        run_id: format!("old{i}"),
+        goal: "g".into(),
+        origin: Origin::Supplement,
+        channel_id: 999,
+        chunk_id: 1,
+        trigger_message_id: None,
+        fork_message_id: 0,
+    };
+    for i in 0..48 {
+        h.store.insert_worker_run(GUILD, &run(i)).await.unwrap();
+    }
+    h.router.set(supplement_answers());
+    h.say(777, "三つ目のチャンネル $1 らしい").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        h.worker.started(),
+        2,
+        "1 日の上限(50)に達したので補足しない"
+    );
+}
+
+#[tokio::test]
+async fn empty_reply_with_router_reaction_reacts_and_records_it_in_layer3() {
+    let mut h = Harness::new().await;
+    h.router.set(with_answer(
+        answers("reply_only", 0.0, 0.0),
+        "reaction",
+        reaction("r0"),
+    ));
+    h.provider.script_text("");
+    h.say(GENERAL, "ありがとう Noth").await;
+
+    assert!(h.sent().is_empty());
+    assert_eq!(reactions_of(&h), vec![(GENERAL, 1001, "👀".to_string())]);
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[1].role, Role::Assistant);
+    assert_eq!(turns[1].text, "[リアクション 👀]");
+}
+
+#[tokio::test]
+async fn main_can_choose_the_reaction_and_unlisted_emoji_is_ignored() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider.script_text("[React] 👀");
+    h.say(GENERAL, "ありがとう Noth").await;
+    assert_eq!(reactions_of(&h), vec![(GENERAL, 1001, "👀".to_string())]);
+
+    h.provider.script_text("[React] 🎉");
+    h.say(GENERAL, "どういたしまして Noth").await;
+    assert_eq!(
+        reactions_of(&h).len(),
+        1,
+        "許可されていない絵文字は付けない"
+    );
+    assert!(h.sent().is_empty(), "[React] の行は本文に出ない");
+}
+
+#[tokio::test]
+async fn reply_with_react_line_posts_text_and_reacts() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider.script_text("どういたしまして\n[React] 👀");
+    h.say(GENERAL, "ありがとう Noth").await;
+    assert_eq!(h.sent(), vec![(GENERAL, "どういたしまして".to_string())]);
+    assert_eq!(reactions_of(&h).len(), 1);
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert_eq!(turns[1].text, "どういたしまして");
 }

@@ -55,8 +55,9 @@ pub async fn run(
                             continue;
                         }
                     };
-                    // Noth 自身の発言は router が「直前に答えた」ことを知るためだけに保存する
-                    if msg.is_self {
+                    // Noth 自身の発言は router が「直前に答えた」ことを知るためだけに、Bot の目印は次の判定に付き添うためだけに保存する。
+                    // デバウンスも進めない(Bot どうしの応酬を防ぐ)
+                    if !msg.triggers_judge() {
                         continue;
                     }
                     // 必ず応答する発言は、デバウンスと router を待たずに入力中を見せる。

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use noth_core::types::UserId;
+use serenity::all as sn;
 
 use crate::MESSAGE_LIMIT;
 
@@ -176,6 +177,65 @@ pub(crate) fn split_message(text: &str, limit: usize) -> Vec<String> {
     }
     chunks.retain(|c| !c.trim().is_empty());
     chunks
+}
+
+const BOT_NAME_LIMIT: usize = 32;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AuthorKind {
+    /// Noth 自身
+    Own,
+    Member,
+    /// Noth 以外の Bot アカウント。本文は持ち込まず目印だけ流す
+    Bot,
+    Drop,
+}
+
+/// webhook は Bot アカウントと違い発言者を特定できないため、Bot の目印にも含めず捨てる
+pub(crate) fn classify_author(
+    is_self: bool,
+    is_bot: bool,
+    is_webhook: bool,
+    is_allowed: bool,
+    is_aside_msg: bool,
+) -> AuthorKind {
+    if is_self {
+        AuthorKind::Own
+    } else if is_webhook {
+        AuthorKind::Drop
+    } else if is_bot {
+        AuthorKind::Bot
+    } else if is_allowed && !is_aside_msg {
+        AuthorKind::Member
+    } else {
+        AuthorKind::Drop
+    }
+}
+
+pub(crate) fn bot_display_name(name: &str) -> String {
+    // `[Bot …]` の目印の行を名前で装えないよう、括弧は全角にする
+    let flat = name
+        .replace(['\r', '\n'], " ")
+        .replace('[', "［")
+        .replace(']', "］");
+    flat.trim().chars().take(BOT_NAME_LIMIT).collect()
+}
+
+pub(crate) fn message_chars(content: &str, embeds: &[sn::Embed]) -> usize {
+    let embed_chars: usize = embeds
+        .iter()
+        .map(|e| {
+            let fields: usize = e
+                .fields
+                .iter()
+                .map(|f| f.name.chars().count() + f.value.chars().count())
+                .sum();
+            e.title.as_deref().map_or(0, |t| t.chars().count())
+                + e.description.as_deref().map_or(0, |d| d.chars().count())
+                + fields
+        })
+        .sum();
+    content.chars().count() + embed_chars
 }
 
 #[cfg(test)]

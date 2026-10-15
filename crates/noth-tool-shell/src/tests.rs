@@ -1,11 +1,11 @@
-use noth_core::types::TaskCategory;
+use noth_core::types::Origin;
 
 use super::*;
 
 fn ctx(dir: &std::path::Path) -> ToolContext {
     ToolContext {
         run_id: "r".into(),
-        task_category: TaskCategory::CodeOrTool,
+        origin: Origin::Request,
         work_dir: dir.to_path_buf(),
         meter: None,
         history: None,

@@ -40,6 +40,14 @@ pub struct SystemOne {
 
 impl SystemOne {
     async fn call(&self, state: &Value, questions: &[(String, Question)]) -> Result<Decision> {
+        // API の上限を超えた質問はサーバー側で弾かれる。再試行しても同じなので送る前に落とす
+        if questions.len() > self.max_questions {
+            return Err(Error::Other(format!(
+                "質問が {} 件あり、1 リクエストの上限 {} を超えています",
+                questions.len(),
+                self.max_questions
+            )));
+        }
         let request = build_request(&self.model, state, questions);
         let start = Instant::now();
         let mut attempt = 0;
@@ -94,10 +102,6 @@ impl Router for SystemOne {
         questions: &[(String, Question)],
     ) -> Result<Decision> {
         self.call(&state.0, questions).await
-    }
-
-    fn max_questions(&self) -> usize {
-        self.max_questions
     }
 
     fn model_label(&self) -> String {

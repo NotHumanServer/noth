@@ -49,7 +49,7 @@ Context Layer Manager は本線の状態(Layer 2〜4、未昇格バッファ)を
 [Layer 2: Episodic Digest]   今日〜直近数日のエピソード要約ボード。Compactor のみが更新
 [Layer 3: Active Clean Log]  現在の会話ログ + Worker 結論メモ。Append-only
 ---------------------------------------------------------------- ↑ ここまで KV キャッシュ 100% ヒット
-[Layer 4: Ephemeral Tail]    router が今ターンのみ抽出した過去の関連チャンク + 今回のトリガー発言群
+[Layer 4: Ephemeral Tail]    今回のトリガー発言群 + 発言先・判定の指示(今ターンのみ)
 ```
 
 ### 3.1 各層の内容と変化のタイミング
@@ -69,10 +69,10 @@ Layer 0 を先頭に置くのは、Profile 側の記述で Harness Rules を上�
 
 本線が応答を出力した直後に次を行います。
 
-1. Layer 4 に一時挿入した「過去の関連チャンク」を破棄する
+1. Layer 4 に一時挿入した発言先・判定の指示を破棄する
 2. `[今回のトリガー発言群]`(Layer 4 に入れたときと同じブロック構造の user メッセージ)と `[本線の応答]`(assistant メッセージ)を Layer 3 の末尾へ確定追記する
 
-トリガー発言群のブロックは Layer 4 でも Layer 3 でも同じ内容・同じ形で、関連チャンクはその **前** に置きます。こうすると「関連チャンクを取り除く」操作では、末尾の2ブロックより前に挿入した関連チャンクだけを削除します。次ターンの Layer 0〜3 は、前ターンの Layer 0〜3 にトリガー発言群と応答の2ブロックを追記した形になります。
+トリガー発言群のブロックは Layer 4 でも Layer 3 でも同じ内容・同じ形で、発言先・判定の指示はその **後** に置きます。次ターンの Layer 0〜3 は、前ターンの Layer 0〜3 にトリガー発言群と応答の2ブロックを追記した形になります。
 
 `[発言先]` のブロックはトリガー発言群の **後ろ** に別の user メッセージとして置き、Layer 3 には昇格しません。チャンネル ID をトリガーのブロックに足すと、Layer 3 と形が変わるためです。発言群の `#チャンネル名` しか見えないと、本線は Goal に「このチャンネル」としか書けず、Worker が別のチャンネルを読むことがありました。Core が Worker に回す条件に当たると判定したとき(worker 有効で、`noth_request` かつ `needs_outside_work` か `corrects_noth` が閾値以上。§4.3)は、`[判定]` を `[発言先]` の後ろに別の user メッセージとして置き、「この発言は会話の外での作業が必要と判定された。Ack と `[Goal]` を書く」と伝えます。`[判定]` も Layer 3 には昇格しません。旧設計は「回すのが適切なら `[Goal]` で回す。直答で足りるなら普通に返事してよい」と任意にしていましたが、本線がそれで回さなかった実例(§4)があるため、v2 では書かなかったときの扱いを Core が決めます(パターン C)。
 
@@ -158,9 +158,8 @@ Core は以下の質問セットを定義し、router module に渡します。�
 |---|---|
 | `noth` | MEMORY.md の `## Noth について` 節。Noth が何者かを判定に教える。無ければ省く |
 | `members` | `{list: [{name, roles, memory?}]}`。Layer 1 のメンバー一覧(表示名とロール)に、MEMORY.md の `## メンバー` 節のうちその人の `### ` 小見出しの本文(コメントを除く)を `memory` として添える。小見出しの id でユーザーを突き合わせ(同じ id の小見出しが複数あれば本文をつなげる)、本文が空なら `memory` を省く。小見出しに属さない `## メンバー` 直下の項目は、誰の事実か決められないので `state` には入れない(Layer 1.5 には入る) |
-| `trigger` | デバウンス後の今回の発言群(チャンネル、投稿者の表示名、本文、時刻、`reply_to`、名前で呼ばれたかを示す `calls_noth_by_name`) |
+| `trigger` | デバウンス後の今回の発言群(チャンネル、投稿者の表示名、本文、時刻、`reply_to`、名前で呼ばれたかを示す `calls_noth_by_name`、Noth が応答した直後の窓の中の発言かを示す `in_conversation_window`) |
 | `recent` | 全チャンネルの直近 `recent_messages` 件(既定 30)。Noth 自身の発言も `is_self: true` で含める。各発言に `reply_to`。ほかの Bot の発言は本文の無い目印(§4.4)として同じ並びに入れる |
-| `candidates` | 候補 TopicChunk の `{id, channel, summary}`。関連判定の対象。関連チャンクの問いを外す場合は含めない(§4.2) |
 
 `reply_to` は Discord のリプライ先で、`{author, is_self, excerpt}`(`excerpt` は本文の先頭 60 文字)です。リプライでなければ省きます。`state_max_chars` を超えるときは `recent` の古い発言から削り、それでも超えるなら各メンバーの `memory`(長いものから)、`noth` の順に削ります。
 
@@ -170,18 +169,17 @@ Core は以下の質問セットを定義し、router module に渡します。�
 
 | キー | 型 | 意味 |
 |---|---|---|
-| `is_noise_or_meme` | noul | スタンプ連打・コピペ連投など文脈価値のないノイズか |
+| `is_noise_or_meme` | noul | スタンプ連打・コピペ連投など文脈価値のないノイズか。閾値は `[router.thresholds] is_noise_or_meme` |
 | `is_topic_shift` | noul | そのチャンネルの直前の会話から話題が切り替わったか |
 | `addressee` | choice: `other` / `about_noth` / `other_bot` / `noth_request` | 最後の発言は誰に向けたものか |
 | `needs_outside_work` | noul | 応えるのに会話の外での作業が必要か |
 | `corrects_noth` | noul | Noth が前に述べたことや調べた結果の誤りを指摘・反論しているか |
 | `worth_supplement` | noul | 確かめたり補ったりすると会話の役に立つ点があるか |
 | `reaction` | choice: `none` / `r0`〜(`[[router.reactions]]` の順) | 付ける絵文字。先頭の `none` は「付けない」で、`none` 以外が選ばれたときだけ付ける。選択肢の説明は「絵文字 + 意味」。`[[router.reactions]]` が空なら出さない |
-| `relevant_chunk_<id>` | noul × 候補数 | 候補 TopicChunk `<id>` が今回の発言に関連するか。候補ごとに1問。減らすか外すかは評価で決める |
 
 `task_category` はなくしました。`intervention_action` もなくなり、動き方は §4.3 の規則で決めます。
 
-**問いの文言(初期案)**: 最終的な文言は評価で詰めます。
+**問いの文言**: 評価に使った版(v2_1)を既定値にします。`[router.questions]`(`config.rs` の `QuestionTexts`)で、問いごとに文言を差し替えられます。choice の選択肢の並びは固定で、変えられるのは説明だけです。
 
 `addressee`: 最後の発言は誰に向けたものか。選択肢は同点のとき先頭が選ばれるため、安全な側を先頭に並べます。
 
@@ -202,17 +200,15 @@ Core は以下の質問セットを定義し、router module に渡します。�
 
 - TopicChunk は **チャンネルごと** に管理する。`is_topic_shift == true` ならそのチャンネルで新しい TopicChunk の ID を割り当てる。チャンネルが違えば別のチャンクなので、2チャンネルの交互発言で毎回 topic shift になることはない
 - `is_noise_or_meme == true` なら SQLite には記録するが、Layer 3 への昇格対象から外す。TopicChunk の要約にも足さず、topic shift でも新しいチャンクを作らない。ただし同時に本線が返事をする(`noth_request`)と決まった場合は、その発言をトリガーとして Layer 3 に入れる。応答した発言が Layer 3 に無いと会話が成り立たないため
-- 関連チャンクの問いは router の入力の約半分を占めるのに、役立ったのは 4% 未満だった。減らす(`candidate_chunks` を小さくする)か外すかは評価で決める。外した場合、Layer 4 の「過去の関連チャンク」は空になり、`state.candidates` も含めない
-- 候補 TopicChunk は直近のものから `candidate_chunks` 個。上限は `Router::max_questions() - 7`(他の質問が 7 問のため。Clef なら 57)。Layer 3 のターンが属しているチャンクと、未昇格クリーンバッファの発言が属しているチャンクは候補から外す。バッファはこのターンで Layer 3 に昇格するので、候補に入れると同じ本文が Layer 3 と Layer 4 に二重に入るため。候補の要約は TopicChunk 作成時に冒頭の数件の発言から機械的に作成する(LLM は使わない)
-- System One API に複数選択型は無いため、関連チャンクは候補ごとの `noul` で表現する。`choice` の選択肢上限 255 は本設計では使わない
+- 関連チャンクの問いはなくしました。router の入力の約半分を占めるのに、役立ったのは 4% 未満だったためです。Layer 4 の「過去の関連チャンク」と `state.candidates` もなくなり、質問数は固定(`reaction` を含めて 7)になりました
 
 ### 4.3 Core の決め方
 
 router の回答から動き方を決めるのは Core です。次の順に見ます。
 
-**決定的な `noth_request`**: Noth へのメンションと、Noth の発言へのリプライだけです。router の判定や失敗に関係なく `addressee == noth_request` として扱い、ノイズ扱いもしません。名指しされたのに無視すると、利用者には故障にしか見えないためです。名前による呼びかけは決定的に扱いません。「Noth の設計中に名前が出るたびに話しかけられると困るので、前の文脈から router が選ぶ」ためです(ユーザーの言葉)。本文に `[router] call_names` の呼び名(単語の一部としての一致は除く。呼び名の後ろに続くひらがなは単語の切れ目とみなす)が入っている発言は、`state.trigger` の `calls_noth_by_name` で router に伝え、`addressee` の問いで、呼びかけなら `noth_request`、名前が話題として出ているだけなら `about_noth` に分けます。`addressed_to_noth` の値で応答を決める旧設計の override(0.6 以上で静観を返答に引き上げる)と、呼び名での `name_call_reply` による応答はなくしました。
+**決定的な `noth_request`**: Noth へのメンションと、Noth の発言へのリプライだけです。router の判定や失敗に関係なく `addressee == noth_request` として扱い、ノイズ扱いもしません。名指しされたのに無視すると、利用者には故障にしか見えないためです。名前による呼びかけと続きの窓は決定的に扱いません。「Noth の設計中に名前が出るたびに話しかけられると困るので、前の文脈から router が選ぶ」ためです(ユーザーの言葉)。本文に `[router] call_names` の呼び名(単語の一部としての一致は除く。呼び名の後ろに続くひらがなは単語の切れ目とみなす)が入っている発言は、`state.trigger` の `calls_noth_by_name` で router に伝え、`addressee` の問いで、呼びかけなら `noth_request`、名前が話題として出ているだけなら `about_noth` に分けます。`addressed_to_noth` の値で応答を決める旧設計の override(0.6 以上で静観を返答に引き上げる)と、呼び名での `name_call_reply` による応答はなくしました。
 
-**続きの窓**: Noth がそのチャンネルで応答してから `conversation_window_secs`(既定 120 秒)の間は、そのとき話しかけてきた人の発言も `noth_request` として扱います。窓は外さずに残します。評価では、窓で返事をしていた 57 行のうち、`addressee` の問いで拾えたのは 39 行だったためです。この時刻と相手はメモリにだけ持ち、再起動で消えます。
+**続きの窓**: Noth がそのチャンネルで応答してから `conversation_window_secs`(既定 120 秒)の間の、そのとき話しかけてきた人の発言は、`state.trigger` の `in_conversation_window: true` で router に伝えます。`addressee` の `noth_request` の説明にある「Noth とのやりとりの直後の続き」の合図として、router が判断します(決定的には扱いません)。この時刻と相手はメモリにだけ持ち、再起動で消えます。
 
 | 条件 | 動き方 |
 |---|---|
@@ -225,8 +221,10 @@ router の回答から動き方を決めるのは Core です。次の順に見�
 | `other` で、`corrects_noth` が閾値以上 | 下の「訂正」 |
 | それ以外 | 静観する。リアクションは付けない(`other` の人どうしの会話や独り言には付けない) |
 
-- **補足**: Ack は出さない。Worker は調べたうえで、「本当に指摘や補足が必要か」を結論に含める。必要なときだけ、短い補足を投稿する。投稿しなかったときも、結論はいつもの Worker の結果と同じく Layer 3 に入れる(調べた結果を捨てないため)。検索の費用がかかるので、`[router]` の設定で、チャンネルごとの最短間隔 `supplement_min_interval_secs`(既定 300 秒)と1日の上限 `supplement_max_per_day`(既定 50 回。MVP は1 guild なので guild 全体の回数)を持つ。上限に当たった発言は補足せず静観する。投稿は、トリガーの最後の発言への Discord のリプライとして出し、`allowed_mentions` は空にする(メンションの通知を飛ばさない)
-- **訂正**: `corrects_noth` が高いときは、`addressee` が `other_bot` でない限り、Worker で調べ直す。`noth_request` ならパターン C で Ack を出して調べる。それ以外は補足と同じく黙って起動する。調べ直した結果を投稿するかは、補足と同じく Worker が決める。誤りを認める場合も、根拠を添えて元の結論を保つ場合もある。黙って調べ直す訂正の Worker には上限を設けず、補足の上限にも数えない。投稿は補足と同じ形(トリガーへのリプライ、`allowed_mentions` は空)
+- **補足**: Ack は出さない。結論メモには独立した行 `補足の要否: 要` / `補足の要否: 不要` を必ず含める(Core はこの行だけを読む。「要」の直後が行末・空白・句読点のときだけ要とし、「要らない」「要確認」や読めない場合は不要として扱う)。Worker は調べたうえで、「本当に指摘や補足が必要か」だけを結論に含め、投稿する文は書かない。投稿は main が書く(パターン C')。不要のときも、結論は Layer 3 に入れる(調べた結果を捨てないため)。検索の費用がかかるので、`[router]` の設定で、チャンネルごとの最短間隔 `supplement_min_interval_secs`(既定 300 秒)と1日の上限 `supplement_max_per_day`(既定 50 回。MVP は1 guild なので guild 全体の回数)を持つ。上限に当たった発言は補足せず静観する。ただし `corrects_noth` も閾値以上なら、上限に関係なく訂正として調べ直す。投稿は、トリガーの最後の発言への Discord のリプライとして出し、`allowed_mentions` は空にする(メンションの通知を飛ばさない)
+- **訂正**: `corrects_noth` が高いときは、`addressee` が `other_bot` でない限り、Worker で調べ直す。`noth_request` ならパターン C で Ack を出して調べる。それ以外は補足と同じく黙って起動する。調べ直した結果を投稿するかは、補足と同じく結論メモの要否と合流判定で決め、文は main が書く。誤りを認める場合も、根拠を添えて元の結論を保つ場合もある。黙って調べ直す訂正の Worker には上限を設けず、補足の上限にも数えない。投稿は補足と同じ形(トリガーへのリプライ、`allowed_mentions` は空)
+- **ノイズ**: ノイズと判定された発言は、補足・訂正・リアクションのどれも起こさない(メンションと Noth へのリプライを除く)
+- **重複防止**: 同じチャンネルで補足・訂正の Worker が動作中なら、新しい補足・訂正は起動しない。同じ話題で Worker が重なるのを防ぐため
 - `worker` module が無効な構成では、Worker を起動する行はすべて「本線が返事をする」(`noth_request`)か「静観する」(それ以外)に読み替える
 - `router-mention` は `addressee` を決定的な規則だけで返し、`needs_outside_work` / `corrects_noth` / `worth_supplement` は常に 0.0 とする。そのため Worker は起動せず、本線が自分の判断で `[Goal]` を書いたときだけ回る
 
@@ -241,6 +239,7 @@ router の回答から動き方を決めるのは Core です。次の順に見�
 - 対象は Bot アカウント(`author.bot`)の発言だけ。webhook 経由の発言は今までどおり落とし、目印も残さない。字数は `content` に embed のタイトル・説明・フィールドを足して数える
 - Bot の本文は長いので入れない。目印があれば、router も本線も「ほかの Bot とのやりとりの最中だ」と分かる
 - 目印は Layer 3 / Layer 4 と `RouterState` の `recent` に、ほかの発言と同じ並びで入れる。未昇格クリーンバッファにも他の発言と同じように溜め、判定(ノイズ判定を含む)は受けない。表示名は長さを制限し、改行を除く。リプライ先が `allowed_users` でなければ `<user>` にする
+- 同じ Bot の連続した目印は1行にまとめ(`[Bot 秘書ちゃん が N 件発言(約X字) 最初の message_id: … 最後の message_id: …]`)、Bot の目印の行が 20 を超えたら古い方から落として、最初に落とした位置に `[Bot の発言 N 件を省略]` を1行置く。`RouterState` では本文を持たず `bot_marker:{chars,count,reply_to?}` と省略分の `omitted_bot_messages` だけを渡す
 - **目印だけでは判定を起動しない。** Bot どうしの応酬を防ぐため。デバウンスのタイマーも進めず、アイドル(§5 パターン D)も解除しない。次に人間の発言で判定が走ったとき、その発言群と一緒に目印が `recent` と Layer 3 に現れる。再起動時の復元(§6.1)でも、目印だけの未判定を `Judge` にしない
 - `tool-discord` が有効なときは、次の案内を入れる。案内は Layer 0 の「Worker に頼めること」と同じく、有効な tool から組み立てる
   - **本線(Layer 0)**: 本線は tool を持たないので、「Bot の発言の中身が必要なら、`[Goal]` を書いて Worker に読ませる」と伝える
@@ -294,11 +293,11 @@ sequenceDiagram
     alt 静観(about_noth / other_bot / other)
         R-->>A: クリーン発言はバッファへ(リアクションだけ付ける場合あり)
     else noth_request(通常)
-        A->>M: バッファ昇格、Layer 4 = 関連チャンク + トリガー
+        A->>M: バッファ昇格、Layer 4 = トリガー
         M->>D: 応答
         A->>A: トリガー + 応答を Layer 3 へ昇格
     else noth_request + 外部作業 / 訂正
-        A->>M: バッファ昇格、Layer 4 = 関連チャンク + トリガー + [判定]
+        A->>M: バッファ昇格、Layer 4 = トリガー + [判定]
         M->>D: Ack(Goal が無ければ返事を捨て、👀 で代える)
         A->>A: トリガー + Ack(+ Goal)を Layer 3 へ昇格
         A->>W: Layer 0〜3 + tools を引き継ぎ Fork(並行)
@@ -334,15 +333,15 @@ Noth の話をしているが返事を求められていない発言に、絵文
 1. `about_noth` で静観と決まった発言群について、`reaction` の回答が `none` 以外のときだけ付ける(`none`、または回答が欠けるときは付けない)
 2. トリガー発言群の最後の発言にリアクションを付ける。本線は起動しない。失敗(権限不足など)はログに残して無視する
 3. 発言していないので Layer 3 には何も足さない。発言はパターン A と同じく未昇格クリーンバッファに入れる
-4. メンションとリプライは `noth_request` になり、本線が返事をするので、このパターンには来ない。お礼のような返事のいらない名指しは、本線が空の返事を返したとき、`reaction` が `none` 以外ならその絵文字だけを付ける(投稿はしない)。Layer 3 には「[リアクション <絵文字>]」の assistant メッセージを残す
+4. 本線が返事の本文を書かずに `[React] <絵文字>` の1行だけを書くと(絵文字は `[[router.reactions]]` にあるものだけ。Layer 0 で規定)、その絵文字を付ける。返事が空で `[React]` も無いときは、router の `reaction` が `none` 以外ならその絵文字を使う。メンションとリプライは `noth_request` になり、本線が返事をするので、このパターンには来ない。お礼のような返事のいらない名指しは、本線が空の返事を返したとき、`reaction` が `none` 以外ならその絵文字だけを付ける(投稿はしない)。Layer 3 には「[リアクション <絵文字>]」の assistant メッセージを残す
 
 ### パターン B: 通常の会話介入(`noth_request` で、Worker に回す条件に当たらないとき)
 
 1. 未昇格クリーンバッファの発言を TopicChunk ごとに1ブロックにまとめて Layer 3 に追記する
-2. router が true と判定した `relevant_chunk_<id>` のチャンク本文(関連チャンクの問いを外した場合は無し)と今回のトリガー発言を Layer 4 にセットする
+2. 今回のトリガー発言と発言先を Layer 4 にセットする
 3. 本線が推論し、Channel 経由で発言する。生成中は typing インジケータを出す。Channel は 2,000 文字を超える応答を分割投稿し、`allowed_mentions` を空にして `@everyone` やロールメンションを抑止する
 4. provider のエラー(429 / 5xx・タイムアウト・止まったストリーム)は `retry_max` 回まで指数バックオフで再試行する(既定は `retry_max = 2` で、初回と合わせて最大 3 回)。それでも失敗したら typing を止め、トリガーのチャンネルに `⚠️ 応答を生成できませんでした(<モデル名> が応答しませんでした)。少し待ってからもう一度話しかけてください` と投稿(認証失敗は「の認証に失敗しました。管理者に確認してもらってください」、利用上限は「の利用上限に達しました」、それ以外は「でエラーが発生しました」)してターンを終了する。この通知は Layer 3 に入れず、トリガー発言は昇格せずバッファに戻す。同じチャンネルへの通知は本線と Join で別々に 60 秒に 1 回までで、router の失敗では通知しない
-5. Layer 4 の過去チャンクを取り除き、トリガー発言と本線の応答を Layer 3 末尾へ確定追記する
+5. Layer 4 の発言先を取り除き、トリガー発言と本線の応答を Layer 3 末尾へ確定追記する
 
 ### パターン C: 自律タスク起動(`noth_request` で `needs_outside_work` か `corrects_noth` が閾値以上)
 
@@ -388,10 +387,10 @@ Noth の話をしているが返事を求められていない発言に、絵文
 1. 補足なら、Core が `supplement_min_interval_secs` と `supplement_max_per_day` を確認する。当たれば静観にする。訂正は確認しない(上限なし)
 2. Ack は出さず、`[Goal]` も本線に書かせない。Core がトリガーと発言先を依頼文にし、補足なら「本当に指摘や補足が必要かを調べて判断する」、訂正なら「Noth が前に述べたことが誤りでないか調べ直す」と書く。トリガー発言群は未昇格バッファのままで、Layer 3 には入れない。Worker の最初の user メッセージにトリガー発言群と依頼された場所を入れる
 3. Fork して Worker を実行する(パターン C の 2 と同じ。キューと `timeout_secs` も同じ)。入力中表示と進捗の編集は出さない。投稿するか分からないうちに、調べていることを見せないため
-4. Worker の結論メモに、「補足(または訂正)が必要か」と、必要なら投稿する短い本文の案を含める。Layer 0 で結論メモの書式として規定する
+4. Worker の結論メモに、「補足(または訂正)が必要か」を `補足の要否:` の行で含める。投稿する本文は書かせない。Layer 0 で結論メモの書式として規定する
 5. 完了時の Join は次のように分かれる
    - **不要**: 未昇格バッファを昇格し、`[内部調査完了 <run_id>: <結論メモ>]` を Layer 3 に追記するだけ。router の合流判定も本線も呼ばず、何も投稿しない。調べた結果を捨てないため
-   - **必要**: パターン C の 3 と同じ。結論メモを Layer 3 に追記し、合流判定(`abort` もありうる)を経て、本線が短い補足を、トリガーの最後の発言へのリプライとして投稿する(`allowed_mentions` は空)。誤りを認める場合も、根拠を添えて元の結論を保つ場合もある
+   - **必要**: 結論メモを Layer 3 に追記し、合流判定(補足・訂正用の文面で、迷うなら `abort`)を経る。続けるなら main を呼び、Layer 4 の指示で短い補足を書かせて、トリガーの最後の発言へのリプライとして投稿する(`allowed_mentions` は空)。main の返事が空なら投稿しない。誤りを認める場合も、根拠を添えて元の結論を保つ場合もある
    - **失敗**: 結論メモの代わりの `[内部調査失敗 <run_id>: <理由>]` は SQLite に残すだけで、Layer 3 にも Discord にも出さない。利用者は調べていることを知らないため
 
 ### パターン D: アイドル時コンパクション
@@ -431,7 +430,7 @@ Noth の話をしているが返事を求められていない発言に、絵文
 | テーブル | 内容 |
 |---|---|
 | `messages` | `allowed_users` と Noth 自身の発言の生ログ、Bot の目印。チャンネル、投稿者、`is_self`、本文、時刻、所属 TopicChunk、`is_noise_or_meme`、自分宛てのメンション・リプライか、リプライ先の発言 ID・投稿者名・Noth の発言か、`decision_id`(NULL なら未判定)、`promoted_turn_id`(NULL なら未昇格) |
-| `topic_chunks` | TopicChunk の ID、チャンネル、開始・終了時刻、候補用の機械要約、Compactor による要約が済んでいるか |
+| `topic_chunks` | TopicChunk の ID、チャンネル、開始・終了時刻、Compactor による要約が済んでいるか |
 | `decisions` | router の判定結果と各回答の確率・confidence、Core が決めた動き方、レイテンシ、判定したモデル(版を固定した名前。`jev/<固定名>` など) |
 | `active_log` | Layer 3 のターン列。各ターンの種別(バッファ / トリガー / 応答 / 結論メモ)、`chunk_id`、その時点の `usage` |
 | `digests` | Layer 2 の履歴 |
@@ -449,14 +448,14 @@ Noth の話をしているが返事を求められていない発言に、絵文
 3. `messages` のうち `promoted_turn_id` が NULL で `decision_id` があるものを未昇格バッファに戻す
 4. `decision_id` が NULL の発言(判定前に落ちたもの)はまとめて1つの `Judge` としてキューに積む。Bot の目印だけが残っているときは積まない
 
-## 7. 実装で直すこと
+## 7. 実機で確かめること
 
-v2 の設計を、2026-10-16 時点のコードが満たしていない箇所です。コードは先に確かめた結果で、この節の項目は実装で直します。
+コードだけでは確かめられない項目です。Discord と System One(Jev)につないで観測します。
 
-1. **Bot の目印(`channel-discord`)**: 受信ハンドラが Noth 以外の Bot の発言を、目印も残さず落としている(`crates/noth-channel-discord/src/handler.rs:50` の `msg.author.bot || msg.webhook_id.is_some() || ...` で return)。`author.bot` の Noth 以外は、本文を読まずに目印(表示名、リプライ先、embed を含む文字数、message_id)だけを `IncomingMessage` に流す。webhook は落としたままにする。判定は起動しない(§4.4)
-2. **`tool-discord` の `fetch_messages`**: message_id を指定した読み出しは `before` / `after` / `around` で可能だが(`crates/noth-tool-discord/src/lib.rs:318-326`、`manifest.rs:101-103`)、Noth 以外の Bot の発言は本文を返さず `{id, author: "<user>", at}` に伏せている(`format.rs:99-107`。`tests.rs:335` の `bot says hi` が伏せられることをテストで固定している)。読めるのは `allowed_users` と Noth 自身(`viewer.self_id`)だけ。Bot の発言は、`content` に加えて embed のタイトル・説明・フィールドもテキストにして返すように変え、外部の指示が紛れうるものとして `bot: true` を付ける([security.md §2](architecture/security.md#2-discord-側の対策))。ID 1 件だけを取る専用の引数は無いので、`around` に `limit: 1` を組み合わせて使えるか(`around` が対象を含むか)を実機で確かめ、使えなければ専用の引数を足す
-3. **`tool-discord` の `search_messages`**: Noth の SQLite の `messages` だけを引く(`crates/noth-core/src/history.rs` の `HistoryQuery` に message_id は無い)。`channel-discord` が Bot を落とすので Bot の発言は含まれず、目印を保存しても対象外とする(`is_bot_marker` を除く)。message_id で引く手段は無いので、Bot の本文は `fetch_messages` で読む
-4. **`RouterState` と質問セット(`noth-core`)**: `reaction` の先頭に `none` を足す。リアクションを付ける条件を `about_noth` と空の返事だけにする。呼び名だけの発言を決定的に扱っている処理をやめ、メンションとリプライだけにする。`intervention_action` / `task_category` / `addressed_to_noth` を `addressee` / `needs_outside_work` / `corrects_noth` / `worth_supplement` に置き換える。`ToolContext.task_category` と `worker_runs.task_category` を `origin` に置き換える。`[router.thresholds]` の `addressed_to_noth` と `name_call_reply` をなくす
-5. **`[判定]` と、`[Goal]` が無いときの Core による起動**(パターン C)、**黙って調べる Worker**(パターン C')、`supplement_min_interval_secs`(既定 300)/ `supplement_max_per_day`(既定 50。訂正は数えない)、補足・訂正の投稿をトリガーへのリプライ(`allowed_mentions` は空)にすること、空の返事+リアクションだけの返事、投稿しなかった返事をログにだけ残すこと、結論メモの「補足の要否」欄
-6. **コメントの誤り(`crates/noth-core/src/config.rs:711`)**: 雛形のコメント「Clef(Cloudflare Workers AI)は安いが、…」は誤り。入力の料金は Jev $0.042、Clef $0.240、Clef-flash $0.038(100万トークンあたり)で、安いのは Clef-flash だけ(§4.6)。「Clef は安い」という趣旨の記述を、Clef-flash だけに直す
-7. **モデル名**: 既定の `jev-latest`(`crates/noth-router-systemone/src/preset.rs:59`)を、版を固定した名前にする(§4.6)
+1. 補足・訂正のリプライ表示と、通知が飛ばないこと
+2. 合流判定(Jev)の `abort` の出やすさ。補足・訂正用の文面は迷うなら abort にしているので、出すぎないか
+3. main が補足を空の返事にする頻度と、`[React]` の規約を守るか
+4. Worker が結論メモに `補足の要否:` を書式どおり書くか
+5. Jev が `in_conversation_window` を続きの合図として使うか
+6. Bot の目印の message_id から、`tool-discord` で本文を読めること(`channel-discord` と `tool-discord` の対応が前提)
+7. 目印のまとめと省略(§4.4)が、router と main から見て分かりやすいか

@@ -30,7 +30,7 @@ impl ConnectionState {
 pub trait Channel: Send + Sync {
     /// 発言を記録するテーブルのキー。MVP は1 guild
     fn guild_id(&self) -> GuildId;
-    /// 接続し、受信した発言を Event Bus に流す。allowed_users 以外と Bot の発言はここで捨てる
+    /// 接続し、受信した発言を Event Bus に流す。allowed_users 以外の人間と webhook の発言はここで捨てる。Noth 以外の Bot の発言は本文を持たない目印(`IncomingMessage::bot_marker`)にして流す
     async fn run(&self, bus: BusHandle) -> Result<()>;
     /// 2,000 文字を超えれば分割し、最後の MessageId を返す。allowed_mentions は常に空
     async fn send(
@@ -119,9 +119,7 @@ pub trait Router: Send + Sync {
         state: &RouterState,
         questions: &[(String, Question)],
     ) -> Result<Decision>;
-    /// 1リクエストに載せられる質問数。候補チャンクの数を決めるのに使う
-    fn max_questions(&self) -> usize;
-    /// `decisions.model` に記録する識別子(例: `jev/jev-latest`)。モデルごとの判定傾向を比べるため
+    /// `decisions.model` に記録する識別子(例: `jev/<版を固定した名前>`)。モデルごとの判定傾向を比べるため
     fn model_label(&self) -> String;
     async fn health_check(&self) -> Result<String>;
 }
@@ -201,7 +199,7 @@ pub struct WorkerProgress {
 pub struct WorkerTask {
     pub run_id: String,
     pub goal: String,
-    pub task_category: TaskCategory,
+    pub origin: Origin,
     pub base: LayeredPrompt,
     pub work_dir: std::path::PathBuf,
     /// None なら進捗を送らない。送信に失敗しても Worker は続ける

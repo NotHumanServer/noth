@@ -3,12 +3,14 @@ use std::collections::HashMap;
 use noth_core::async_trait;
 use noth_core::bus::{BusEvent, BusHandle};
 use noth_core::traits::ConnectionState;
-use noth_core::types::{IncomingMessage, ReplyTo, UserId};
+use noth_core::types::{BotMarker, IncomingMessage, ReplyTo, UserId};
 use serenity::all as sn;
 use serenity::prelude::{Context, EventHandler};
 
 use crate::state::{Names, SharedState, from_stage};
-use crate::text::{is_aside, replace_mentions};
+use crate::text::{
+    AuthorKind, bot_display_name, classify_author, is_aside, message_chars, replace_mentions,
+};
 
 pub(crate) struct Handler {
     pub(crate) bus: BusHandle,
@@ -46,12 +48,14 @@ impl EventHandler for Handler {
         }
         let author_id = msg.author.id.get();
         let is_self = author_id == self.self_id;
-        if !is_self
-            && (msg.author.bot
-                || msg.webhook_id.is_some()
-                || !self.allowed.contains(&author_id)
-                || is_aside(&msg.content))
-        {
+        let origin = classify_author(
+            is_self,
+            msg.author.bot,
+            msg.webhook_id.is_some(),
+            self.allowed.contains(&author_id),
+            is_aside(&msg.content),
+        );
+        if origin == AuthorKind::Drop {
             return;
         }
 
@@ -62,14 +66,19 @@ impl EventHandler for Handler {
             .collect();
         lookup.extend(self.names.read().unwrap_or_else(|e| e.into_inner()).clone());
 
-        let content = replace_mentions(
-            &msg.content,
-            self.self_id,
-            &self.self_name,
-            &self.allowed,
-            &lookup,
-        );
-        if content.trim().is_empty() {
+        let is_bot = origin == AuthorKind::Bot;
+        let content = if is_bot {
+            String::new()
+        } else {
+            replace_mentions(
+                &msg.content,
+                self.self_id,
+                &self.self_name,
+                &self.allowed,
+                &lookup,
+            )
+        };
+        if !is_bot && content.trim().is_empty() {
             return;
         }
         let author_name = msg
@@ -89,40 +98,62 @@ impl EventHandler for Handler {
             })
             .unwrap_or_else(|| msg.channel_id.get().to_string());
 
-        let reply_to = msg.referenced_message.as_ref().map(|r| {
-            let is_self = r.author.id.get() == self.self_id;
-            // allowed_users 以外の発言は保存しない方針なので、返信先でも名前と本文を残さない
-            if !is_self && !self.allowed.contains(&r.author.id.get()) {
-                return ReplyTo {
-                    message_id: r.id.get(),
-                    author_name: "<user>".into(),
-                    is_self: false,
-                    excerpt: String::new(),
-                };
-            }
-            let author_name = if is_self {
-                self.self_name.clone()
-            } else {
-                r.member
-                    .as_ref()
-                    .and_then(|m| m.nick.clone())
-                    .or_else(|| lookup.get(&r.author.id.get()).cloned())
-                    .unwrap_or_else(|| r.author.display_name().to_string())
-            };
-            let referenced = replace_mentions(
-                &r.content,
-                self.self_id,
-                &self.self_name,
-                &self.allowed,
-                &lookup,
-            );
-            ReplyTo {
-                message_id: r.id.get(),
-                author_name,
-                is_self,
-                excerpt: ReplyTo::excerpt_of(&referenced),
-            }
+        let bot_marker = is_bot.then(|| BotMarker {
+            author_name: bot_display_name(&author_name),
+            reply_to_author: msg.referenced_message.as_ref().map(|r| {
+                let id = r.author.id.get();
+                if id == self.self_id {
+                    self.self_name.clone()
+                } else if self.allowed.contains(&id) {
+                    r.member
+                        .as_ref()
+                        .and_then(|m| m.nick.clone())
+                        .or_else(|| lookup.get(&id).cloned())
+                        .unwrap_or_else(|| r.author.display_name().to_string())
+                } else {
+                    "<user>".into()
+                }
+            }),
+            chars: message_chars(&msg.content, &msg.embeds),
         });
+        let reply_to = msg
+            .referenced_message
+            .as_ref()
+            .filter(|_| !is_bot)
+            .map(|r| {
+                let is_self = r.author.id.get() == self.self_id;
+                // allowed_users 以外の発言は保存しない方針なので、返信先でも名前と本文を残さない
+                if !is_self && !self.allowed.contains(&r.author.id.get()) {
+                    return ReplyTo {
+                        message_id: r.id.get(),
+                        author_name: "<user>".into(),
+                        is_self: false,
+                        excerpt: String::new(),
+                    };
+                }
+                let author_name = if is_self {
+                    self.self_name.clone()
+                } else {
+                    r.member
+                        .as_ref()
+                        .and_then(|m| m.nick.clone())
+                        .or_else(|| lookup.get(&r.author.id.get()).cloned())
+                        .unwrap_or_else(|| r.author.display_name().to_string())
+                };
+                let referenced = replace_mentions(
+                    &r.content,
+                    self.self_id,
+                    &self.self_name,
+                    &self.allowed,
+                    &lookup,
+                );
+                ReplyTo {
+                    message_id: r.id.get(),
+                    author_name,
+                    is_self,
+                    excerpt: ReplyTo::excerpt_of(&referenced),
+                }
+            });
         let incoming = IncomingMessage {
             guild_id: self.guild_id,
             channel_id: msg.channel_id.get(),
@@ -140,6 +171,7 @@ impl EventHandler for Handler {
                 .as_ref()
                 .is_some_and(|r| r.author.id.get() == self.self_id),
             reply_to,
+            bot_marker,
         };
         if let Err(e) = self.bus.publish(BusEvent::MessageReceived(incoming)).await {
             tracing::error!(error = %e, "failed to publish message");

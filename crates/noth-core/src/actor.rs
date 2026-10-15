@@ -11,25 +11,26 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::config::{CompactorSettings, Config};
 use crate::error::ErrorKind;
-use crate::judge::{self, Action, Binarized, DeliveryStyle, JudgeBatch};
+use crate::judge::{
+    self, Action, ActionInput, DeliveryStyle, JudgeAnswers, JudgeBatch, PendingMessage,
+};
 use crate::layers::{self, Line};
+use crate::markers::{self, Folded};
 use crate::registry::Modules;
-use crate::store::{MessageRow, NewWorkerRun, RunStatus, Store};
-use crate::text;
+use crate::store::{MessageRow, NewWorkerRun, RunStatus, Store, WorkerRunRow};
 use crate::traits::{
     Channel, Compactor, Completion, LayeredPrompt, Provider, Router, Worker, WorkerOutcome,
     WorkerTask,
 };
 use crate::types::*;
-use crate::{Error, Result, bus, heartbeat, ingest, memory, progress, restore};
+use crate::{Error, Result, bus, heartbeat, ingest, memory, progress, restore, supplement};
 
 /// typing インジケータは Discord 側で約 10 秒で消えるので、それより短い間隔で再送する
 const TYPING_INTERVAL: Duration = Duration::from_secs(8);
-const SUMMARY_CHARS: usize = 40;
-/// 委譲しなかった本線の応答をログに出すときの先頭の文字数
+/// 委譲しなかったmain の応答をログに出すときの先頭の文字数
 const MISMATCH_HEAD_CHARS: usize = 60;
-/// 関連チャンク 1 つあたりの本文の上限。候補が多くても Layer 4 が膨らまないようにする
-const RELEVANT_CHUNK_MAX_CHARS: usize = 6_000;
+/// Core が依頼を作った(main が Goal を書かなかった)ときの Ack の代わり
+const ACK_REACTION: &str = "👀";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// アイドル判定の周期。idle_minutes は分単位なので、この程度の遅れは問題にならない
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -219,6 +220,8 @@ pub struct Actor {
     jobs: mpsc::UnboundedSender<Job>,
     /// Fork してまだ Join を処理していない run の数。アイドル判定と終了待ちに使う
     in_flight: usize,
+    /// 黙った Worker が finished になってから Join を処理するまでの間も、同じチャンネルで重ねて起動しないため。再起動では restore が全 run を中止するので持ち越さない
+    silent_pending: HashSet<ChannelId>,
     /// キューに積んだ Compact が対象とするアイドル期間(その時点の人間の最終発言の行 ID)
     compact_queued: Option<i64>,
     /// コンパクションを済ませたアイドル期間。新しい人間の発言が来るまで次を積まない
@@ -248,17 +251,25 @@ enum FailureKind {
     Join,
 }
 
-/// 本線を呼ぶときの router の判定。委譲しなかったときに食い違いを記録するために渡す
+/// main を呼ぶときの router の判定。委譲しなかったときに食い違いを記録するために渡す
 #[derive(Debug, Clone, Copy)]
 enum RouterVerdict {
     ReplyOnly,
     SpawnTask {
-        /// 判定の JSON に spawn_task の確率が無ければ None
+        /// 判定の JSON に needs_outside_work の確率が無ければ None
         probability: Option<f64>,
     },
 }
 
-/// 本線が Worker に任せると決めた内容
+/// router の回答のうち、main の応答の扱いに使うもの
+struct RespondHints {
+    /// main の返事が空だったときに付けるリアクション
+    reaction: Option<String>,
+    /// 依頼が Noth の前の発言への訂正でもあるか(Core が作る依頼文に反映する)
+    corrects_noth: bool,
+}
+
+/// main が Worker に任せると決めた内容
 struct TaskPlan {
     /// Discord に投稿する Ack。[Memo] 行を除いてある
     ack: String,
@@ -266,14 +277,18 @@ struct TaskPlan {
     log_ack: String,
     memos: Vec<memory::Memo>,
     goal: String,
-    category: TaskCategory,
+    origin: Origin,
 }
 
-/// 本線の応答から [Memo] 行を分けたもの
+/// main の応答から [Memo] 行を分けたもの
 struct Reply {
     /// Discord に投稿する本文。空なら投稿しない
     post: String,
+    /// Layer 3 に残す本文。[Memo] 行は含み、[React] 行は含まない
+    log: String,
     memos: Vec<memory::Memo>,
+    /// `[React]` で選ばれた、許可された絵文字
+    reaction: Option<String>,
 }
 
 impl Actor {
@@ -312,8 +327,13 @@ impl Actor {
                 .map_or(FALLBACK_KEEP_RECENT_TURNS, |s| s.keep_recent_turns),
         };
         Ok(Self {
-            harness_rules: layers::harness_rules(worker.is_some(), &tools, &config.memory),
-            compactor_rules: layers::harness_rules(false, &[], &config.memory),
+            harness_rules: layers::harness_rules(
+                worker.is_some(),
+                &tools,
+                &config.memory,
+                &config.router.reactions,
+            ),
+            compactor_rules: layers::harness_rules(false, &[], &config.memory, &[]),
             profile: layers::profile_layer(&config, members),
             memory: memory::layer_text(
                 &memory::read(&config.paths.memory_file()),
@@ -333,6 +353,7 @@ impl Actor {
             tools,
             jobs,
             in_flight: 0,
+            silent_pending: HashSet::new(),
             compact_queued: None,
             compacted_for: None,
             channel_names: HashMap::new(),
@@ -380,42 +401,22 @@ impl Actor {
             .insert(batch.channel_id, batch.channel_name.clone());
 
         let current = self.store.current_chunk(guild, batch.channel_id).await?;
-        let turns = self.store.active_turns(guild).await?;
-        // Layer 3・未昇格バッファ・今の会話の本文は本線に見えているか、このあと昇格して見えるので、関連チャンクの候補にしない。
-        // バッファを漏らすと同じ本文が Layer 3 と Layer 4 に二重に載る
-        let mut exclude: Vec<i64> = turns.iter().filter_map(|t| t.chunk_id).collect();
-        exclude.extend(
-            self.store
-                .buffered_messages(guild)
-                .await?
-                .iter()
-                .filter_map(|r| r.chunk_id),
-        );
-        exclude.extend(current.as_ref().map(|c| c.id));
-        exclude.sort_unstable();
-        exclude.dedup();
-
-        let limit = self.config.router.candidate_chunks.min(
-            self.router
-                .max_questions()
-                .saturating_sub(judge::FIXED_QUESTIONS),
-        );
-        let candidates = self.store.candidate_chunks(guild, limit, &exclude).await?;
-        let first_row_id = batch
+        // バッチの途中に挟まった Bot の目印も router に見せるため、最後のトリガー行より前を取る。
+        // トリガー自身は state から除くので、その分を多めに取る
+        let last_row_id = batch
             .messages
             .iter()
             .map(|m| m.row_id)
-            .min()
+            .max()
             .unwrap_or(i64::MAX);
         let recent = self
             .store
-            .recent_messages(guild, first_row_id, self.config.router.recent_messages)
+            .recent_messages(
+                guild,
+                last_row_id,
+                self.config.router.recent_messages + batch.messages.len(),
+            )
             .await?;
-        for r in &recent {
-            self.channel_names
-                .entry(r.channel_id)
-                .or_insert_with(|| r.channel_name.clone());
-        }
 
         // 手で直した内容がすぐ判定に効くよう、state 用には毎回ディスクから読む(router の入力はキャッシュに影響しない)
         let memory_text = memory::read(&self.config.paths.memory_file());
@@ -430,37 +431,26 @@ impl Actor {
             members: &self.members,
             member_memory: &member_memory,
         };
-        let state = judge::build_state(
-            &batch,
-            &recent,
-            &candidates,
-            &self.channel_names,
-            &roster,
-            &self.config.router,
-        );
-        let questions = judge::build_questions(&candidates, &self.config.router.reactions);
-        let candidate_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+        let state = judge::build_state(&batch, &recent, &roster, &self.config.router, &|m| {
+            self.in_conversation_window(batch.channel_id, m)
+        });
+        let questions =
+            judge::build_questions(&self.config.router.questions, &self.config.router.reactions);
 
-        let called_by_name = batch
-            .messages
-            .iter()
-            .any(|m| text::contains_any_name(&m.content, &self.config.router.call_names));
-        // Clef は Noth の応答直後の返事を Noth 宛てと見なさないことが多いので、名前で呼ばれたのと同じ扱いにする
-        let in_conversation = self.continues_conversation(&batch);
-        let addressed_directly = batch
+        // 決定的に noth_request とするのはメンションと Noth の発言へのリプライだけ。
+        // 名前での呼びかけと続きの窓は router への合図で、前後の文脈から router が選ぶ
+        // (開発の話題で名前が出るたびに割り込まないため)
+        let cued = batch
             .messages
             .iter()
             .any(|m| m.mentions_self || m.reply_to_self);
-        let (mut binarized, kind, answers, latency_ms) =
+        let (answers, kind, answers_json, latency_ms) =
             match self.router.decide(&state, &questions).await {
                 Ok(decision) => (
                     judge::binarize(
                         &decision,
-                        &candidate_ids,
                         &self.config.router.reactions,
                         &self.config.router.thresholds,
-                        called_by_name || in_conversation,
-                        addressed_directly,
                     ),
                     "judge",
                     judge::answers_json(&decision),
@@ -468,59 +458,68 @@ impl Actor {
                 ),
                 Err(e) => {
                     tracing::warn!(error = %e, "router の判定に失敗しました。静観として扱います");
-                    let mut safe = Binarized::safe();
-                    // 名指しへの無応答は故障に見えるので、router が落ちていても応答する
-                    if called_by_name {
-                        safe.answer_direct_call();
-                    }
-                    (safe, "judge_error", json!({ "error": e.to_string() }), 0)
+                    (
+                        JudgeAnswers::safe(),
+                        "judge_error",
+                        json!({ "error": e.to_string() }),
+                        0,
+                    )
                 }
             };
-        if addressed_directly {
-            binarized.answer_direct_call();
-        }
         let decision_id = self
             .store
             .insert_decision(
                 guild,
                 kind,
                 &self.router.model_label(),
-                &answers,
+                &answers_json,
                 latency_ms,
             )
             .await?;
 
-        let summary = summarize(&first.content);
+        let is_noise = answers.is_noise_for(cued);
         // ノイズの本文は要約にも新しいチャンクの種にもしない。チャンクが無いときだけは割り当て先が要るので作る
         let chunk_id = match current {
-            Some(c) if binarized.is_noise => {
-                self.store.touch_chunk(c.id, last.at, None).await?;
+            Some(c) if is_noise => {
+                self.store.touch_chunk(c.id, last.at).await?;
                 c.id
             }
-            Some(c) if !binarized.is_topic_shift => {
-                self.store
-                    .touch_chunk(c.id, last.at, Some(&summary))
-                    .await?;
+            Some(c) if !answers.is_topic_shift => {
+                self.store.touch_chunk(c.id, last.at).await?;
                 c.id
             }
             _ => {
                 self.store
-                    .create_chunk(guild, batch.channel_id, first.at, &summary)
+                    .create_chunk(guild, batch.channel_id, first.at)
                     .await?
             }
         };
         let row_ids: Vec<i64> = batch.messages.iter().map(|m| m.row_id).collect();
         self.store
-            .mark_judged(&row_ids, decision_id, chunk_id, binarized.is_noise)
+            .mark_judged(&row_ids, decision_id, chunk_id, is_noise)
             .await?;
 
-        let action = binarized.effective_action(self.worker.is_some());
-        tracing::info!(channel = %batch.channel_name, action = action.as_str(), noise = binarized.is_noise, chunk_id, "judge");
+        let worker_enabled = self.worker.is_some();
+        // 費用のかかる補足の候補にだけ DB を引く
+        let supplement_allowed = if worker_enabled && answers.worth_supplement {
+            self.supplement_allowed(batch.channel_id, Timestamp::now())
+                .await?
+        } else {
+            true
+        };
+        let action = judge::decide_action(&ActionInput {
+            answers: &answers,
+            cued,
+            noise: is_noise,
+            worker_enabled,
+            supplement_allowed,
+        });
+        tracing::info!(channel = %batch.channel_name, action = action.as_str(), addressee = answers.addressee.as_str(), noise = is_noise, chunk_id, "judge");
         match action {
             Action::Silent => Ok(()),
             // 発言しないので Layer 3 には何も足さず、発言群は静観と同じくバッファに残す
             Action::React => {
-                let emoji = binarized.reaction.as_deref().unwrap_or_default();
+                let emoji = answers.reaction.as_deref().unwrap_or_default();
                 if let Err(e) = self
                     .channel
                     .react(batch.channel_id, last.message_id, emoji)
@@ -530,79 +529,105 @@ impl Actor {
                 }
                 Ok(())
             }
+            Action::SilentSupplement | Action::SilentCorrection => {
+                let origin = action.origin().unwrap_or(Origin::Supplement);
+                // 同じ話題への補足と訂正が重なって、同じ指摘を二重に投稿しないため
+                if self.silent_run_active(batch.channel_id).await? {
+                    tracing::debug!(
+                        channel = %batch.channel_name,
+                        origin = origin.as_str(),
+                        "黙って起動した Worker が動いているため、新しく起動しません"
+                    );
+                    return Ok(());
+                }
+                self.start_silent(&batch, chunk_id, origin).await
+            }
             Action::ReplyOnly | Action::SpawnTask => {
                 let verdict = if action == Action::SpawnTask {
                     RouterVerdict::SpawnTask {
-                        probability: answers[judge::KEY_ACTION]["probabilities"]["spawn_task"]
-                            .as_f64(),
+                        probability: answers_json[judge::KEY_NEEDS_OUTSIDE_WORK]["p"].as_f64(),
                     }
                 } else {
                     RouterVerdict::ReplyOnly
                 };
-                self.respond(
-                    &batch,
-                    chunk_id,
-                    &binarized.relevant,
-                    binarized.task_category,
-                    verdict,
-                )
-                .await
+                let hints = RespondHints {
+                    reaction: answers.reaction.clone(),
+                    corrects_noth: answers.corrects_noth,
+                };
+                self.respond(&batch, chunk_id, verdict, hints).await
             }
         }
     }
 
-    /// パターン B と C。spawn_task かどうかは router の判定ではなく本線の応答の形で決める。
-    /// `verdict` は本線が委譲しなかったときの食い違いのログ用
+    /// そのチャンネルで、補足か訂正の Worker が動いているか
+    async fn silent_run_active(&self, channel_id: ChannelId) -> Result<bool> {
+        if self.silent_pending.contains(&channel_id) {
+            return Ok(true);
+        }
+        Ok(self
+            .store
+            .active_runs(self.guild)
+            .await?
+            .iter()
+            .any(|r| r.channel_id == channel_id && r.origin != Origin::Request))
+    }
+
+    /// 補足の最短間隔(チャンネルごと)と 1 日の上限(guild 全体、ローカル時刻の日付)に収まるか。
+    /// 再起動しても数え直せるよう worker_runs から数える
+    async fn supplement_allowed(&self, channel_id: ChannelId, now: Timestamp) -> Result<bool> {
+        let router = &self.config.router;
+        let day_start = now
+            .to_zoned(jiff::tz::TimeZone::system())
+            .start_of_day()
+            .map(|z| z.timestamp())
+            .unwrap_or(now);
+        let (last, today) = self
+            .store
+            .supplement_usage(self.guild, channel_id, day_start)
+            .await?;
+        if today >= router.supplement_max_per_day {
+            tracing::info!(today, "補足の 1 日の上限に達したため静観します");
+            return Ok(false);
+        }
+        if let Some(last) = last
+            && now.as_second() - last.as_second() < router.supplement_min_interval_secs as i64
+        {
+            tracing::info!(channel_id, "補足の最短間隔に満たないため静観します");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// パターン B と C。Worker に回すかどうかは main の応答の形で決める(`[Goal]` か tool 呼び出し)。
+    /// `verdict` が `SpawnTask` で main が `[Goal]` を書かなかったときは、返事を投稿せず Core が依頼を作って起動する
     async fn respond(
         &mut self,
         batch: &JudgeBatch,
         chunk_id: i64,
-        relevant: &[i64],
-        category: TaskCategory,
         verdict: RouterVerdict,
+        hints: RespondHints,
     ) -> Result<()> {
+        let RespondHints {
+            reaction: fallback_reaction,
+            corrects_noth,
+        } = hints;
         let guild = self.guild;
         let trigger_ids: HashSet<i64> = batch.messages.iter().map(|m| m.row_id).collect();
 
         self.promote_buffer(&trigger_ids).await?;
 
-        let trigger_lines: Vec<Line> = batch
-            .messages
-            .iter()
-            .map(|m| Line {
-                channel: batch.channel_name.clone(),
-                author: m.author_name.clone(),
-                at: m.at,
-                content: m.content.clone(),
-                reply_to: m.reply_to.clone(),
-            })
-            .collect();
+        let trigger_lines = trigger_lines(batch);
         let trigger = layers::trigger_turn(chunk_id, &trigger_lines);
 
-        let mut tail = Vec::new();
-        for id in relevant {
-            let rows: Vec<MessageRow> = self
-                .store
-                .chunk_messages(*id)
-                .await?
-                .into_iter()
-                .filter(|r| r.is_noise != Some(true))
-                .collect();
-            if rows.is_empty() {
-                continue;
-            }
-            tail.push(layers::relevant_chunk_turn(
-                *id,
-                &limit_chars(rows_to_lines(&rows), RELEVANT_CHUNK_MAX_CHARS),
-            ));
-        }
-        tail.push(trigger.clone());
-        tail.push(layers::channel_turn(
-            chunk_id,
-            &batch.channel_name,
-            batch.channel_id,
-            matches!(verdict, RouterVerdict::SpawnTask { .. }),
-        ));
+        let tail = vec![
+            trigger.clone(),
+            layers::channel_turn(
+                chunk_id,
+                &batch.channel_name,
+                batch.channel_id,
+                matches!(verdict, RouterVerdict::SpawnTask { .. }),
+            ),
+        ];
 
         let active_log = self.store.active_turns(guild).await?;
         let prompt = self.prompt(active_log, tail);
@@ -612,7 +637,7 @@ impl Actor {
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "本線の生成に失敗しました。バッファに残します");
+                tracing::warn!(error = %e, "main の生成に失敗しました。バッファに残します");
                 self.report_provider_failure(batch.channel_id, FailureKind::Reply, &e)
                     .await;
                 return Ok(());
@@ -624,82 +649,114 @@ impl Actor {
             tool_calls = completion.tool_calls.len(),
             has_text = completion.text.is_some(),
             chunk_id,
-            "本線の応答"
+            "main の応答"
         );
-        if let Some(plan) = self.task_plan(&completion, category) {
+        if let Some(plan) = self.task_plan(&completion) {
             return self
                 .start_task(batch, chunk_id, trigger, plan, &completion.usage)
                 .await;
         }
         if let RouterVerdict::SpawnTask { probability } = verdict {
-            let head: String = completion
-                .text
-                .as_deref()
-                .unwrap_or_default()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(MISMATCH_HEAD_CHARS)
-                .collect();
+            let reply = completion.text.as_deref().unwrap_or_default();
             tracing::info!(
-                spawn_task_p = ?probability,
-                head,
+                needs_outside_work_p = ?probability,
+                reply = %reply.chars().take(MISMATCH_HEAD_CHARS).collect::<String>(),
                 chunk_id,
-                "router は spawn_task と判定しましたが、本線は委譲しませんでした"
+                "main が [Goal] を書かなかったため、返事を投稿せず Core が Worker を起動します"
             );
+            let plan = TaskPlan {
+                ack: String::new(),
+                log_ack: String::new(),
+                // 捨てた返事の [Memo] は、言ってもいないことを覚えさせないため記録しない
+                memos: Vec::new(),
+                goal: layers::core_goal(
+                    &batch.channel_name,
+                    batch.channel_id,
+                    &trigger_lines,
+                    corrects_noth,
+                ),
+                origin: Origin::Request,
+            };
+            return self
+                .start_task(batch, chunk_id, trigger, plan, &completion.usage)
+                .await;
         }
-        let Some(text) = completion
+        let text = completion
             .text
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
-        else {
-            tracing::info!("本線の応答が空でした。投稿せずバッファに残します");
-            return Ok(());
-        };
+            .unwrap_or_default();
         let reply = self.split_reply(text);
-        if reply.post.is_empty() && reply.memos.is_empty() {
-            tracing::info!("本線の応答が空でした。投稿せずバッファに残します");
+        let silent_reply = reply.post.is_empty();
+        let emoji = reply
+            .reaction
+            .clone()
+            .or_else(|| fallback_reaction.filter(|_| silent_reply));
+        if silent_reply && reply.memos.is_empty() && emoji.is_none() {
+            tracing::info!("main の応答が空でした。投稿せずバッファに残します");
             return Ok(());
         }
-        if !reply.post.is_empty()
+        if !silent_reply
             && let Err(e) = self.channel.send(batch.channel_id, &reply.post, None).await
         {
             tracing::warn!(error = %e, "応答を投稿できませんでした。バッファに残します");
             return Ok(());
         }
+        let mut reacted = None;
+        if let Some(emoji) = emoji
+            && let Some(message_id) = batch.messages.last().map(|m| m.message_id)
+        {
+            match self
+                .channel
+                .react(batch.channel_id, message_id, &emoji)
+                .await
+            {
+                Ok(()) => reacted = Some(emoji),
+                Err(e) => {
+                    tracing::warn!(error = %e, emoji, "リアクションを付けられませんでした")
+                }
+            }
+        }
+        if silent_reply && reacted.is_none() && reply.memos.is_empty() {
+            tracing::info!("リアクションだけの応答を付けられなかったため、バッファに残します");
+            return Ok(());
+        }
 
-        // [Memo] だけの応答は何も投稿しないが、覚えた事実を本線が次のターンから知っているよう Layer 3 には残す
-        if !reply.post.is_empty() {
+        // [Memo] だけの応答は何も投稿しないが、覚えた事実をmain が次のターンから知っているよう Layer 3 には残す
+        if !silent_reply {
             self.note_conversation(batch);
         }
+        let response = match (&reacted, silent_reply) {
+            (Some(emoji), true) => layers::reaction_response_turn(chunk_id, emoji, &reply.log),
+            _ => layers::response_turn(chunk_id, &reply.log),
+        };
         let row_ids: Vec<i64> = batch.messages.iter().map(|m| m.row_id).collect();
         self.store
-            .record_reply(
-                guild,
-                &trigger,
-                &layers::response_turn(chunk_id, text),
-                &row_ids,
-                &completion.usage,
-            )
+            .record_reply(guild, &trigger, &response, &row_ids, &completion.usage)
             .await?;
         self.record_memos(&reply.memos).await;
         self.enforce_hard_limit(chunk_id).await
     }
 
-    /// `memo` が無効なら本文に手を付けない
+    /// `[React]` の行を外したうえで、`memo` が有効なら Memo の行も分ける。`memo` が無効なら Memo には手を付けない
     fn split_reply(&self, text: &str) -> Reply {
+        let (without_react, reaction) =
+            layers::extract_reaction(text, &self.config.router.reactions);
         if !self.config.memory.memo {
             return Reply {
-                post: text.to_string(),
+                post: without_react.clone(),
+                log: without_react,
                 memos: Vec::new(),
+                reaction,
             };
         }
-        let (kept, memos) = memory::extract_memos(text, &self.members);
+        let (kept, memos) = memory::extract_memos(&without_react, &self.members);
         Reply {
             post: kept.trim().to_string(),
+            log: without_react,
             memos: memory::normalize_memos(memos, self.config.memory.memo_max_per_reply),
+            reaction,
         }
     }
 
@@ -725,9 +782,9 @@ impl Actor {
         }
     }
 
-    /// 本線の応答が Worker への委譲かどうか。router が reply_only と判定していても、本線が `[Goal]` を書いたか
+    /// main の応答が Worker への委譲かどうか。router が reply_only と判定していても、main が `[Goal]` を書いたか
     /// tool を呼んだなら委譲する。そのまま投稿すると Goal が Discord に漏れ、tool_calls は投稿できる本文が無いため
-    fn task_plan(&self, completion: &Completion, category: TaskCategory) -> Option<TaskPlan> {
+    fn task_plan(&self, completion: &Completion) -> Option<TaskPlan> {
         self.worker.as_ref()?;
         if !completion.tool_calls.is_empty() {
             return Some(TaskPlan {
@@ -735,10 +792,10 @@ impl Actor {
                 log_ack: layers::FIXED_ACK.to_string(),
                 memos: Vec::new(),
                 goal: layers::goal_from_tool_calls(&completion.tool_calls),
-                category: spawn_category(category),
+                origin: Origin::Request,
             });
         }
-        // `[Goal]` 行が無いのは、本線が調べなくても答えられると判断したか書式を守らなかったとき。
+        // `[Goal]` 行が無いのは、main が調べなくても答えられると判断したか書式を守らなかったとき。
         // Goal の無い Worker には任せる内容が無いので、spawn_task でも普通の返事として投稿する
         let (log_ack, goal) = layers::split_ack_goal(completion.text.as_deref()?)?;
         let reply = self.split_reply(&log_ack);
@@ -749,10 +806,10 @@ impl Actor {
             } else {
                 reply.post
             },
-            log_ack,
+            log_ack: reply.log,
             memos: reply.memos,
             goal,
-            category: spawn_category(category),
+            origin: Origin::Request,
         })
     }
 
@@ -771,11 +828,24 @@ impl Actor {
         let audience = self
             .audience(&row_ids, batch.channel_id, &batch.channel_name)
             .await?;
-        let ack_message_id = match self.channel.send(batch.channel_id, &plan.ack, None).await {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(error = %e, "Ack を投稿できませんでした。Worker を起動せずバッファに残します");
-                return Ok(());
+        // Ack が空なのは Core が依頼を作ったとき。何も言わずに作業を始めると無視されたように見えるので、👀 だけ付ける
+        let progress_target = if plan.ack.is_empty() {
+            if let Some(last) = batch.messages.last()
+                && let Err(e) = self
+                    .channel
+                    .react(batch.channel_id, last.message_id, ACK_REACTION)
+                    .await
+            {
+                tracing::warn!(error = %e, "👀 を付けられませんでした。Worker は起動します");
+            }
+            None
+        } else {
+            match self.channel.send(batch.channel_id, &plan.ack, None).await {
+                Ok(id) => Some((id, plan.ack.clone())),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Ack を投稿できませんでした。Worker を起動せずバッファに残します");
+                    return Ok(());
+                }
             }
         };
         self.note_conversation(batch);
@@ -787,7 +857,7 @@ impl Actor {
         let run = NewWorkerRun {
             run_id: next_run_id(),
             goal: plan.goal.clone(),
-            task_category: plan.category,
+            origin: plan.origin,
             channel_id: batch.channel_id,
             chunk_id,
             trigger_message_id,
@@ -806,12 +876,41 @@ impl Actor {
             )
             .await?;
         self.record_memos(&plan.memos).await;
-        tracing::info!(run_id = %run.run_id, category = crate::store::category_str(run.task_category), "Worker を起動します");
+        tracing::info!(run_id = %run.run_id, origin = run.origin.as_str(), "Worker を起動します");
         // Worker の base も本線と同じ上限に収めるため、Fork より前に緊急コンパクションを済ませる
         self.enforce_hard_limit(chunk_id).await?;
 
         let base = self.prompt(self.store.active_turns(guild).await?, Vec::new());
-        self.fork(run, base, ack_message_id, plan.ack, audience);
+        self.fork(run, base, progress_target, audience);
+        Ok(())
+    }
+
+    /// パターン C'。Ack もリアクションも出さずに Worker を起動する。トリガーはバッファに残り、結果が出たときに一緒に Layer 3 へ入る
+    async fn start_silent(
+        &mut self,
+        batch: &JudgeBatch,
+        chunk_id: i64,
+        origin: Origin,
+    ) -> Result<()> {
+        let guild = self.guild;
+        let row_ids: Vec<i64> = batch.messages.iter().map(|m| m.row_id).collect();
+        let audience = self
+            .audience(&row_ids, batch.channel_id, &batch.channel_name)
+            .await?;
+        let run = NewWorkerRun {
+            run_id: next_run_id(),
+            goal: layers::silent_goal(origin, &trigger_lines(batch)),
+            origin,
+            channel_id: batch.channel_id,
+            chunk_id,
+            trigger_message_id: batch.messages.last().map(|m| m.message_id),
+            fork_message_id: self.store.max_message_id(guild).await?,
+        };
+        self.store.insert_worker_run(guild, &run).await?;
+        self.silent_pending.insert(batch.channel_id);
+        tracing::info!(run_id = %run.run_id, origin = origin.as_str(), "黙って Worker を起動します");
+        let base = self.prompt(self.store.active_turns(guild).await?, Vec::new());
+        self.fork(run, base, None, audience);
         Ok(())
     }
 
@@ -852,8 +951,7 @@ impl Actor {
         &mut self,
         run: NewWorkerRun,
         base: LayeredPrompt,
-        ack_message_id: MessageId,
-        ack: String,
+        progress_target: Option<(MessageId, String)>,
         audience: Audience,
     ) {
         let Some(pool) = &self.worker else {
@@ -865,11 +963,14 @@ impl Actor {
         let timeout = pool.timeout;
         let store = self.store.clone();
         let jobs = self.jobs.clone();
-        // Ack の後に黙り込むと止まったように見えるので、キュー待ちの間も含めて Worker が終わるまで入力中を出し続ける
-        let typing = AbortOnDrop(self.spawn_typing(run.channel_id).abort_handle());
+        // Ack の後に黙り込むと止まったように見えるので、キュー待ちの間も含めて Worker が終わるまで入力中を出し続ける。
+        // 黙って起動した Worker は、人どうしの会話に気配を出さないため出さない
+        let typing = (run.origin == Origin::Request)
+            .then(|| AbortOnDrop(self.spawn_typing(run.channel_id).abort_handle()));
         // 2,000 文字を超えた Ack は分割投稿されていて、最後の断片に Ack 全体を書き戻せないので進捗を出さない
-        let show_progress = pool.show_progress && ack.chars().count() <= progress::MAX_CHARS;
-        let (progress_tx, progress) = if show_progress {
+        let progress_target = progress_target
+            .filter(|(_, ack)| pool.show_progress && ack.chars().count() <= progress::MAX_CHARS);
+        let (progress_tx, progress) = if let Some((ack_message_id, ack)) = progress_target {
             let (tx, rx) = mpsc::unbounded_channel();
             let (done_tx, done_rx) = oneshot::channel();
             let handle = progress::spawn(
@@ -892,7 +993,7 @@ impl Actor {
             work_dir: self.config.paths.work_dir(&run.run_id),
             run_id: run.run_id,
             goal: run.goal,
-            task_category: run.task_category,
+            origin: run.origin,
             base,
             progress: progress_tx,
             history: Some(std::sync::Arc::new(store.clone())),
@@ -932,6 +1033,9 @@ impl Actor {
             tracing::warn!(run_id, "Join の run が見つかりません");
             return Ok(());
         };
+        if run.origin != Origin::Request {
+            self.silent_pending.remove(&run.channel_id);
+        }
         let memo = run.conclusion.clone().unwrap_or_default();
         let outcome = match run.status {
             RunStatus::Finished => Ok(memo.as_str()),
@@ -949,6 +1053,9 @@ impl Actor {
             tracing::warn!(run_id, "TopicChunk の無い run は報告しません");
             return Ok(());
         };
+        if run.origin != Origin::Request {
+            return self.handle_silent_join(&run, chunk_id, outcome).await;
+        }
 
         let since_fork: Vec<MessageRow> = self
             .store
@@ -975,7 +1082,7 @@ impl Actor {
         );
         let (style, kind, answers, latency_ms) = match self
             .router
-            .decide(&state, &judge::join_questions())
+            .decide(&state, &judge::join_questions(Origin::Request))
             .await
         {
             Ok(decision) => (
@@ -1086,6 +1193,179 @@ impl Actor {
             }
         }
         self.enforce_hard_limit(chunk_id).await
+    }
+
+    /// 補足・訂正の Join。依頼ではないので Ack で待たせた人はいない。
+    /// 結論は投稿の要否にかかわらず Layer 3 に入れる(調べた結果を捨てないため)。
+    /// 「要」のときだけ、合流判定で人どうしの解決を確かめ、続けるなら main が短い補足を書き、トリガーへのリプライで投稿する。
+    /// Worker の文面は投稿しない(外部の入力を読んだ Worker の出力をそのまま人に見せないため)
+    async fn handle_silent_join(
+        &mut self,
+        run: &WorkerRunRow,
+        chunk_id: i64,
+        outcome: std::result::Result<&str, &str>,
+    ) -> Result<()> {
+        let guild = self.guild;
+        let run_id = run.run_id.as_str();
+        let memo = match outcome {
+            Ok(memo) => memo,
+            Err(reason) => {
+                // 黙って起動したので、利用者は結果を待っていない。失敗を Layer 3 にも投稿にも出さない
+                tracing::warn!(
+                    run_id,
+                    origin = run.origin.as_str(),
+                    reason,
+                    "黙って起動した Worker が失敗しました"
+                );
+                return Ok(());
+            }
+        };
+        let conclusion = layers::conclusion_turn(chunk_id, run_id, Ok(memo));
+        if !supplement::needed(memo) {
+            tracing::info!(run_id, origin = run.origin.as_str(), "補足は不要でした");
+            return self.keep_conclusion_only(&conclusion, chunk_id).await;
+        }
+        if !self.silent_report_allowed(run, memo).await? {
+            return self.keep_conclusion_only(&conclusion, chunk_id).await;
+        }
+
+        self.promote_buffer(&HashSet::new()).await?;
+        let mut active_log = self.store.active_turns(guild).await?;
+        active_log.push(conclusion.clone());
+        let prompt = self.prompt(
+            active_log,
+            vec![layers::silent_report_turn(chunk_id, run.origin)],
+        );
+        // 黙って起動したので入力中の表示は出さず、失敗も利用者に知らせない
+        let params = CompletionParams {
+            max_tokens: self.config.context.max_tokens,
+            purpose: Purpose::Join,
+            run_id: Some(run_id.to_string()),
+        };
+        let completion = match self.provider.complete(&prompt, &params).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, run_id, "補足の生成に失敗しました。投稿しません");
+                return self.keep_conclusion_only(&conclusion, chunk_id).await;
+            }
+        };
+        let reply = self.split_reply(completion.text.as_deref().unwrap_or_default().trim());
+        self.record_memos(&reply.memos).await;
+        if reply.post.is_empty() {
+            tracing::info!(run_id, "main の補足が空だったため投稿しません");
+            return self.keep_conclusion_only(&conclusion, chunk_id).await;
+        }
+        // 補足の返事から Worker は起動できない。投稿すると [Goal] の行がそのまま人に見える
+        if reply
+            .post
+            .lines()
+            .any(|l| l.trim_start().starts_with(layers::GOAL_MARKER))
+        {
+            tracing::warn!(
+                run_id,
+                "main の補足に [Goal] が含まれていたため投稿しません"
+            );
+            return self.keep_conclusion_only(&conclusion, chunk_id).await;
+        }
+        let Some(reply_to) = run.trigger_message_id else {
+            tracing::warn!(
+                run_id,
+                "リプライ先のトリガー発言が無いため補足を投稿しません"
+            );
+            return self.keep_conclusion_only(&conclusion, chunk_id).await;
+        };
+        if let Err(e) = self
+            .channel
+            .send(run.channel_id, &reply.post, Some(reply_to))
+            .await
+        {
+            tracing::warn!(error = %e, run_id, "補足を投稿できませんでした");
+            return self.keep_conclusion_only(&conclusion, chunk_id).await;
+        }
+        tracing::info!(run_id, origin = run.origin.as_str(), "補足を投稿しました");
+        // 言ったことは Layer 3 に残す。次に main が話すとき、同じ指摘を繰り返さないため
+        self.store
+            .record_reply(
+                guild,
+                &conclusion,
+                &layers::response_turn(chunk_id, &reply.log),
+                &[],
+                &completion.usage,
+            )
+            .await?;
+        self.enforce_hard_limit(chunk_id).await
+    }
+
+    /// 投稿しない補足・訂正でも、調べた結果は次に main が話すときのために Layer 3 に残す
+    async fn keep_conclusion_only(&mut self, conclusion: &Turn, chunk_id: i64) -> Result<()> {
+        self.promote_buffer(&HashSet::new()).await?;
+        self.store.append_turn(self.guild, conclusion).await?;
+        self.enforce_hard_limit(chunk_id).await
+    }
+
+    /// 調べている間に人どうしで解決していないかを、合流判定と同じ仕組みで router に尋ねる。
+    /// 判定に失敗したら投稿しない側に倒す
+    async fn silent_report_allowed(&self, run: &WorkerRunRow, memo: &str) -> Result<bool> {
+        let guild = self.guild;
+        let run_id = run.run_id.as_str();
+        let since_fork: Vec<MessageRow> = self
+            .store
+            .recent_messages(guild, i64::MAX, self.config.router.recent_messages)
+            .await?
+            .into_iter()
+            .filter(|r| r.id > run.fork_message_id)
+            .collect();
+        let channel_name = self
+            .channel_names
+            .get(&run.channel_id)
+            .cloned()
+            .unwrap_or_else(|| run.channel_id.to_string());
+        let state = judge::build_join_state(
+            &judge::JoinInput {
+                run_id,
+                goal: &run.goal,
+                channel: &channel_name,
+                concluded: true,
+                memo,
+                since_fork: &since_fork,
+            },
+            &self.config.router,
+        );
+        let (style, kind, answers, latency_ms) = match self
+            .router
+            .decide(&state, &judge::join_questions(run.origin))
+            .await
+        {
+            Ok(decision) => (
+                judge::binarize_delivery(&decision, self.config.router.thresholds.min_confidence),
+                "join",
+                judge::answers_json(&decision),
+                decision.latency.as_millis() as i64,
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, run_id, "router の合流判定に失敗しました。投稿しません");
+                (
+                    DeliveryStyle::Abort,
+                    "join_error",
+                    json!({ "error": e.to_string() }),
+                    0,
+                )
+            }
+        };
+        self.store
+            .insert_decision(
+                guild,
+                kind,
+                &self.router.model_label(),
+                &answers,
+                latency_ms,
+            )
+            .await?;
+        self.store
+            .set_delivery_style(run_id, style.as_str())
+            .await?;
+        tracing::info!(run_id, delivery_style = style.as_str(), "silent join");
+        Ok(style != DeliveryStyle::Abort)
     }
 
     /// 人間の発言が idle_minutes 途切れ、Worker も動いていなければ Compact を 1 回だけ積む。
@@ -1268,14 +1548,15 @@ impl Actor {
         );
     }
 
-    fn continues_conversation(&self, batch: &JudgeBatch) -> bool {
-        let Some((replied_at, authors)) = self.conversations.get(&batch.channel_id) else {
+    /// Noth が応答してから窓の間の、話していた相手の発言。決定的な noth_request ではなく router への合図にする
+    fn in_conversation_window(&self, channel_id: ChannelId, m: &PendingMessage) -> bool {
+        let Some((replied_at, authors)) = self.conversations.get(&channel_id) else {
             return false;
         };
         let window = self.config.router.conversation_window_secs as i64;
-        batch.messages.iter().any(|m| {
-            authors.contains(&m.author_name) && m.at.as_second() - replied_at.as_second() <= window
-        })
+        // 応答より前の発言は続きではない
+        let elapsed = m.at.as_second() - replied_at.as_second();
+        authors.contains(&m.author_name) && (0..=window).contains(&elapsed)
     }
 
     /// 未昇格バッファを TopicChunk ごとに 1 ブロックにして Layer 3 の末尾へ追記する
@@ -1492,15 +1773,6 @@ fn next_run_id() -> String {
     )
 }
 
-/// router が作業不要(none)と見ていても Worker を起こした以上、run のラベルは none にしない。
-/// ラベルは記録とプロンプト用で、tool の可否には使わない(approval.rs)
-fn spawn_category(router_category: TaskCategory) -> TaskCategory {
-    match router_category {
-        TaskCategory::None => TaskCategory::WebResearch,
-        c => c,
-    }
-}
-
 /// 直近 `keep` ターンを残す境界。残す側が assistant から始まると Layer 3 の先頭が応答になり provider によっては弾かれるので、
 /// 境界を前へずらして直前の user ターンも残す。設定より少なく残すことはない
 fn compaction_cut(turns: &[Turn], keep: usize) -> usize {
@@ -1511,32 +1783,53 @@ fn compaction_cut(turns: &[Turn], keep: usize) -> usize {
     cut
 }
 
-fn rows_to_lines(rows: &[MessageRow]) -> Vec<Line> {
-    rows.iter()
-        .map(|r| Line {
-            channel: r.channel_name.clone(),
-            author: r.author_name.clone(),
-            at: r.created_at,
-            content: r.content.clone(),
-            reply_to: r.reply_to.clone(),
+fn trigger_lines(batch: &JudgeBatch) -> Vec<Line> {
+    batch
+        .messages
+        .iter()
+        .map(|m| Line {
+            channel: batch.channel_name.clone(),
+            author: m.author_name.clone(),
+            at: m.at,
+            content: m.content.clone(),
+            reply_to: m.reply_to.clone(),
+            is_bot_marker: false,
         })
         .collect()
 }
 
-/// 古い行から落として本文の合計を上限に収める
-fn limit_chars(mut lines: Vec<Line>, max: usize) -> Vec<Line> {
-    let mut total: usize = lines.iter().map(|l| l.content.chars().count()).sum();
-    while total > max && lines.len() > 1 {
-        total -= lines.remove(0).content.chars().count();
-    }
-    lines
-}
-
-fn summarize(content: &str) -> String {
-    let flat: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut s: String = flat.chars().take(SUMMARY_CHARS).collect();
-    if flat.chars().count() > SUMMARY_CHARS {
-        s.push('…');
-    }
-    s
+fn rows_to_lines(rows: &[MessageRow]) -> Vec<Line> {
+    markers::fold(rows, markers::MAX_MARKER_RUNS)
+        .into_iter()
+        .map(|item| match item {
+            Folded::Row(r) => Line {
+                channel: r.channel_name.clone(),
+                author: r.author_name.clone(),
+                at: r.created_at,
+                content: r.content.clone(),
+                reply_to: r.reply_to.clone(),
+                is_bot_marker: false,
+            },
+            Folded::Markers(run) => Line {
+                channel: run.channel_name.clone(),
+                author: run.author_name.clone(),
+                at: run.at,
+                content: run.render(),
+                reply_to: None,
+                is_bot_marker: true,
+            },
+            Folded::Omitted {
+                count,
+                channel_name,
+                at,
+            } => Line {
+                channel: channel_name,
+                author: String::new(),
+                at,
+                content: Folded::render_omitted(count),
+                reply_to: None,
+                is_bot_marker: true,
+            },
+        })
+        .collect()
 }

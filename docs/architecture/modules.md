@@ -13,8 +13,8 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 | 種別 | module | 内容 |
 |---|---|---|
 | channel | `channel-discord` | Discord への接続、発言の受信とデバウンス、Bot からの投稿。Noth 以外の Bot(`author.bot`。webhook は除く)の発言は本文を入れない目印だけを流す |
-| router | `router-systemone` | System One API(Jev / Clef)で発言の性質(宛先 `addressee`、外部作業の要否、訂正、補足の価値)・ノイズ判定・話題区切り・合流判定を行う。関連チャンク選択は評価で残すか決める。動き方は Core が決める |
-| router | `router-mention` | ルールベース。メンション・リプライ・キーワード一致時のみ `addressee = noth_request`、他は `other`。外部作業・訂正・補足の問いは常に 0.0(Worker は起動しない)。話題区切りは「前の発言から一定時間空いた、またはチャンネルが変わった」で判定し、関連チャンクは常に空。System One を契約していなくても起動でき、テストにも使う |
+| router | `router-systemone` | System One API(Jev / Clef)で発言の性質(宛先 `addressee`、外部作業の要否、訂正、補足の価値)・ノイズ判定・話題区切り・合流判定を行う。動き方は Core が決める |
+| router | `router-mention` | ルールベース。メンション・リプライ・キーワード一致時のみ `addressee = noth_request`、他は `other`。外部作業・訂正・補足の問いは常に 0.0(Worker は起動しない)。話題区切りは「前の発言から一定時間空いた、またはチャンネルが変わった」で判定する。System One を契約していなくても起動でき、テストにも使う |
 | provider | `provider-openai` | OpenAI Chat Completions 形式。Responses 形式も同 module 内で選べる |
 | provider | `provider-anthropic` | Anthropic Messages API |
 | provider | `provider-google` | Gemini `generateContent`。認証は API キー(AI Studio)か OAuth2(Agent Platform) |

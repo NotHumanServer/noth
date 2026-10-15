@@ -103,19 +103,23 @@ pub struct ContextSection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Thresholds {
+    /// 文脈価値のないノイズ。記録だけして Layer 3 には昇格させない
     #[serde(default = "d05")]
     pub is_noise_or_meme: f32,
     #[serde(default = "d06")]
     pub is_topic_shift: f32,
+    /// noth_request でこれ以上なら Worker に回す。取りこぼさない側に倒す
     #[serde(default = "d05")]
-    pub relevant_chunk: f32,
+    pub needs_outside_work: f32,
+    /// Noth の誤りの指摘とみなす(訂正)
+    #[serde(default = "d05")]
+    pub corrects_noth: f32,
+    /// 黙って補足の Worker を起こす
+    #[serde(default = "d05")]
+    pub worth_supplement: f32,
+    /// 合流判定の `abort` だけに使う
     #[serde(default = "d015")]
     pub min_confidence: f32,
-    #[serde(default = "d025")]
-    pub name_call_reply: f32,
-    /// Noth 宛てと判定する確率。以上なら静観を返答に引き上げる
-    #[serde(default = "d06")]
-    pub addressed_to_noth: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,18 +128,92 @@ pub struct RouterSection {
     pub recent_messages: usize,
     #[serde(default = "default_state_max_chars")]
     pub state_max_chars: usize,
-    #[serde(default = "default_candidate_chunks")]
-    pub candidate_chunks: usize,
-    /// 本文で呼ばれたら min_confidence を外して router の判定どおりに動く。必ず応答にしないのは、開発の話題で名前が出るたびに割り込まないため
+    /// 本文で呼ばれたことを router に伝える(`calls_noth_by_name`)。決定的に noth_request とするのはメンションとリプライだけ。
+    /// 開発の話題で名前が出るたびに割り込まないため
     #[serde(default)]
     pub call_names: Vec<String>,
     #[serde(default = "default_conversation_window_secs")]
     pub conversation_window_secs: u64,
+    /// 黙って補足する Worker のチャンネルごとの最短間隔。訂正には適用しない
+    #[serde(default = "default_supplement_min_interval_secs")]
+    pub supplement_min_interval_secs: u64,
+    /// 黙って補足する Worker の 1 日の上限(guild 全体)。訂正は数えない
+    #[serde(default = "default_supplement_max_per_day")]
+    pub supplement_max_per_day: u32,
     #[serde(default)]
     pub thresholds: Thresholds,
     /// router が選べる絵文字リアクション。空にするとリアクションで反応しなくなる
     #[serde(default = "default_reactions")]
     pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub questions: QuestionTexts,
+}
+
+/// `[router.questions]`。router に渡す問いの文言。省略した項目は評価で確定した既定値(v2_1)になる。
+/// choice の選択肢の並びは固定(同点は先頭が選ばれるため、安全な側が先頭)で、変えられるのは説明だけ
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct QuestionTexts {
+    pub is_noise_or_meme: String,
+    pub addressee: AddresseeTexts,
+    pub needs_outside_work: String,
+    pub corrects_noth: String,
+    pub worth_supplement: String,
+    pub reaction: ReactionTexts,
+    pub is_topic_shift: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AddresseeTexts {
+    pub instructions: String,
+    pub other: String,
+    pub about_noth: String,
+    pub other_bot: String,
+    pub noth_request: String,
+}
+
+/// 絵文字ごとの説明は `[[router.reactions]]` の `meaning` から作るので、ここは問いの文言と `none` の説明だけ
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReactionTexts {
+    pub instructions: String,
+    pub none: String,
+}
+
+impl Default for QuestionTexts {
+    fn default() -> Self {
+        Self {
+            is_noise_or_meme: "今回のトリガー発言群が、スタンプや絵文字の連打、同じ文面のコピペ連投、意味のない短い反応の羅列など、後から読み返しても文脈上の価値がないノイズやミームかを判定してください。短くても質問・意見・情報・感情の表明を含む発言はノイズではありません。迷うときはノイズではないとしてください。".into(),
+            addressee: AddresseeTexts::default(),
+            needs_outside_work: "この発言に応えるには、会話に出ている情報だけでは足りず、会話の外での作業が必要である。たとえば Web で調べる、チャンネルの過去ログを読む、ファイルやコマンドを扱う、長い文書を書く、モデルの知識では古いかもしれない最近の事柄（新しい製品、サービス、モデルの版、料金など）を確かめる。一般的な知識（料理名など）で答えられるなら作業は要らない".into(),
+            corrects_noth: "この発言は、Noth が前に述べたことや調べた結果の誤りを指摘している、または反論している".into(),
+            worth_supplement: "この発言には、確かめたり補ったりすると会話の役に立つ点がある。次のどちらかがあるときだけ「はい」とする。(1) 数字、仕様、料金、日付、固有名詞についての具体的な主張がある。(2) 人どうしで出たまま答えのない、事実についての問いがある。リンクだけの発言、相づち、感想、感嘆、冗談は「いいえ」".into(),
+            reaction: ReactionTexts::default(),
+            is_topic_shift: "今回のトリガー発言群が、同じチャンネルの直前の会話(recent のうち同じ channel_id の発言)から話題が切り替わったかを判定してください。同じ話題の続きや、少し脱線しただけの発言は切り替わりではありません。別のチャンネルの発言は無関係として扱い、そのチャンネルに直前の発言がなければ切り替わりではないとしてください。".into(),
+        }
+    }
+}
+
+impl Default for AddresseeTexts {
+    fn default() -> Self {
+        Self {
+            instructions: "最後の発言は誰に向けたものか".into(),
+            other: "人どうしの会話、全体への呼びかけ、独り言。Noth への合図（名前での呼びかけ、メンション、Noth の発言への返信、Noth とのやりとりの直後の続き）がないもの。人どうしの質問（例「いまってsonnetだっけ」）は、Noth が答えられそうでもこれ".into(),
+            about_noth: "Noth の設計や挙動について人どうしで話していて、名前が話題として出ているだけ。Noth に返事や作業を求めていない（Noth の挙動の感想、開発の相談、ほかの人への説明）。文頭や文末での呼びかけはこれではなく noth_request".into(),
+            other_bot: "Noth 以外の Bot に話しかけている、または Bot の発言に返している".into(),
+            noth_request: "Noth に返事、回答、作業を求める合図がある。合図とは、名前による呼びかけ（文頭や文末の「のす」「の、す」「…よのす」などの愛称や崩した表記を含む）、メンション、Noth の発言への返信、Noth とのやりとりの直後の続き。trigger の in_conversation_window が true の発言は、Noth とのやりとりの直後の続きの合図がある".into(),
+        }
+    }
+}
+
+impl Default for ReactionTexts {
+    fn default() -> Self {
+        Self {
+            instructions: "Noth がトリガー発言群の最後の発言に絵文字リアクションを付けるとしたら、どれが一番自然かを選んでください。発言の内容と、それを読んだ Noth の気持ちに合うものを選びます。".into(),
+            none: "リアクションを付けない（話すほどでも、絵文字を付けるほどでもない）".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -693,22 +771,30 @@ debounce_secs = 2.0
 [router]
 recent_messages  = 30            # state.recent に入れる直近発言数
 state_max_chars  = 24000         # state 全体の文字数上限
-candidate_chunks = 32            # 関連判定にかける候補 TopicChunk の数
-call_names       = ["noth", "ノス", "のす"]  # 本文でこう呼ばれたら min_confidence を無視して router の判定に従う
-conversation_window_secs = 120  # Noth が応答してからこの秒数は、話していた相手の発言を呼び名と同じ扱いにする
+call_names       = ["noth", "ノス", "のす"]  # 本文でこう呼ばれたことを router に伝える(calls_noth_by_name)。決定的に noth_request とするのはメンションとリプライだけ
+conversation_window_secs = 120  # Noth が応答してからこの秒数の、話していた相手の発言を、router に in_conversation_window で伝える(決定的には noth_request にしない)
+supplement_min_interval_secs = 300  # 黙って補足の Worker を起動する、チャンネルごとの最短間隔(秒)。訂正には適用しない
+supplement_max_per_day       = 50   # 同じ起動の 1 日の上限回数(guild 全体。訂正は数えない)
 
 [router.thresholds]
-is_noise_or_meme = 0.5
-is_topic_shift   = 0.6
-relevant_chunk   = 0.5
-min_confidence   = 0.15
-name_call_reply  = 0.25  # 呼び名で呼ばれたとき、reply_only と spawn_task の確率の合計がこれ以上なら応答する
-addressed_to_noth = 0.6  # 「Noth に向けた発言か」がこれ以上なら、静観を返答に引き上げる
+is_noise_or_meme   = 0.5  # ノイズは記録だけして Layer 3 には昇格させない。Noth への依頼(noth_request)なら応答を優先
+is_topic_shift     = 0.6
+needs_outside_work = 0.5  # noth_request でこれ以上なら Worker に回す。取りこぼさない側に倒す
+corrects_noth      = 0.5  # Noth の誤りの指摘とみなす(訂正)
+worth_supplement   = 0.5  # 黙って補足の Worker を起動する
+min_confidence     = 0.15 # 合流判定の abort だけに使う
+
+# 問いの文言は [router.questions] で差し替えられる(省略時は評価で確定した既定値)。
+# 例: [router.questions.addressee] の instructions / other / about_noth / other_bot / noth_request、
+#     [router.questions.reaction] の instructions / none、
+#     needs_outside_work / corrects_noth / worth_supplement / is_topic_shift は文字列
 
 [router.systemone]
 preset     = "jev"               # jev | clef | custom
+model      = "jev-1.14.0"        # 版を固定した名前。jev-latest などの別名は中身が変わるので避ける
 api_key    = "${TYPESAFE_API_KEY}"
-# Clef(Cloudflare Workers AI)は安いが、実測では Noth 宛てかどうかの判定が Jev より大きく劣った。使う場合は上の2行を次に置き換える
+# 入力の料金は Jev $0.042、Clef $0.240、Clef-flash $0.038(100万トークンあたり)で、安いのは Clef-flash だけ(Clef は Jev より高い)。
+# 実測では Noth 宛てかどうかの判定が Jev より大きく劣った。使う場合は上の3行を次に置き換える
 # preset     = "clef"
 # model      = "clef-flash"
 # api_key    = "${CF_API_TOKEN}"
@@ -821,8 +907,11 @@ fn default_recent() -> usize {
 fn default_state_max_chars() -> usize {
     24_000
 }
-fn default_candidate_chunks() -> usize {
-    32
+fn default_supplement_min_interval_secs() -> u64 {
+    300
+}
+fn default_supplement_max_per_day() -> u32 {
+    50
 }
 fn d06() -> f32 {
     0.6
@@ -857,19 +946,15 @@ fn default_conversation_window_secs() -> u64 {
     120
 }
 
-fn d025() -> f32 {
-    0.25
-}
-
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
             is_noise_or_meme: d05(),
             is_topic_shift: d06(),
-            relevant_chunk: d05(),
+            needs_outside_work: d05(),
+            corrects_noth: d05(),
+            worth_supplement: d05(),
             min_confidence: d015(),
-            name_call_reply: d025(),
-            addressed_to_noth: d06(),
         }
     }
 }
@@ -1141,7 +1226,10 @@ api_key = "${{OTHER}}"
         assert_eq!(c.memory.memory_max_chars, 6000);
         assert_eq!(c.memory.dreaming_hour, 4);
         assert_eq!(c.memory.dream_input_max_chars, 60_000);
-        assert_eq!(c.router.thresholds.addressed_to_noth, 0.6);
+        assert_eq!(c.router.thresholds.needs_outside_work, 0.5);
+        assert_eq!(c.router.supplement_min_interval_secs, 300);
+        assert_eq!(c.router.supplement_max_per_day, 50);
+        assert!(c.router.questions.addressee.noth_request.contains("合図"));
         let home = &c.paths.home;
         assert_eq!(c.paths.memory_dir(), home.join("profiles/memory"));
         assert_eq!(
