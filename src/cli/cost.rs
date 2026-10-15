@@ -2,117 +2,19 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
-use clap::ValueEnum;
-use jiff::{Timestamp, Zoned};
+use anyhow::Result;
+use jiff::Timestamp;
 use noth_core::config::{Config, lookup, masked_raw_table};
 use noth_core::store::{CostGroup, CostSummaryRow, Store};
 
 use super::{message, pad, pad_left, paths};
 
-#[derive(Clone, Copy, ValueEnum)]
-pub enum By {
-    Source,
-    Model,
-    Purpose,
-    Day,
-    Run,
-}
+mod format;
+mod period;
 
-impl By {
-    fn group(self) -> CostGroup {
-        match self {
-            By::Source => CostGroup::Source,
-            By::Model => CostGroup::Model,
-            By::Purpose => CostGroup::Purpose,
-            By::Day => CostGroup::Day,
-            By::Run => CostGroup::Run,
-        }
-    }
-    fn header(self) -> &'static str {
-        match self {
-            By::Source => "source",
-            By::Model => "model",
-            By::Purpose => "purpose",
-            By::Day => "日付",
-            By::Run => "run",
-        }
-    }
-}
-
-/// `today`(ローカル時間の 0 時)/ `<n>h` / `<n>d` / `all` を、集計の開始時刻(UNIX ミリ秒)にする
-pub fn parse_period(s: &str, now_ms: i64, today_start_ms: i64) -> Result<i64> {
-    const HOUR_MS: i64 = 3_600_000;
-    let s = s.trim();
-    match s {
-        "all" => return Ok(0),
-        "today" => return Ok(today_start_ms),
-        _ => {}
-    }
-    let unit_ms = match s.chars().last() {
-        Some('h') => HOUR_MS,
-        Some('d') => 24 * HOUR_MS,
-        _ => bail!("期間は today / 24h / 7d / 30d / all の形式で指定してください: `{s}`"),
-    };
-    let n: i64 = s[..s.len() - 1]
-        .parse()
-        .ok()
-        .filter(|n| *n > 0)
-        .ok_or_else(|| anyhow::anyhow!("期間の数値が不正です: `{s}`"))?;
-    Ok(now_ms.saturating_sub(n.saturating_mul(unit_ms)))
-}
-
-fn today_start_ms() -> i64 {
-    let now = Zoned::now();
-    now.start_of_day()
-        .map_or(0, |z| z.timestamp().as_millisecond())
-}
-
-pub fn group_digits(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-pub fn format_usd(amount: f64) -> String {
-    format!("${amount:.4}")
-}
-
-fn format_cost(amount: f64, unpriced: u64) -> String {
-    if unpriced > 0 {
-        format!("{} +不明 {unpriced} 件", format_usd(amount))
-    } else {
-        format_usd(amount)
-    }
-}
-
-fn format_units(units: &[(String, u64)]) -> String {
-    if units.is_empty() {
-        return "-".to_string();
-    }
-    units
-        .iter()
-        .map(|(name, n)| format!("{} {name}", group_digits(*n)))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// 秒数を「3分」「2時間」のように最大の単位 1 つで表す
-pub fn format_span(secs: i64) -> String {
-    let secs = secs.max(0);
-    match secs {
-        0..=59 => format!("{secs}秒"),
-        60..=3599 => format!("{}分", secs / 60),
-        3600..=86399 => format!("{}時間", secs / 3600),
-        _ => format!("{}日", secs / 86400),
-    }
-}
+use format::{display_width, format_cost, format_span, format_units, format_usd, group_digits};
+pub use period::By;
+use period::{parse_period, today_start_ms};
 
 fn total(rows: &[CostSummaryRow]) -> CostSummaryRow {
     let mut t = CostSummaryRow {
@@ -203,10 +105,6 @@ fn print_table(by: By, rows: &[CostSummaryRow]) {
         }
         println!("{}", line(row).trim_end());
     }
-}
-
-fn display_width(s: &str) -> usize {
-    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
 /// config.toml の guild_id。`${VAR}` が未解決でも読めるよう、生の設定から取る

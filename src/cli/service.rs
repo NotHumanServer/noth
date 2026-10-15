@@ -4,13 +4,21 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use noth_core::config::{lookup, masked_raw_table};
 use service_manager::{
     RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx,
     ServiceStatus, ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 
 use super::{ServiceCmd, paths};
+
+mod launchd;
+mod systemd;
+mod timeout;
+
+use launchd::launchd_plist;
+use systemd::systemd_unit;
+pub use timeout::timeout_mismatch_notice;
+use timeout::{print_timeout_notice, stop_timeout_secs};
 
 const LABEL: &str = "dev.noth.noth";
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -27,112 +35,6 @@ pub struct UnitSpec {
     pub path_env: String,
     pub stop_timeout_secs: u64,
     pub logs_dir: PathBuf,
-}
-
-/// systemd は `%` を指定子、`$` を変数として展開し、引用符内では `\` と `"` をエスケープする
-fn systemd_quote(s: &str) -> String {
-    let escaped = s
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('%', "%%")
-        .replace('$', "$$");
-    format!("\"{escaped}\"")
-}
-
-/// `Environment=` では `$` は展開されない
-fn systemd_env(key: &str, value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('%', "%%");
-    format!("Environment=\"{key}={escaped}\"")
-}
-
-pub fn systemd_unit(spec: &UnitSpec) -> String {
-    let exec = std::iter::once(spec.program.to_string_lossy().into_owned())
-        .chain(spec.args.iter().cloned())
-        .map(|a| systemd_quote(&a))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let home = spec.home.to_string_lossy();
-    format!(
-        "[Unit]\n\
-         Description=Noth Discord agent\n\
-         \n\
-         [Service]\n\
-         ExecStart={exec}\n\
-         WorkingDirectory={wd}\n\
-         {env_home}\n\
-         {env_path}\n\
-         Restart=on-failure\n\
-         RestartSec={RESTART_DELAY_SECS}\n\
-         TimeoutStopSec={timeout}\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        wd = home.replace('%', "%%"),
-        env_home = systemd_env("NOTH_HOME", &home),
-        env_path = systemd_env("PATH", &spec.path_env),
-        timeout = spec.stop_timeout_secs,
-    )
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// `Disabled` は install 時の `launchctl load` で起動しないための印。service-manager の start が外してから load し直す
-pub fn launchd_plist(spec: &UnitSpec) -> String {
-    let args = std::iter::once(spec.program.to_string_lossy().into_owned())
-        .chain(spec.args.iter().cloned())
-        .map(|a| format!("    <string>{}</string>\n", xml_escape(&a)))
-        .collect::<String>();
-    let home = xml_escape(&spec.home.to_string_lossy());
-    let logs = |name: &str| xml_escape(&spec.logs_dir.join(name).to_string_lossy());
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-{args}  </array>
-  <key>WorkingDirectory</key>
-  <string>{home}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>NOTH_HOME</key>
-    <string>{home}</string>
-    <key>PATH</key>
-    <string>{path}</string>
-  </dict>
-  <key>Disabled</key>
-  <true/>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
-  <key>ExitTimeOut</key>
-  <integer>{timeout}</integer>
-  <key>StandardOutPath</key>
-  <string>{out}</string>
-  <key>StandardErrorPath</key>
-  <string>{err}</string>
-</dict>
-</plist>
-"#,
-        path = xml_escape(&spec.path_env),
-        timeout = spec.stop_timeout_secs,
-        out = logs("service.out.log"),
-        err = logs("service.err.log"),
-    )
 }
 
 fn unit_contents(spec: &UnitSpec) -> String {
@@ -156,20 +58,6 @@ fn manager() -> Result<Box<dyn ServiceManager>> {
 
 fn label() -> Result<ServiceLabel> {
     Ok(LABEL.parse()?)
-}
-
-/// 停止を待つ時間。Worker の完了待ち(最長 `worker.timeout_secs`)に余裕を足す
-fn stop_timeout_secs(cfg: Option<&Path>) -> u64 {
-    let timeout = paths(cfg)
-        .ok()
-        .and_then(|p| masked_raw_table(&p).ok())
-        .and_then(|t| {
-            lookup(&t, "worker.timeout_secs")
-                .and_then(|v| v.as_integer())
-                .and_then(|v| u64::try_from(v).ok())
-        })
-        .unwrap_or(DEFAULT_WORKER_TIMEOUT_SECS);
-    timeout + STOP_MARGIN_SECS
 }
 
 fn build_spec(cfg: Option<&Path>) -> Result<UnitSpec> {
@@ -252,43 +140,6 @@ fn require_installed(m: &dyn ServiceManager) -> Result<()> {
         bail!("サービスは未登録です(`noth service install` を先に実行してください)");
     }
     Ok(())
-}
-
-/// 登録済みの定義に埋め込まれた停止タイムアウト(秒)。systemd は `TimeoutStopSec=`、launchd は `ExitTimeOut`
-pub fn installed_stop_timeout(unit: &str) -> Option<u64> {
-    if let Some(line) = unit.lines().find_map(|l| l.strip_prefix("TimeoutStopSec=")) {
-        return line.trim().parse().ok();
-    }
-    let rest = unit.split("<key>ExitTimeOut</key>").nth(1)?;
-    let rest = rest.split_once("<integer>")?.1;
-    rest.split_once("</integer>")?.0.trim().parse().ok()
-}
-
-fn installed_unit_path() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME").filter(|v| !v.is_empty())?);
-    Some(if cfg!(target_os = "macos") {
-        home.join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist"))
-    } else {
-        home.join(".config/systemd/user/noth-noth.service")
-    })
-}
-
-/// 停止タイムアウトは install 時に定義へ固定されるため、`worker.timeout_secs` を変えたあとは差が出る
-pub fn timeout_mismatch_notice(cfg: Option<&Path>) -> Option<String> {
-    let installed = installed_stop_timeout(&std::fs::read_to_string(installed_unit_path()?).ok()?)?;
-    let expected = stop_timeout_secs(cfg);
-    (installed != expected).then(|| {
-        format!(
-            "登録済みの停止タイムアウト({installed} 秒)が worker.timeout_secs に合っていません(現在の設定では {expected} 秒)。反映するには `noth service uninstall && noth service install` で登録し直してください"
-        )
-    })
-}
-
-fn print_timeout_notice(cfg: Option<&Path>) {
-    if let Some(msg) = timeout_mismatch_notice(cfg) {
-        println!("注意: {msg}");
-    }
 }
 
 fn status_label(status: &ServiceStatus) -> String {
@@ -375,6 +226,7 @@ pub async fn restart_if_installed(cfg: Option<&Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::timeout::installed_stop_timeout;
     use super::*;
 
     fn spec() -> UnitSpec {
