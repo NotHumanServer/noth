@@ -32,6 +32,8 @@ fn registry() -> Registry {
     noth_tool_web_agent::register(&mut reg);
     #[cfg(feature = "tool-shell")]
     noth_tool_shell::register(&mut reg);
+    #[cfg(feature = "tool-discord")]
+    noth_tool_discord::register(&mut reg);
     reg
 }
 

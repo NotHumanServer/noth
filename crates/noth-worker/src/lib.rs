@@ -160,6 +160,29 @@ fn progress_summary(tool: &str, input: &Value) -> String {
             let goal = str_field(input, "goal").unwrap_or("");
             format!("{url} : {}", goal.lines().next().unwrap_or(""))
         }
+        "discord" => {
+            // 改行や連続する空白は進捗の 1 行を崩すので 1 つの空白にまとめる
+            let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let action = one_line(str_field(input, "action").unwrap_or(""));
+            let first = |keys: &[&str]| {
+                keys.iter()
+                    .filter_map(|k| match input.get(*k)? {
+                        Value::String(s) => Some(one_line(s)),
+                        Value::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    })
+                    .find(|s| !s.is_empty())
+            };
+            match action.as_str() {
+                "search_messages" => first(&["query", "author", "channel_id"])
+                    .map(|t| format!("{action}「{t}」"))
+                    .unwrap_or(action),
+                _ => match first(&["channel_id", "user_id"]) {
+                    Some(id) => format!("{action} {id}"),
+                    None => action,
+                },
+            }
+        }
         "shell" => {
             let line = str_field(input, "command")
                 .and_then(|c| c.lines().next())
@@ -321,6 +344,8 @@ impl Worker for AgentWorker {
             task_category: task.task_category,
             work_dir: task.work_dir.clone(),
             meter: Some(self.meter.clone()),
+            history: task.history.clone(),
+            audience: task.audience.clone(),
         };
 
         for iteration in 1..=self.settings.max_iterations {
@@ -411,6 +436,7 @@ mod tests {
         out: Result<String>,
         called: Mutex<u32>,
         had_meter: Mutex<bool>,
+        audience: Mutex<Option<noth_core::types::Audience>>,
     }
 
     fn tool(name: &'static str, out: Result<String>) -> Arc<MockTool> {
@@ -419,6 +445,7 @@ mod tests {
             out,
             called: Mutex::new(0),
             had_meter: Mutex::new(false),
+            audience: Mutex::new(None),
         })
     }
 
@@ -434,6 +461,7 @@ mod tests {
         async fn call(&self, _: serde_json::Value, c: &ToolContext) -> Result<ToolOutput> {
             *self.called.lock().unwrap() += 1;
             *self.had_meter.lock().unwrap() = c.meter.is_some();
+            *self.audience.lock().unwrap() = Some(c.audience.clone());
             match &self.out {
                 Ok(t) => Ok(ToolOutput {
                     text: t.clone(),
@@ -482,6 +510,8 @@ mod tests {
             },
             work_dir: "/tmp".into(),
             progress: None,
+            history: None,
+            audience: Default::default(),
         }
     }
 
@@ -717,6 +747,38 @@ mod tests {
             progress_summary("shell", &json!({"command": "ls -la\nrm x"})),
             "`ls -la`"
         );
+        assert_eq!(
+            progress_summary(
+                "discord",
+                &json!({"action": "search_messages", "query": "予算", "channel_id": "#雑談"})
+            ),
+            "search_messages「予算」"
+        );
+        assert_eq!(
+            progress_summary(
+                "discord",
+                &json!({"action": "search_messages", "query": "予算\n  の\t話"})
+            ),
+            "search_messages「予算 の 話」"
+        );
+        assert_eq!(
+            progress_summary(
+                "discord",
+                &json!({"action": "list_pins", "channel_id": 123})
+            ),
+            "list_pins 123"
+        );
+        assert_eq!(
+            progress_summary("discord", &json!({"action": "list_channels"})),
+            "list_channels"
+        );
+        assert_eq!(
+            progress_summary(
+                "discord",
+                &json!({"action": "fetch_messages", "channel_id": "123"})
+            ),
+            "fetch_messages 123"
+        );
         assert_eq!(progress_summary("mystery", &json!({"query": "x"})), "");
     }
 
@@ -806,5 +868,20 @@ mod tests {
             assert_eq!(run_id.as_deref(), Some("run1"));
         }
         assert!(*t.had_meter.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn passes_audience_to_tools() {
+        let t = tool("discord", Ok("r".into()));
+        let p = MockProvider::new(vec![call("discord"), text("メモ")]);
+        let w = worker(p, vec![t.clone()], settings(3, 100));
+        let mut task = task(TaskCategory::WebResearch);
+        task.audience = noth_core::types::Audience {
+            requesters: vec![1, 2],
+            channel_id: Some(10),
+        };
+        w.run(task).await;
+        let seen = t.audience.lock().unwrap().clone().unwrap();
+        assert_eq!((seen.requesters, seen.channel_id), (vec![1, 2], Some(10)));
     }
 }

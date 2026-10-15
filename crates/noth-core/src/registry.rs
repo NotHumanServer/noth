@@ -53,6 +53,7 @@ pub const KNOWN_MODULES: &[(&str, ModuleKind)] = &[
     ("tool-web-fetch", ModuleKind::Tool),
     ("tool-web-agent", ModuleKind::Tool),
     ("tool-shell", ModuleKind::Tool),
+    ("tool-discord", ModuleKind::Tool),
 ];
 
 pub fn kind_of(name: &str) -> Option<ModuleKind> {

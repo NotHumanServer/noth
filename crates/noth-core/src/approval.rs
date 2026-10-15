@@ -4,6 +4,7 @@ use serde_json::Value;
 use crate::types::{TaskCategory, ToolContext, ToolSpec};
 
 pub const SHELL_TOOL: &str = "shell";
+pub const DISCORD_TOOL: &str = "discord";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApprovalPolicy;

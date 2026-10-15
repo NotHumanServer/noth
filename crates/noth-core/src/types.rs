@@ -254,6 +254,15 @@ pub enum TaskCategory {
     CodeOrTool,
 }
 
+/// Worker を起動させた人と場所。tool が「依頼した人に見えるものだけ」を返すために使う
+#[derive(Debug, Clone, Default)]
+pub struct Audience {
+    /// トリガー発言群の発言者(重複なし、Noth 自身を除く)。空なら誰の権限も確認できない
+    pub requesters: Vec<UserId>,
+    /// トリガー発言のチャンネル。依頼した人が発言した場所なので、権限を再計算せず読んでよい
+    pub channel_id: Option<ChannelId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub run_id: String,
@@ -261,6 +270,9 @@ pub struct ToolContext {
     pub work_dir: std::path::PathBuf,
     /// 有料 API の課金やレート制限の残りを Core に知らせる。None なら記録しない
     pub meter: Option<MeterSink>,
+    /// 記録済みの発言の検索窓口。None なら検索できない
+    pub history: Option<std::sync::Arc<dyn crate::history::MessageHistory>>,
+    pub audience: Audience,
 }
 
 #[derive(Debug, Clone)]

@@ -712,6 +712,9 @@ impl Actor {
         usage: &Usage,
     ) -> Result<()> {
         let guild = self.guild;
+        // DB の失敗で Ack 投稿後に中断し、Queued のまま残る run を作らないよう、Ack より前に済ませる
+        let row_ids: Vec<i64> = batch.messages.iter().map(|m| m.row_id).collect();
+        let audience = self.audience(&row_ids, batch.channel_id).await?;
         let ack_message_id = match self.channel.send(batch.channel_id, &plan.ack, None).await {
             Ok(id) => id,
             Err(e) => {
@@ -721,7 +724,6 @@ impl Actor {
         };
         self.note_conversation(batch);
 
-        let row_ids: Vec<i64> = batch.messages.iter().map(|m| m.row_id).collect();
         let trigger_message_id = match row_ids.iter().max() {
             Some(id) => self.store.message(*id).await?.map(|m| m.message_id),
             None => None,
@@ -753,8 +755,33 @@ impl Actor {
         self.enforce_hard_limit(chunk_id).await?;
 
         let base = self.prompt(self.store.active_turns(guild).await?, Vec::new());
-        self.fork(run, base, ack_message_id, plan.ack);
+        self.fork(run, base, ack_message_id, plan.ack, audience);
         Ok(())
+    }
+
+    /// トリガー発言群の発言者。tool が閲覧権限を確かめる相手になる
+    async fn audience(&self, row_ids: &[i64], channel_id: ChannelId) -> Result<Audience> {
+        let mut requesters = Vec::new();
+        for id in row_ids {
+            let Some(m) = self.store.message(*id).await? else {
+                // 発言者を特定できない行があれば、一部の人だけで権限を判断しないよう依頼者を空にして閉じる
+                tracing::warn!(
+                    row_id = id,
+                    "トリガー発言が見つからないため、依頼者を特定できません"
+                );
+                return Ok(Audience {
+                    requesters: Vec::new(),
+                    channel_id: Some(channel_id),
+                });
+            };
+            if !m.is_self && !requesters.contains(&m.user_id) {
+                requesters.push(m.user_id);
+            }
+        }
+        Ok(Audience {
+            requesters,
+            channel_id: Some(channel_id),
+        })
     }
 
     /// 本線の Layer 0〜3 と tool 定義を複製して Worker をバックグラウンドで動かし、終わったら Join を積む
@@ -764,6 +791,7 @@ impl Actor {
         base: LayeredPrompt,
         ack_message_id: MessageId,
         ack: String,
+        audience: Audience,
     ) {
         let Some(pool) = &self.worker else {
             return;
@@ -804,6 +832,8 @@ impl Actor {
             task_category: run.task_category,
             base,
             progress: progress_tx,
+            history: Some(std::sync::Arc::new(store.clone())),
+            audience,
         };
         tokio::spawn(async move {
             let run_id = task.run_id.clone();

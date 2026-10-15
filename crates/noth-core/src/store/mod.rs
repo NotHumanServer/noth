@@ -8,12 +8,26 @@ use serde_json::Value;
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 
+use crate::history::{HistoryQuery, MessageHistory};
 use crate::types::*;
 use crate::{Error, Result};
 
 #[derive(Clone)]
 pub struct Store {
     pool: sqlx::SqlitePool,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store").finish_non_exhaustive()
+    }
+}
+
+#[crate::async_trait]
+impl MessageHistory for Store {
+    async fn search(&self, q: &HistoryQuery) -> Result<Vec<MessageRow>> {
+        self.search_messages(q).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +432,37 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(message_row).transpose()
+    }
+    /// 新しい順。文字列の絞り込みは SQLite の lower() に頼るので、大文字小文字を区別しないのは ASCII だけ。SQLite 側の lower() に合わせ、引数も ASCII だけ小文字にする
+    pub async fn search_messages(&self, q: &HistoryQuery) -> Result<Vec<MessageRow>> {
+        let lower = |s: &Option<String>| s.as_ref().map(|s| s.to_ascii_lowercase());
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ?
+               AND (? IS NULL OR channel_id = ?)
+               AND (? IS NULL OR lower(channel_name) = ?)
+               AND (? IS NULL OR instr(lower(content), ?) > 0)
+               AND (? IS NULL OR instr(lower(author_name), ?) > 0)
+               AND (? IS NULL OR created_at >= ?)
+               AND (? IS NULL OR created_at < ?)
+             ORDER BY created_at DESC, id DESC LIMIT ?"
+        )))
+        .bind(q.guild_id as i64)
+        .bind(q.channel_id.map(|c| c as i64))
+        .bind(q.channel_id.map(|c| c as i64))
+        .bind(lower(&q.channel_name))
+        .bind(lower(&q.channel_name))
+        .bind(lower(&q.text))
+        .bind(lower(&q.text))
+        .bind(lower(&q.author))
+        .bind(lower(&q.author))
+        .bind(q.since.map(|t| t.as_millisecond()))
+        .bind(q.since.map(|t| t.as_millisecond()))
+        .bind(q.until.map(|t| t.as_millisecond()))
+        .bind(q.until.map(|t| t.as_millisecond()))
+        .bind(q.limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(message_row).collect()
     }
     /// 発言が 1 件も無ければ 0
     pub async fn max_message_id(&self, guild: GuildId) -> Result<i64> {
@@ -1669,6 +1714,101 @@ mod tests {
             ]
         );
         assert!(s.memory_versions(G + 1).await.unwrap().is_empty());
+    }
+
+    fn query() -> HistoryQuery {
+        HistoryQuery {
+            guild_id: G,
+            channel_id: None,
+            channel_name: None,
+            text: None,
+            author: None,
+            since: None,
+            until: None,
+            limit: 10,
+        }
+    }
+
+    async fn search_ids(s: &Store, q: &HistoryQuery) -> Vec<u64> {
+        s.search_messages(q)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.message_id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn search_messages_filters_and_orders_newest_first() {
+        let s = Store::open_memory().await.unwrap();
+        s.insert_message(&incoming(1, false, "Rust の話"))
+            .await
+            .unwrap();
+        let mut other = incoming(2, false, "晩ごはん");
+        other.channel_id = 11;
+        other.channel_name = "雑談".into();
+        other.author_name = "Bob".into();
+        s.insert_message(&other).await.unwrap();
+        s.insert_message(&incoming(3, true, "rust は速い"))
+            .await
+            .unwrap();
+        let mut foreign = incoming(4, false, "rust");
+        foreign.guild_id = G + 1;
+        s.insert_message(&foreign).await.unwrap();
+
+        assert_eq!(search_ids(&s, &query()).await, vec![3, 2, 1]);
+        let text = HistoryQuery {
+            text: Some("RUST".into()),
+            ..query()
+        };
+        assert_eq!(search_ids(&s, &text).await, vec![3, 1]);
+        let by_id = HistoryQuery {
+            channel_id: Some(11),
+            ..query()
+        };
+        assert_eq!(search_ids(&s, &by_id).await, vec![2]);
+        let by_name = HistoryQuery {
+            channel_name: Some("GENERAL".into()),
+            ..query()
+        };
+        assert_eq!(search_ids(&s, &by_name).await, vec![3, 1]);
+        let author = HistoryQuery {
+            author: Some("bo".into()),
+            ..query()
+        };
+        assert_eq!(search_ids(&s, &author).await, vec![2]);
+        let ts = |id: i64| Timestamp::from_millisecond(1_700_000_000_000 + id).unwrap();
+        let range = HistoryQuery {
+            since: Some(ts(2)),
+            until: Some(ts(3)),
+            ..query()
+        };
+        assert_eq!(search_ids(&s, &range).await, vec![2]);
+        let limited = HistoryQuery {
+            limit: 1,
+            ..query()
+        };
+        assert_eq!(search_ids(&s, &limited).await, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn search_messages_folds_only_ascii_case() {
+        let s = Store::open_memory().await.unwrap();
+        s.insert_message(&incoming(1, false, "École の話"))
+            .await
+            .unwrap();
+        let ids = |text: &str| {
+            let q = HistoryQuery {
+                text: Some(text.into()),
+                ..query()
+            };
+            let s = s.clone();
+            async move { search_ids(&s, &q).await }
+        };
+        assert_eq!(ids("École").await, vec![1]);
+        assert_eq!(ids("cole").await, vec![1]);
+        assert_eq!(ids("COLE").await, vec![1]);
+        assert!(ids("école").await.is_empty());
     }
 
     #[tokio::test]

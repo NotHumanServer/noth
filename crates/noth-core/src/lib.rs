@@ -4,6 +4,7 @@ pub mod bus;
 pub mod config;
 pub mod error;
 pub mod heartbeat;
+pub mod history;
 pub mod ingest;
 pub mod judge;
 pub mod layers;

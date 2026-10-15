@@ -129,6 +129,32 @@ pub trait Tool: Send + Sync {
 
 tool の出力は Worker のコンテキストにだけ入り、本線には届きません。出力は `tool_output_max_chars` で切り詰めてから Worker に返します。
 
+`ToolContext` は `audience: Audience { requesters: Vec<UserId>, channel_id: Option<ChannelId> }` も持ちます。Worker を起動させた発言者とトリガーのチャンネルで、actor が `WorkerTask::audience` に詰め、Worker が `ToolContext` に写します。tool が「出力が届く先の全員に見えるものだけ」を返すための情報です。届く先は、依頼した人、トリガーのチャンネルを見られる `allowed_users` 全員、`@everyone` がそのチャンネルを見られるなら `@everyone`、の和集合です([security.md §2](security.md#2-discord-側の対策))。
+
+`ToolContext` は `run_id` / `task_category` / `work_dir` / `meter` に加え、記録済みの発言を読み取り専用で引く `history: Option<Arc<dyn MessageHistory>>` を持ちます。tool crate が `noth-core` の trait だけで SQLite の `messages` を検索できるようにするためで、実体は Core の `Store` です(Worker が `WorkerTask::history` から渡す。None なら検索できない)。
+
+```rust
+pub struct HistoryQuery {
+    pub guild_id: GuildId,
+    pub channel_id: Option<ChannelId>,
+    /// `messages.channel_name` との完全一致(ASCII のみ大文字小文字を区別しない。非 ASCII は完全に同じ表記で一致する)
+    pub channel_name: Option<String>,
+    /// content の部分一致(ASCII のみ大文字小文字を区別しない。非 ASCII は完全に同じ表記で一致する)
+    pub text: Option<String>,
+    /// author_name の部分一致(ASCII のみ大文字小文字を区別しない。非 ASCII は完全に同じ表記で一致する)
+    pub author: Option<String>,
+    pub since: Option<Timestamp>,
+    pub until: Option<Timestamp>,
+    pub limit: usize,
+}
+
+#[async_trait]
+pub trait MessageHistory: Send + Sync + Debug {
+    /// 新しい順。`allowed_users` と Noth の発言だけが記録されているので、返る行に追加のマスクは要らない
+    async fn search(&self, q: &HistoryQuery) -> Result<Vec<MessageRow>>;
+}
+```
+
 Worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。承認ポリシーの内容と `tool-shell` の作業ディレクトリは [security.md §3](security.md#3-web-側の対策と承認ポリシー) と [§4](security.md#4-tool-shell-の運用) で定義します。
 
 ## 6. `Compactor`

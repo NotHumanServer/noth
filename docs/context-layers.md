@@ -269,7 +269,7 @@ sequenceDiagram
    - Worker 固有の指示(「これはバックグラウンド作業である」「結論メモの書式」「Goal」)は **最初の user メッセージ** に置く。`system` には1文字も足さない。理由は [architecture/caching.md §3](architecture/caching.md#3-worker-固有の指示の置き場) を参照
    - Worker は隔離された自分のコンテキストで tool を実行し、呼び出しと結果をコンテキストの末尾に追記する。反復は `max_iterations` 回まで、各 tool の出力は `tool_output_max_chars` で切り詰める。`tool-shell` は `task_category == code_or_tool` の run でだけ承認され、`cwd` は run ごとの `$NOTH_HOME/work/<run_id>/`
    - Worker の実行中も本線は別の会話を処理できるため、雑談が進めばパターン B で通常どおり応答できる
-   - Worker の実行中(キュー待ちを含む)はトリガーのチャンネルに入力中表示を出し続ける。`[worker] show_progress`(既定 true)なら、Worker が tool を呼ぶたびに Ack のメッセージを編集し、`-# 🔍 web_search「検索語」` のような行を末尾に足していく。編集は 1.5 秒に 1 回までにまとめ、終了時に完了か失敗の行を足す。この進捗は Discord にだけ出し、Layer 3 には Ack と Goal の本文だけを残す。tool の出力は進捗にも含めない
+   - Worker の実行中(キュー待ちを含む)はトリガーのチャンネルに入力中表示を出し続ける。`[worker] show_progress`(既定 true)なら、Worker が tool を呼ぶたびに Ack のメッセージを編集し、`-# 🔍 web_search「検索語」` や `-# 💬 discord search_messages「検索語」` のような行を末尾に足していく。編集は 1.5 秒に 1 回までにまとめ、終了時に完了か失敗の行を足す。この進捗は Discord にだけ出し、Layer 3 には Ack と Goal の本文だけを残す。tool の出力は進捗にも含めない
 3. **Join と報告**
    - Worker は完了時に途中の tool 出力をすべて捨て、構造化された結論メモ(数百トークン)だけを出力して終了する。timeout・API エラー・反復上限で失敗したときは Core が `[内部調査失敗 <run_id>: <理由>]` を結論メモの代わりにする
    - actor が `Join(run_id)` を処理し、router の合流判定(§4.3)を実行する

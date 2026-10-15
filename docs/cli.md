@@ -192,6 +192,7 @@ enabled = [
   "tool-web-search",
   "tool-web-fetch",
   "tool-shell",
+  "tool-discord",              # 読み取り専用の Discord 参照。[channel.discord] のトークンと guild_id を使う
 ]
 
 [profile]
@@ -323,6 +324,8 @@ poll_interval_secs = 5
 max_duration_secs  = 300         # TinyFish 側で run を打ち切る秒数。Agent はステップ課金のため上限を設ける
 # max_steps         = 30          # 1 run の最大ステップ数(tool 入力の max_steps との小さい方。上限 150)
 # max_steps_per_run  = 60          # 1 回の調査(Worker の run_id)での累計ステップ上限。超えたら API を呼ばず失敗を返す
+[tool.discord]
+# actions = ["fetch_messages", "search_messages", "list_channels"]   # 使える action を絞る。省略か空なら全部
 [tool.shell]
 # cwd は run ごとの $NOTH_HOME/work/<run_id>/ に固定。設定項目なし
 

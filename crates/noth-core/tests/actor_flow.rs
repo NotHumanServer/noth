@@ -1231,6 +1231,91 @@ async fn runs(store: &Store, status: RunStatus) -> Vec<noth_core::store::WorkerR
 }
 
 #[tokio::test]
+async fn worker_task_carries_distinct_requesters_without_noth() {
+    let mut h = Harness::setup(Setup {
+        worker: true,
+        worker_permits: 0,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(spawn_answers("web_research"));
+    h.provider.script_text("調べるね\n[Goal]\n調査");
+    let mut pending = Vec::new();
+    // 発言者 1, 2, 1(重複)と、Noth 自身(99)
+    for (user_id, is_self) in [(1, false), (2, false), (1, false), (99, true)] {
+        h.next_message_id += 1;
+        let mut m = incoming(GENERAL, "general", "調べて", h.next_message_id);
+        m.user_id = user_id;
+        m.is_self = is_self;
+        let row_id = h.store.insert_message(&m).await.unwrap();
+        pending.push(PendingMessage {
+            row_id,
+            message_id: m.message_id,
+            author_name: "x".into(),
+            content: m.content.clone(),
+            at: m.timestamp,
+            mentions_self: false,
+            reply_to_self: false,
+            reply_to: None,
+        });
+    }
+    h.actor
+        .handle_judge(JudgeBatch {
+            channel_id: GENERAL,
+            channel_name: "general".into(),
+            messages: pending,
+        })
+        .await
+        .unwrap();
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    let task = h.worker.tasks.lock().unwrap()[0].clone();
+    assert_eq!(task.audience.requesters, vec![1, 2]);
+    assert_eq!(task.audience.channel_id, Some(GENERAL));
+    h.worker.release.add_permits(1);
+}
+
+#[tokio::test]
+async fn worker_task_has_no_requesters_when_a_trigger_row_is_missing() {
+    let mut h = Harness::setup(Setup {
+        worker: true,
+        worker_permits: 0,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(spawn_answers("web_research"));
+    h.provider.script_text("調べるね\n[Goal]\n調査");
+    h.next_message_id += 1;
+    let m = incoming(GENERAL, "general", "調べて", h.next_message_id);
+    let row_id = h.store.insert_message(&m).await.unwrap();
+    let pending = |row_id, message_id| PendingMessage {
+        row_id,
+        message_id,
+        author_name: "x".into(),
+        content: "調べて".into(),
+        at: m.timestamp,
+        mentions_self: false,
+        reply_to_self: false,
+        reply_to: None,
+    };
+    // DB に無い行が混ざると、発言者を一部しか特定できないので依頼者を空にして閉じる
+    h.actor
+        .handle_judge(JudgeBatch {
+            channel_id: GENERAL,
+            channel_name: "general".into(),
+            messages: vec![pending(row_id, m.message_id), pending(999_999, 999)],
+        })
+        .await
+        .unwrap();
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    let task = h.worker.tasks.lock().unwrap()[0].clone();
+    assert!(task.audience.requesters.is_empty());
+    assert_eq!(task.audience.channel_id, Some(GENERAL));
+    h.worker.release.add_permits(1);
+}
+
+#[tokio::test]
 async fn spawn_task_posts_ack_and_records_goal_before_fork() {
     let mut h = Harness::setup(Setup {
         worker: true,
@@ -1262,6 +1347,7 @@ async fn spawn_task_posts_ack_and_records_goal_before_fork() {
     let task = h.worker.tasks.lock().unwrap()[0].clone();
     assert_eq!(task.goal, "東京の明日の天気を調べる");
     assert_eq!(task.task_category, TaskCategory::WebResearch);
+    assert_eq!(task.audience.requesters, vec![1]);
     assert_eq!(task.base.active_log, turns);
     assert!(task.base.ephemeral_tail.is_empty());
     assert_eq!(

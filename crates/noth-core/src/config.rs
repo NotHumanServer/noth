@@ -673,6 +673,7 @@ enabled = [
   # "tool-web-agent",
   # 警告: tool-shell は Bot を動かすユーザーの権限で、サンドボックスなしにコマンドを実行する(security.md §4)
   "tool-shell",
+  "tool-discord",              # 読み取り専用の Discord 参照。[channel.discord] のトークンと guild_id を使う
 ]
 
 [profile]
@@ -1219,6 +1220,7 @@ api_key = "${{OTHER}}"
             "tool-web-search",
             "tool-web-fetch",
             "tool-shell",
+            "tool-discord",
         ] {
             assert!(c.is_enabled(m), "{m}");
         }

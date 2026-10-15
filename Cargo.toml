@@ -24,6 +24,7 @@ noth-tool-shell = { path = "crates/noth-tool-shell" }
 noth-tool-web-search = { path = "crates/noth-tool-web-search" }
 noth-tool-web-fetch = { path = "crates/noth-tool-web-fetch" }
 noth-tool-web-agent = { path = "crates/noth-tool-web-agent" }
+noth-tool-discord = { path = "crates/noth-tool-discord" }
 noth-backend-tinyfish = { path = "crates/noth-backend-tinyfish" }
 gcp_auth = "0.12"
 tokio = { version = "1.53", features = ["full"] }
@@ -46,7 +47,7 @@ jiff = { version = "0.2", features = ["serde"] }
 default = [
   "channel-discord", "router-systemone", "router-mention",
   "provider-anthropic", "worker", "compactor",
-  "tool-web-search", "tool-web-fetch", "tool-shell",
+  "tool-web-search", "tool-web-fetch", "tool-shell", "tool-discord",
 ]
 channel-discord = ["dep:noth-channel-discord"]
 router-systemone = ["dep:noth-router-systemone"]
@@ -60,6 +61,7 @@ tool-web-search = ["dep:noth-tool-web-search"]
 tool-web-fetch = ["dep:noth-tool-web-fetch"]
 tool-web-agent = ["dep:noth-tool-web-agent"]
 tool-shell = ["dep:noth-tool-shell"]
+tool-discord = ["dep:noth-tool-discord"]
 
 [dependencies]
 noth-core.workspace = true
@@ -75,6 +77,7 @@ noth-tool-shell = { workspace = true, optional = true }
 noth-tool-web-search = { workspace = true, optional = true }
 noth-tool-web-fetch = { workspace = true, optional = true }
 noth-tool-web-agent = { workspace = true, optional = true }
+noth-tool-discord = { workspace = true, optional = true }
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

@@ -21,6 +21,7 @@ fn icon(tool: &str) -> &'static str {
         "web_fetch" => "📄",
         "web_agent" => "🧭",
         "shell" => "💻",
+        "discord" => "💬",
         _ => "🔧",
     }
 }
@@ -134,6 +135,10 @@ mod tests {
             "-# 🔍 web_search 東京 天気"
         );
         assert_eq!(progress_line(&p("shell", "ls")), "-# 💻 shell ls");
+        assert_eq!(
+            progress_line(&p("discord", "search_messages「予算」")),
+            "-# 💬 discord search_messages「予算」"
+        );
         assert_eq!(progress_line(&p("other", "x")), "-# 🔧 other x");
     }
 

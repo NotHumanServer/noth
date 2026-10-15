@@ -206,6 +206,10 @@ pub struct WorkerTask {
     pub work_dir: std::path::PathBuf,
     /// None なら進捗を送らない。送信に失敗しても Worker は続ける
     pub progress: Option<tokio::sync::mpsc::UnboundedSender<WorkerProgress>>,
+    /// tool の `ToolContext::history` にそのまま渡す
+    pub history: Option<std::sync::Arc<dyn crate::history::MessageHistory>>,
+    /// tool の `ToolContext::audience` にそのまま渡す
+    pub audience: Audience,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

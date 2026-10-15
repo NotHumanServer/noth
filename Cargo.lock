@@ -1610,6 +1610,7 @@ dependencies = [
  "noth-provider-openai",
  "noth-router-mention",
  "noth-router-systemone",
+ "noth-tool-discord",
  "noth-tool-shell",
  "noth-tool-web-agent",
  "noth-tool-web-fetch",
@@ -1751,6 +1752,20 @@ dependencies = [
  "noth-core",
  "reqwest 0.13.5",
  "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "noth-tool-discord"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jiff",
+ "noth-core",
+ "reqwest 0.13.5",
  "serde_json",
  "tokio",
  "toml",
@@ -2238,6 +2253,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.6",

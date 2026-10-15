@@ -8,6 +8,8 @@ fn ctx(dir: &std::path::Path) -> ToolContext {
         task_category: TaskCategory::CodeOrTool,
         work_dir: dir.to_path_buf(),
         meter: None,
+        history: None,
+        audience: Default::default(),
     }
 }
 

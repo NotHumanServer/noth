@@ -8,6 +8,8 @@ fn ctx() -> ToolContext {
         task_category: TaskCategory::WebResearch,
         work_dir: std::env::temp_dir(),
         meter: None,
+        history: None,
+        audience: Default::default(),
     }
 }
 
