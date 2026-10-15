@@ -4,7 +4,7 @@ mod pricing;
 mod wire;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use noth_core::registry::{ModuleCtx, Registry};
@@ -33,16 +33,46 @@ struct Settings {
     format: Option<String>,
     preset: Option<String>,
     base_url: Option<String>,
+    /// 1 回の試行全体の上限。進んでいても超えれば切って再試行する。旧名 timeout_secs はどちらか一方だけ
+    request_timeout_secs: Option<u64>,
     timeout_secs: Option<u64>,
+    /// codex preset の SSE で、バイトが 1 つも届かない時間の上限
+    idle_timeout_secs: Option<u64>,
     effort: Option<String>,
     #[serde(default)]
     pricing: pricing::Overrides,
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
-/// Codex は SSE を最後まで読み切ってから解析する。長い reasoning の間は何も届かないが全体の
-/// タイムアウトは進むので、通常より長くとる
+/// Codex は SSE を最後まで読み切ってから解析するので、通常より長くとる
 const CODEX_TIMEOUT_SECS: u64 = 300;
+/// 止まった接続に 5 分付き合わず早めに再試行へ回すため、全体上限とは別に無通信だけを短く見る
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 45;
+
+/// request_timeout_secs と旧名 timeout_secs は同時に指定できない。0 は即タイムアウトになるので弾く
+fn request_timeout(
+    request_timeout_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+) -> Result<Option<u64>> {
+    if request_timeout_secs.is_some() && timeout_secs.is_some() {
+        return Err(Error::Config(
+            "provider.openai: request_timeout_secs と timeout_secs は同時に指定できません(timeout_secs は旧名です)".into(),
+        ));
+    }
+    positive_secs(
+        "request_timeout_secs",
+        request_timeout_secs.or(timeout_secs),
+    )
+}
+
+fn positive_secs(key: &str, secs: Option<u64>) -> Result<Option<u64>> {
+    if secs == Some(0) {
+        return Err(Error::Config(format!(
+            "provider.openai: {key} は 1 以上にしてください"
+        )));
+    }
+    Ok(secs)
+}
 
 fn resolve_base_url(preset: Option<&str>, base_url: Option<&str>) -> Result<String> {
     let preset_url = match preset {
@@ -84,9 +114,11 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
         ));
     }
     let effort = s.effort.as_deref().map(wire::parse_effort).transpose()?;
+    let request_timeout = request_timeout(s.request_timeout_secs, s.timeout_secs)?;
+    let idle_timeout = positive_secs("idle_timeout_secs", s.idle_timeout_secs)?;
     let base_url = resolve_base_url(s.preset.as_deref(), s.base_url.as_deref())?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(s.timeout_secs.unwrap_or(if codex {
+        .timeout(Duration::from_secs(request_timeout.unwrap_or(if codex {
             CODEX_TIMEOUT_SECS
         } else {
             DEFAULT_TIMEOUT_SECS
@@ -117,6 +149,8 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
         format,
         effort,
         retry_max: ctx.config.context.retry_max,
+        streaming: codex,
+        idle_timeout: Duration::from_secs(idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS)),
         compat: s.preset.is_some() || s.base_url.is_some(),
     }))
 }
@@ -130,6 +164,9 @@ struct OpenAiProvider {
     format: wire::Format,
     effort: Option<&'static str>,
     retry_max: u32,
+    /// SSE で受け取る(codex)。本文を chunk ごとに読み、idle_timeout だけ何も来なければその試行を捨てる
+    streaming: bool,
+    idle_timeout: Duration,
     /// preset / base_url 指定時。互換サーバー向けの挙動に切り替える
     compat: bool,
 }
@@ -188,24 +225,30 @@ impl OpenAiProvider {
                 },
                 err => Attempt::Fatal(err),
             })?;
-        let resp = extra_headers
+        let sending = extra_headers
             .iter()
             .fold(req, |r, (k, v)| r.header(*k, v))
             .json(body)
-            .send()
-            .await
-            .map_err(|e| {
-                let err = Error::Transport(e.to_string());
-                // リクエストを組み立てられない失敗は何度送っても直らない
-                if e.is_builder() {
-                    Attempt::Fatal(err)
-                } else {
-                    Attempt::Retry {
-                        err,
-                        retry_after: None,
-                    }
+            .send();
+        let sent = if self.streaming {
+            tokio::time::timeout(self.idle_timeout, sending)
+                .await
+                .map_err(|_| stall(self.idle_timeout))?
+        } else {
+            sending.await
+        };
+        let resp = sent.map_err(|e| {
+            let err = Error::Transport(e.to_string());
+            // リクエストを組み立てられない失敗は何度送っても直らない
+            if e.is_builder() {
+                Attempt::Fatal(err)
+            } else {
+                Attempt::Retry {
+                    err,
+                    retry_after: None,
                 }
-            })?;
+            }
+        })?;
         let status = resp.status();
         let retry_after = resp
             .headers()
@@ -215,11 +258,17 @@ impl OpenAiProvider {
             .map(Duration::from_secs);
         if status.is_success() {
             // 本文を読み切れない通信断は再試行で直るが、200 で JSON が壊れているのは直らない
-            let bytes = resp.bytes().await.map_err(|e| Attempt::Retry {
-                err: Error::Transport(e.to_string()),
-                retry_after: None,
-            })?;
-            return Ok(bytes.to_vec());
+            return if self.streaming {
+                read_stream(resp, self.idle_timeout).await
+            } else {
+                resp.bytes()
+                    .await
+                    .map(|b| b.to_vec())
+                    .map_err(|e| Attempt::Retry {
+                        err: Error::Transport(e.to_string()),
+                        retry_after: None,
+                    })
+            };
         }
         let raw = resp.text().await.unwrap_or_default();
         let err = Error::Api {
@@ -230,6 +279,37 @@ impl OpenAiProvider {
             Err(Attempt::Retry { err, retry_after })
         } else {
             Err(Attempt::Fatal(err))
+        }
+    }
+}
+
+fn stall(idle: Duration) -> Attempt {
+    Attempt::Retry {
+        err: Error::Transport(format!(
+            "{} 秒間何も届かなかったため、止まった接続とみなして切りました",
+            idle.as_secs_f64()
+        )),
+        retry_after: None,
+    }
+}
+
+/// 全体のタイムアウトだけだと、止まった接続に上限いっぱいまで付き合うことになる。chunk ごとに無通信を見て早く切る
+async fn read_stream(
+    mut resp: reqwest::Response,
+    idle: Duration,
+) -> std::result::Result<Vec<u8>, Attempt> {
+    let mut buf = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(idle, resp.chunk())
+            .await
+            .map_err(|_| stall(idle))?
+            .map_err(|e| Attempt::Retry {
+                err: Error::Transport(e.to_string()),
+                retry_after: None,
+            })?;
+        match chunk {
+            Some(c) => buf.extend_from_slice(&c),
+            None => return Ok(buf),
         }
     }
 }
@@ -325,9 +405,10 @@ impl Provider for OpenAiProvider {
         } else {
             Vec::new()
         };
+        let started = Instant::now();
         let mut attempt = 0;
         loop {
-            match self.post_once(path, &extra_headers, &body).await {
+            let outcome = match self.post_once(path, &extra_headers, &body).await {
                 Ok(bytes) => {
                     let cost_ctx = wire::CostContext {
                         request_model: &self.model,
@@ -340,29 +421,87 @@ impl Provider for OpenAiProvider {
                         use_table: !self.compat,
                         overrides: &self.pricing,
                     };
-                    if codex {
-                        return wire::assemble_sse(&String::from_utf8_lossy(&bytes), &cost_ctx);
-                    }
-                    let resp: Value = serde_json::from_slice(&bytes)?;
-                    return match self.format {
-                        wire::Format::Chat => wire::parse_chat_response(&resp, &cost_ctx),
-                        wire::Format::Responses => wire::parse_responses_response(&resp, &cost_ctx),
+                    let completion = if self.streaming {
+                        wire::assemble_sse(&String::from_utf8_lossy(&bytes), &cost_ctx)
+                    } else {
+                        serde_json::from_slice::<Value>(&bytes)
+                            .map_err(Error::from)
+                            .and_then(|resp| match self.format {
+                                wire::Format::Chat => wire::parse_chat_response(&resp, &cost_ctx),
+                                wire::Format::Responses => {
+                                    wire::parse_responses_response(&resp, &cost_ctx)
+                                }
+                            })
                     };
+                    match completion {
+                        // 完了イベントなしで切れたストリームは、通信断なので再試行で直る
+                        Err(err @ Error::Transport(_)) => Err(Attempt::Retry {
+                            err,
+                            retry_after: None,
+                        }),
+                        other => other.map_err(Attempt::Fatal),
+                    }
                 }
-                Err(Attempt::Fatal(err)) => return Err(err),
+                Err(attempt) => Err(attempt),
+            };
+            match outcome {
+                Ok(completion) => {
+                    tracing::info!(
+                        provider = "openai",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        attempts = attempt + 1,
+                        "provider の応答を受け取りました"
+                    );
+                    return Ok(completion);
+                }
+                Err(Attempt::Fatal(err)) => {
+                    tracing::warn!(
+                        provider = "openai",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        reason = %err,
+                        attempts = attempt + 1,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "provider が再試行できないエラーを返しました"
+                    );
+                    return Err(err);
+                }
                 Err(Attempt::Retry { err, retry_after }) => {
-                    if attempt >= self.retry_max {
-                        return Err(err);
-                    }
-                    let Some(wait) = backoff(attempt, retry_after) else {
+                    let wait = (attempt < self.retry_max)
+                        .then(|| backoff(attempt, retry_after))
+                        .flatten();
+                    let Some(wait) = wait else {
+                        tracing::warn!(
+                            provider = "openai",
+                            model = %self.model,
+                            purpose = params.purpose.as_str(),
+                            reason = %err,
+                            attempts = attempt + 1,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "provider の応答を得られず諦めます"
+                        );
                         return Err(err);
                     };
-                    tracing::warn!(%err, attempt, ?wait, "openai リクエストに失敗したため再試行します");
+                    tracing::warn!(
+                        provider = "openai",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        reason = %err,
+                        attempt = format!("{}/{}", attempt + 1, self.retry_max + 1),
+                        ?wait,
+                        "provider の試行に失敗したため再試行します"
+                    );
                     tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
             }
         }
+    }
+
+    fn label(&self) -> String {
+        self.model.clone()
     }
 
     async fn health_check(&self) -> Result<String> {
@@ -475,5 +614,148 @@ mod tests {
             429,
             r#"{"error":{"message":"You exceeded your current Quota"}}"#
         ));
+    }
+
+    /// ヘッダと 1 chunk だけ送って止まるサーバーを立て、受け付けた接続数を返す
+    async fn stalling_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = sock.read(&mut buf).await;
+                    let chunk = "data: {\"type\":\"response.created\",\"response\":{}}\n\n";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n",
+                        chunk.len()
+                    );
+                    sock.write_all(head.as_bytes()).await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+            }
+        });
+        (url, accepted)
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_is_retried_then_fails() {
+        use std::sync::atomic::Ordering;
+        let (url, accepted) = stalling_server().await;
+        let provider = OpenAiProvider {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: url,
+            auth: Auth::ApiKey("k".into()),
+            pricing: pricing::Overrides::default(),
+            model: "m".into(),
+            format: wire::Format::Responses,
+            effort: None,
+            retry_max: 1,
+            streaming: true,
+            idle_timeout: Duration::from_millis(200),
+            compat: true,
+        };
+        let prompt = LayeredPrompt {
+            active_log: vec![noth_core::types::Turn {
+                id: None,
+                role: noth_core::types::Role::User,
+                kind: noth_core::types::TurnKind::Buffer,
+                text: "hi".into(),
+                chunk_id: None,
+            }],
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let err = provider
+            .complete(&prompt, &CompletionParams::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err}");
+        assert!(err.to_string().contains("止まった接続"), "{err}");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn timeout_settings_are_validated() {
+        assert_eq!(request_timeout(Some(30), None).unwrap(), Some(30));
+        assert_eq!(request_timeout(None, Some(30)).unwrap(), Some(30));
+        assert_eq!(request_timeout(None, None).unwrap(), None);
+        assert!(request_timeout(Some(30), Some(60)).is_err());
+        assert!(request_timeout(Some(0), None).is_err());
+        assert!(request_timeout(None, Some(0)).is_err());
+        assert!(positive_secs("idle_timeout_secs", Some(0)).is_err());
+        assert_eq!(
+            positive_secs("idle_timeout_secs", Some(5)).unwrap(),
+            Some(5)
+        );
+    }
+
+    /// idle_timeout より短い間隔で chunk を送り続け、全体では idle_timeout を超える応答を返すサーバー
+    async fn progressing_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let completed = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+            let mut chunks = vec![": keepalive\n\n"; 5];
+            chunks.push(completed);
+            for chunk in chunks {
+                sock.write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            sock.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn slow_but_progressing_stream_is_not_cut() {
+        let provider = OpenAiProvider {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: progressing_server().await,
+            auth: Auth::ApiKey("k".into()),
+            pricing: pricing::Overrides::default(),
+            model: "m".into(),
+            format: wire::Format::Responses,
+            effort: None,
+            retry_max: 0,
+            streaming: true,
+            idle_timeout: Duration::from_millis(300),
+            compat: true,
+        };
+        let prompt = LayeredPrompt {
+            active_log: vec![noth_core::types::Turn {
+                id: None,
+                role: noth_core::types::Role::User,
+                kind: noth_core::types::TurnKind::Buffer,
+                text: "hi".into(),
+                chunk_id: None,
+            }],
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let c = provider
+            .complete(&prompt, &CompletionParams::default())
+            .await
+            .unwrap();
+        assert_eq!(c.text.as_deref(), Some("ok"));
+        assert!(started.elapsed() > Duration::from_millis(300));
     }
 }

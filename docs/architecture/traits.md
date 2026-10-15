@@ -108,10 +108,12 @@ pub trait Provider: Send + Sync {
     /// Layer 0〜3 のキャッシュ期限を延ばす keep-alive。既定は何もしない。MVP では呼び出し処理も無効
     async fn keep_alive(&self, _prefix: &LayeredPrompt) -> Result<()> { Ok(()) }
     async fn health_check(&self) -> Result<String>;
+    /// 利用者向けのエラー文に出す呼び出し先の名前(モデル名など)。既定は "AI"
+    fn label(&self) -> String { "AI".into() }
 }
 ```
 
-provider のエラー(429 / 5xx)は `retry_max` 回まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。本線は応答を投稿せずにそのターンを終了し、トリガー発言をバッファに戻します。
+provider のエラー(429 / 5xx・タイムアウト・止まったストリーム・本文の受信失敗)は `retry_max` 回(既定 2。初回と合わせて最大 3 回)まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。ストリーミング(Codex の SSE)は `idle_timeout_secs`(既定 45 秒)の間 SSE のバイトが何も届かなければその試行を捨てて再試行します。長い推論の間も流れるよう、Codex には `reasoning.summary = "auto"` を要求します(要約は本文に含めません)。`request_timeout_secs`(Codex 既定 300 秒、他は 120 秒)は試行全体の上限で、進んでいるが遅いストリームも切って再試行します。失敗の通知文は原因(通信・認証・利用上限・その他)で変わります。本線と Join の報告はチャンネルに失敗を投稿してそのターンを終了し、トリガー発言をバッファに戻します(Layer 3 には入れません)。各 provider は完了ごとに INFO(provider・model・purpose・elapsed_ms・attempts)、再試行ごとに WARN を記録します。
 
 ## 5. `Tool`
 

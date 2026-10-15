@@ -167,6 +167,10 @@ pub trait Provider: Send + Sync {
         Ok(())
     }
     async fn health_check(&self) -> Result<String>;
+    /// 利用者向けのエラー文に出す呼び出し先の名前(モデル名など)
+    fn label(&self) -> String {
+        "AI".into()
+    }
 }
 
 #[async_trait]

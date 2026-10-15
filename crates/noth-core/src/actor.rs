@@ -3,13 +3,14 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use serde_json::json;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::config::{CompactorSettings, Config};
+use crate::error::ErrorKind;
 use crate::judge::{self, Action, Binarized, DeliveryStyle, JudgeBatch};
 use crate::layers::{self, Line};
 use crate::registry::Modules;
@@ -33,6 +34,9 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// `[compactor]` を読めないときの keep_recent_turns。cli.md の既定値と同じ
 const FALLBACK_KEEP_RECENT_TURNS: usize = 6;
+
+/// provider の失敗を同じチャンネルへ続けて知らせない間隔。トリガーがバッファに残るので、次の発言でも同じ失敗が起きうる
+const ERROR_POST_INTERVAL: Duration = Duration::from_secs(60);
 
 const PROGRESS_FINAL_WAIT: Duration = Duration::from_secs(10);
 
@@ -227,8 +231,17 @@ pub struct Actor {
     channel_names: HashMap<ChannelId, String>,
     /// チャンネルごとに、Noth が最後に応答した時刻とそのとき話しかけてきた人。再起動で消えてよい一時的な手がかり
     conversations: HashMap<ChannelId, (Timestamp, HashSet<String>)>,
+    /// チャンネルと種別ごとの、provider 失敗を最後に投稿した時刻。Join の失敗が本線の失敗に隠れないよう種別を分ける
+    error_posted: HashMap<(ChannelId, FailureKind), Instant>,
     typing_interval: Duration,
     progress_interval: Duration,
+}
+
+/// provider 失敗の通知を出す場面
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FailureKind {
+    Reply,
+    Join,
 }
 
 /// 本線が Worker に任せると決めた内容
@@ -309,6 +322,7 @@ impl Actor {
             compacted_for: None,
             channel_names: HashMap::new(),
             conversations: HashMap::new(),
+            error_posted: HashMap::new(),
             typing_interval: TYPING_INTERVAL,
             progress_interval: progress::DEFAULT_INTERVAL,
         })
@@ -565,7 +579,9 @@ impl Actor {
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "本線の生成に失敗しました。応答せずバッファに残します");
+                tracing::warn!(error = %e, "本線の生成に失敗しました。バッファに残します");
+                self.report_provider_failure(batch.channel_id, FailureKind::Reply, &e)
+                    .await;
                 return Ok(());
             }
         };
@@ -951,6 +967,8 @@ impl Actor {
             },
             Err(e) => {
                 tracing::warn!(error = %e, run_id, "報告の生成に失敗しました");
+                self.report_provider_failure(run.channel_id, FailureKind::Join, e)
+                    .await;
                 None
             }
         };
@@ -1103,6 +1121,44 @@ impl Actor {
         let completion = self.provider.complete(prompt, &params).await;
         typing.abort();
         completion
+    }
+
+    /// 利用者に失敗を知らせる。Layer 3 には残さない(言っていないことや失敗の記録を本線に覚えさせない)。
+    /// 投稿の失敗は握りつぶす。知らせる手段がもう無い
+    async fn report_provider_failure(
+        &mut self,
+        channel_id: ChannelId,
+        kind: FailureKind,
+        error: &Error,
+    ) {
+        let now = Instant::now();
+        self.error_posted
+            .retain(|_, at| now.duration_since(*at) < ERROR_POST_INTERVAL);
+        if self.error_posted.contains_key(&(channel_id, kind)) {
+            return;
+        }
+        self.error_posted.insert((channel_id, kind), now);
+        let what = match kind {
+            FailureKind::Reply => "応答を生成できませんでした",
+            FailureKind::Join => "調査結果の報告を生成できませんでした",
+        };
+        let label = self.provider.label();
+        let (cause, retry) = match error.kind() {
+            ErrorKind::Unavailable => (
+                format!("{label} が応答しませんでした"),
+                "。少し待ってからもう一度話しかけてください",
+            ),
+            ErrorKind::Auth => (
+                format!("{label} の認証に失敗しました。管理者に確認してもらってください"),
+                "",
+            ),
+            ErrorKind::Quota => (format!("{label} の利用上限に達しました"), ""),
+            ErrorKind::Other => (format!("{label} でエラーが発生しました"), ""),
+        };
+        let text = format!("⚠️ {what}({cause}){retry}");
+        if let Err(e) = self.channel.send(channel_id, &text, None).await {
+            tracing::warn!(error = %e, "失敗の通知を投稿できませんでした");
+        }
     }
 
     fn note_conversation(&mut self, batch: &JudgeBatch) {

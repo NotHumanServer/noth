@@ -3,7 +3,7 @@ mod pricing;
 mod wire;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use noth_core::registry::{ModuleCtx, Registry};
@@ -30,8 +30,11 @@ struct Settings {
     cache_ttl: String,
     preset: Option<String>,
     base_url: Option<String>,
-    #[serde(default = "default_timeout_secs")]
-    timeout_secs: u64,
+    /// 1 回の試行の上限。非ストリーミングなので無通信だけを見る idle_timeout は持たない
+    request_timeout_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+    /// 非ストリーミングなので使わない。設定されていたら警告する
+    idle_timeout_secs: Option<u64>,
     effort: Option<String>,
     #[serde(default)]
     pricing: pricing::Overrides,
@@ -41,8 +44,31 @@ fn default_cache_ttl() -> String {
     "5m".into()
 }
 
-fn default_timeout_secs() -> u64 {
-    120
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// request_timeout_secs と旧名 timeout_secs は同時に指定できない。0 は即タイムアウトになるので弾く
+fn request_timeout(
+    request_timeout_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+) -> Result<Option<u64>> {
+    if request_timeout_secs.is_some() && timeout_secs.is_some() {
+        return Err(Error::Config(
+            "provider.anthropic: request_timeout_secs と timeout_secs は同時に指定できません(timeout_secs は旧名です)".into(),
+        ));
+    }
+    positive_secs(
+        "request_timeout_secs",
+        request_timeout_secs.or(timeout_secs),
+    )
+}
+
+fn positive_secs(key: &str, secs: Option<u64>) -> Result<Option<u64>> {
+    if secs == Some(0) {
+        return Err(Error::Config(format!(
+            "provider.anthropic: {key} は 1 以上にしてください"
+        )));
+    }
+    Ok(secs)
 }
 
 fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
@@ -67,8 +93,15 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
         .unwrap_or_else(|| preset_url.to_string())
         .trim_end_matches('/')
         .to_string();
+    let request_timeout = request_timeout(s.request_timeout_secs, s.timeout_secs)?
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+    if s.idle_timeout_secs.is_some() {
+        tracing::warn!(
+            "provider.anthropic: idle_timeout_secs は非ストリーミングの provider では使いません。request_timeout_secs を使ってください"
+        );
+    }
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(s.timeout_secs))
+        .timeout(Duration::from_secs(request_timeout))
         .build()
         .map_err(|e| {
             Error::Config(format!(
@@ -207,6 +240,7 @@ impl Provider for AnthropicProvider {
         if let Some(effort) = self.effort {
             body["output_config"] = serde_json::json!({ "effort": effort });
         }
+        let started = Instant::now();
         let mut attempt = 0;
         loop {
             match self.post_once(&body).await {
@@ -216,22 +250,77 @@ impl Provider for AnthropicProvider {
                         ttl: self.ttl,
                         overrides: &self.pricing,
                     };
-                    return wire::parse_response(&resp, &cost_ctx);
+                    let completion = match wire::parse_response(&resp, &cost_ctx) {
+                        Ok(c) => c,
+                        Err(err) => {
+                            tracing::warn!(
+                                provider = "anthropic",
+                                model = %self.model,
+                                purpose = params.purpose.as_str(),
+                                reason = %err,
+                                attempts = attempt + 1,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "provider が再試行できないエラーを返しました"
+                            );
+                            return Err(err);
+                        }
+                    };
+                    tracing::info!(
+                        provider = "anthropic",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        attempts = attempt + 1,
+                        "provider の応答を受け取りました"
+                    );
+                    return Ok(completion);
                 }
-                Err(Attempt::Fatal(err)) => return Err(err),
+                Err(Attempt::Fatal(err)) => {
+                    tracing::warn!(
+                        provider = "anthropic",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        reason = %err,
+                        attempts = attempt + 1,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "provider が再試行できないエラーを返しました"
+                    );
+                    return Err(err);
+                }
                 Err(Attempt::Retry { err, retry_after }) => {
-                    if attempt >= self.retry_max {
-                        return Err(err);
-                    }
-                    let Some(wait) = backoff(attempt, retry_after) else {
+                    let wait = (attempt < self.retry_max)
+                        .then(|| backoff(attempt, retry_after))
+                        .flatten();
+                    let Some(wait) = wait else {
+                        tracing::warn!(
+                            provider = "anthropic",
+                            model = %self.model,
+                            purpose = params.purpose.as_str(),
+                            reason = %err,
+                            attempts = attempt + 1,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "provider の応答を得られず諦めます"
+                        );
                         return Err(err);
                     };
-                    tracing::warn!(%err, attempt, ?wait, "anthropic request failed, retrying");
+                    tracing::warn!(
+                        provider = "anthropic",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        reason = %err,
+                        attempt = format!("{}/{}", attempt + 1, self.retry_max + 1),
+                        ?wait,
+                        "provider の試行に失敗したため再試行します"
+                    );
                     tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
             }
         }
+    }
+
+    fn label(&self) -> String {
+        self.model.clone()
     }
 
     async fn health_check(&self) -> Result<String> {
@@ -302,5 +391,12 @@ mod tests {
         for code in [400u16, 401, 404] {
             assert!(!is_retryable(StatusCode::from_u16(code).unwrap()), "{code}");
         }
+    }
+
+    #[test]
+    fn timeout_settings_are_validated() {
+        assert_eq!(request_timeout(None, Some(30)).unwrap(), Some(30));
+        assert!(request_timeout(Some(30), Some(60)).is_err());
+        assert!(request_timeout(Some(0), None).is_err());
     }
 }

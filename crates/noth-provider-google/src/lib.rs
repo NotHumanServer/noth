@@ -4,7 +4,7 @@ mod wire;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use gcp_auth::{CustomServiceAccount, TokenProvider};
@@ -35,8 +35,11 @@ struct Settings {
     location: String,
     credentials_file: Option<String>,
     thinking_level: Option<String>,
-    #[serde(default = "default_timeout_secs")]
-    timeout_secs: u64,
+    /// 1 回の試行の上限。非ストリーミングなので無通信だけを見る idle_timeout は持たない
+    request_timeout_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+    /// 非ストリーミングなので使わない。設定されていたら警告する
+    idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pricing: pricing::Overrides,
 }
@@ -45,8 +48,31 @@ fn default_location() -> String {
     "global".into()
 }
 
-fn default_timeout_secs() -> u64 {
-    120
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// request_timeout_secs と旧名 timeout_secs は同時に指定できない。0 は即タイムアウトになるので弾く
+fn request_timeout(
+    request_timeout_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+) -> Result<Option<u64>> {
+    if request_timeout_secs.is_some() && timeout_secs.is_some() {
+        return Err(Error::Config(
+            "provider.google: request_timeout_secs と timeout_secs は同時に指定できません(timeout_secs は旧名です)".into(),
+        ));
+    }
+    positive_secs(
+        "request_timeout_secs",
+        request_timeout_secs.or(timeout_secs),
+    )
+}
+
+fn positive_secs(key: &str, secs: Option<u64>) -> Result<Option<u64>> {
+    if secs == Some(0) {
+        return Err(Error::Config(format!(
+            "provider.google: {key} は 1 以上にしてください"
+        )));
+    }
+    Ok(secs)
 }
 
 /// 接続先と認証に要る設定。ファイルの読み込みは含めず、検証と URL 組み立てを純粋に保つ
@@ -187,8 +213,15 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
             })?,
         )),
     };
+    let request_timeout = request_timeout(s.request_timeout_secs, s.timeout_secs)?
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+    if s.idle_timeout_secs.is_some() {
+        tracing::warn!(
+            "provider.google: idle_timeout_secs は非ストリーミングの provider では使いません。request_timeout_secs を使ってください"
+        );
+    }
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(s.timeout_secs))
+        .timeout(Duration::from_secs(request_timeout))
         .build()
         .map_err(|e| {
             Error::Config(format!(
@@ -238,7 +271,12 @@ impl GoogleProvider {
             // トークンの再利用と更新は gcp_auth 側が持つので、リクエストごとに取る
             Auth::ServiceAccount(sa) => {
                 let token = sa.token(&[CLOUD_PLATFORM_SCOPE]).await.map_err(|e| {
-                    Error::Transport(format!("Google の認証トークンを取れません: {e}"))
+                    let message = format!("Google の認証トークンを取れません: {e}");
+                    // 接続できなかったのは通信の問題。資格情報の誤りや拒否は待っても直らない
+                    match e {
+                        gcp_auth::Error::Http(..) => Error::Transport(message),
+                        _ => Error::Other(message),
+                    }
                 })?;
                 req.bearer_auth(token.as_str())
             }
@@ -253,10 +291,13 @@ impl GoogleProvider {
         let req = self
             .request(reqwest::Method::POST, url)
             .await
-            // request が失敗するのはトークン取得だけで、通信断なら再試行で直る
-            .map_err(|err| Attempt::Retry {
-                err,
-                retry_after: None,
+            // request が失敗するのはトークン取得だけ。通信断なら再試行で直るが、資格情報の失敗は直らない
+            .map_err(|err| match err {
+                Error::Transport(_) => Attempt::Retry {
+                    err,
+                    retry_after: None,
+                },
+                err => Attempt::Fatal(err),
             })?;
         let resp = req.json(body).send().await.map_err(|e| {
             let err = Error::Transport(e.to_string());
@@ -326,6 +367,7 @@ impl Provider for GoogleProvider {
         params: &CompletionParams,
     ) -> Result<Completion> {
         let body = wire::build_request(prompt, params, self.thinking_level)?;
+        let started = Instant::now();
         let mut attempt = 0;
         loop {
             match self.post_once(&body).await {
@@ -338,22 +380,77 @@ impl Provider for GoogleProvider {
                         purpose: params.purpose,
                         run_id: params.run_id.clone(),
                     };
-                    return wire::parse_response(&resp, &cost_ctx);
+                    let completion = match wire::parse_response(&resp, &cost_ctx) {
+                        Ok(c) => c,
+                        Err(err) => {
+                            tracing::warn!(
+                                provider = "google",
+                                model = %self.model,
+                                purpose = params.purpose.as_str(),
+                                reason = %err,
+                                attempts = attempt + 1,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "provider が再試行できないエラーを返しました"
+                            );
+                            return Err(err);
+                        }
+                    };
+                    tracing::info!(
+                        provider = "google",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        attempts = attempt + 1,
+                        "provider の応答を受け取りました"
+                    );
+                    return Ok(completion);
                 }
-                Err(Attempt::Fatal(err)) => return Err(err),
+                Err(Attempt::Fatal(err)) => {
+                    tracing::warn!(
+                        provider = "google",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        reason = %err,
+                        attempts = attempt + 1,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "provider が再試行できないエラーを返しました"
+                    );
+                    return Err(err);
+                }
                 Err(Attempt::Retry { err, retry_after }) => {
-                    if attempt >= self.retry_max {
-                        return Err(err);
-                    }
-                    let Some(wait) = backoff(attempt, retry_after) else {
+                    let wait = (attempt < self.retry_max)
+                        .then(|| backoff(attempt, retry_after))
+                        .flatten();
+                    let Some(wait) = wait else {
+                        tracing::warn!(
+                            provider = "google",
+                            model = %self.model,
+                            purpose = params.purpose.as_str(),
+                            reason = %err,
+                            attempts = attempt + 1,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "provider の応答を得られず諦めます"
+                        );
                         return Err(err);
                     };
-                    tracing::warn!(%err, attempt, ?wait, "google request failed, retrying");
+                    tracing::warn!(
+                        provider = "google",
+                        model = %self.model,
+                        purpose = params.purpose.as_str(),
+                        reason = %err,
+                        attempt = format!("{}/{}", attempt + 1, self.retry_max + 1),
+                        ?wait,
+                        "provider の試行に失敗したため再試行します"
+                    );
                     tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
             }
         }
+    }
+
+    fn label(&self) -> String {
+        self.model.clone()
     }
 
     async fn health_check(&self) -> Result<String> {
@@ -521,5 +618,12 @@ mod tests {
         assert_eq!(backoff(0, None), Some(Duration::from_secs(1)));
         assert_eq!(backoff(10, None), Some(Duration::from_secs(30)));
         assert_eq!(backoff(0, Some(Duration::from_secs(300))), None);
+    }
+
+    #[test]
+    fn timeout_settings_are_validated() {
+        assert_eq!(request_timeout(None, Some(30)).unwrap(), Some(30));
+        assert!(request_timeout(Some(30), Some(60)).is_err());
+        assert!(request_timeout(Some(0), None).is_err());
     }
 }

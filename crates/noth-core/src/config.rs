@@ -680,7 +680,7 @@ name = "default"                 # profiles/<name>.md
 
 [context]
 prompt_hard_limit_tokens = 80000 # 直近レスポンスの usage.input_tokens がこれを超えたら緊急コンパクション
-retry_max                = 3     # provider の 429 / 5xx の再試行回数
+retry_max                = 2     # provider の 429 / 5xx・タイムアウトの再試行回数(初回と合わせて最大 retry_max+1 回)
 max_tokens               = 2048  # 本線の 1 応答の max_tokens
 
 [channel.discord]
@@ -809,7 +809,7 @@ fn default_hard_limit() -> u64 {
     80_000
 }
 fn default_retry_max() -> u32 {
-    3
+    2
 }
 fn default_max_tokens() -> u32 {
     2_048

@@ -199,7 +199,7 @@ name = "default"                 # profiles/<name>.md
 
 [context]
 prompt_hard_limit_tokens = 80000 # 直近レスポンスの usage.input_tokens(tools + Layer 0〜4)がこれを超えたら緊急コンパクション。compactor 無効時は切り詰め
-retry_max                = 3     # provider の 429 / 5xx の再試行回数
+retry_max                = 2     # provider の 429 / 5xx・タイムアウトの再試行回数(初回と合わせて最大 retry_max+1 回)
 
 [channel.discord]
 guild_id      = "123456789012345678"
@@ -246,6 +246,7 @@ api_key   = "${ANTHROPIC_API_KEY}"
 model     = "claude-opus-5-5"
 cache_ttl = "5m"                 # 5m | 1h
 effort    = "low"                # low | medium | high | xhigh | max。雑談は low で速く返す。変えると直後の1回はキャッシュが効かない
+# request_timeout_secs = 120     # 1 回の試行全体の上限(旧名 timeout_secs はどちらか一方だけ)
 # OpenCode Go の Messages 形式モデルを使うときは preset を指定し、api_key にそのキーを書く
 # preset  = "opencode-go"
 # api_key = "${OPENCODE_GO_API_KEY}"
@@ -264,6 +265,8 @@ format   = "chat"                # chat | responses
 # base_url = "..."               # 互換サーバー
 # preset   = "opencode-go"       # このとき api_key は ${OPENCODE_GO_API_KEY}
 # preset   = "codex"             # ChatGPT のサブスクリプションで Codex を使う。api_key は不要で、先に `noth auth codex` を実行する。format は responses に固定
+# request_timeout_secs = 120     # 1 回の試行全体の上限(旧名 timeout_secs はどちらか一方だけ)。進んでいるストリームでも超えたら切って再試行する。codex は既定 300
+# idle_timeout_secs    = 45      # codex の SSE で、SSE のバイトが何も届かない時間の上限。超えたらその試行を捨てて再試行する。reasoning 要約を要求しているが、Codex 実機での効果は未検証。高 effort で途中で切られるようなら大きくする。0 は不可
 # effort   = "low"               # none | minimal | low | medium | high | xhigh | max(モデル依存)
 # 内蔵の単価表($/MTok)を上書きする。指定したキーだけが優先される。表にないモデルは金額が記録されない。
 # preset / base_url の先は表を使わず、input と output を両方指定したときだけ金額が出る(cached_input と cache_write は未指定なら input と同額)。
@@ -277,6 +280,7 @@ format   = "chat"                # chat | responses
 [provider.google]
 api_key = "${GOOGLE_AI_STUDIO_API_KEY}"
 model   = "..."
+# request_timeout_secs = 120   # 1 回の試行全体の上限(旧名 timeout_secs はどちらか一方だけ)
 # preset           = "agent-platform"   # このとき api_key は不要
 # project          = "my-project"
 # location         = "us-central1"

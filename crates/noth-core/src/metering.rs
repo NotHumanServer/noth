@@ -69,4 +69,8 @@ impl Provider for MeteredProvider {
     async fn health_check(&self) -> Result<String> {
         self.inner.health_check().await
     }
+
+    fn label(&self) -> String {
+        self.inner.label()
+    }
 }

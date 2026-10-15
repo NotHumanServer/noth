@@ -409,9 +409,23 @@ pub fn parse_responses_response(resp: &Value, cost_ctx: &CostContext) -> Result<
         .ok_or_else(|| Error::Other("openai: 応答に output 配列がありません".into()))?;
     let mut text = String::new();
     let mut tool_calls = Vec::new();
+    // Codex 系は途中経過の message(phase: commentary)と最終回答(final_answer)を別の item で返すことがある。
+    // 全部つなげると同じ文面が二重になり、Ack と Goal が Layer 3 と Worker にも二重に渡る
+    let is_message = |item: &Value| item.get("type").and_then(Value::as_str) == Some("message");
+    fn phase(item: &Value) -> Option<&str> {
+        item.get("phase").and_then(Value::as_str)
+    }
+    let has_final = output
+        .iter()
+        .any(|i| is_message(i) && phase(i) == Some("final_answer"));
+    let mut seen_messages: Vec<String> = Vec::new();
     for item in output {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
+                if has_final && phase(item) != Some("final_answer") {
+                    continue;
+                }
+                let mut item_text = String::new();
                 let parts = item.get("content").and_then(Value::as_array);
                 for part in parts.into_iter().flatten() {
                     // output_text が正だが、互換サーバー向けに text 型も受ける
@@ -419,9 +433,16 @@ pub fn parse_responses_response(resp: &Value, cost_ctx: &CostContext) -> Result<
                         part.get("type").and_then(Value::as_str),
                         Some("output_text" | "text")
                     ) {
-                        text.push_str(str_at(part, "text"));
+                        item_text.push_str(str_at(part, "text"));
                     }
                 }
+                if !item_text.trim().is_empty() {
+                    if seen_messages.contains(&item_text) {
+                        continue;
+                    }
+                    seen_messages.push(item_text.clone());
+                }
+                text.push_str(&item_text);
             }
             Some("function_call") => {
                 let name = str_at(item, "name").to_string();
@@ -489,6 +510,10 @@ pub fn build_codex_request(
         typed_message_parts(input);
     }
     obj.insert("prompt_cache_key".into(), key.into());
+    // 要約を求めると、長く考える間も reasoning_summary のイベントが流れて idle timeout に掛からない
+    // (hermes-agent の codex transport も Codex バックエンドへ summary: "auto" を送っている)
+    let reasoning = obj.entry("reasoning").or_insert_with(|| json!({}));
+    reasoning["summary"] = "auto".into();
     Ok(body)
 }
 
@@ -509,7 +534,8 @@ pub fn codex_cache_key(body: &Value) -> String {
     format!("noth-{hash:016x}")
 }
 
-fn sse_error_message(event: &Value) -> String {
+/// ストリーム中のエラーを原因で分ける。上限到達は待っても直らず、サーバー側の一時的な失敗は再試行で直る
+fn sse_error(event: &Value) -> Error {
     let nested = event
         .get("response")
         .and_then(|r| r.get("error"))
@@ -519,8 +545,31 @@ fn sse_error_message(event: &Value) -> String {
         .flatten()
         .find_map(Value::as_str)
         .unwrap_or("詳細不明");
+    let code = [nested.and_then(|e| e.get("code")), event.get("code")]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+        .unwrap_or_default();
     let one_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("openai: Codex のストリームがエラーを返しました: {one_line}")
+    let text =
+        format!("openai: Codex のストリームがエラーを返しました: {one_line}(コード: {code})");
+    let hint = format!("{code} {one_line}").to_lowercase();
+    if ["quota", "usage_limit", "billing", "credit"]
+        .iter()
+        .any(|w| hint.contains(w))
+    {
+        Error::Api {
+            status: 429,
+            body: text,
+        }
+    } else if ["server_error", "overloaded", "rate_limit", "unavailable"]
+        .iter()
+        .any(|w| hint.contains(w))
+    {
+        Error::Transport(text)
+    } else {
+        Error::Other(text)
+    }
 }
 
 /// SSE 全文から Completion を組み立てる。terminal の output は null や空のことがあるため、
@@ -557,14 +606,14 @@ pub fn assemble_sse(text: &str, cost_ctx: &CostContext) -> Result<Completion> {
                 terminal = event.get("response").cloned();
             }
             Some("response.failed" | "error") => {
-                return Err(Error::Other(sse_error_message(&event)));
+                return Err(sse_error(&event));
             }
             _ => {}
         }
     }
     // 途中で切れたストリームの item は tool call の引数が欠けている恐れがあり、使えない
     let Some(terminal) = terminal else {
-        return Err(Error::Other(
+        return Err(Error::Transport(
             "openai: Codex のストリームが完了イベントなしで終わりました".into(),
         ));
     };
@@ -926,6 +975,10 @@ data: [DONE]\n";
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["instructions"], "rules\n\nprofile\n\ndigest");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort": "low", "summary": "auto"})
+        );
         assert!(body.get("tool_choice").is_none());
         let key = body["prompt_cache_key"].as_str().unwrap();
         assert_eq!(key, codex_cache_key(&body));
@@ -953,6 +1006,74 @@ data: [DONE]\n";
         let raw = c.raw_assistant.unwrap();
         assert_eq!(raw.as_array().unwrap().len(), 3);
         assert_eq!(raw[0]["encrypted_content"], "zz");
+    }
+
+    /// delta・text.done・output_item.done・completed の全部が同じ本文を運ぶ実際の流れ
+    fn sse_transcript(items: &[(&str, &str)]) -> String {
+        let mut out = String::from(
+            "data: {\"type\":\"response.created\",\"response\":{}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"A\"}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"ck\"}\n\n\
+data: {\"type\":\"response.output_text.done\",\"text\":\"Ack\"}\n\n",
+        );
+        let mut output = Vec::new();
+        for (phase, text) in items {
+            let item = json!({"type": "message", "phase": phase, "content": [{"type": "output_text", "text": text}]});
+            out.push_str(&format!(
+                "data: {}\n\n",
+                json!({"type": "response.output_item.done", "item": item})
+            ));
+            output.push(item);
+        }
+        out.push_str(&format!(
+            "data: {}\n\n",
+            json!({"type": "response.completed", "response": {"status": "completed", "output": output, "usage": {"input_tokens": 1, "output_tokens": 1}}})
+        ));
+        out
+    }
+
+    #[test]
+    fn assemble_sse_ignores_reasoning_summary_events_and_text() {
+        let sse = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"考え中\"}\n\n\
+data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"考え中\"}\n\n\
+data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"考え中\"}]}}\n\n\
+data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"答え\"}]}}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+        assert_eq!(
+            assemble_sse(sse, &cx()).unwrap().text.as_deref(),
+            Some("答え")
+        );
+    }
+
+    #[test]
+    fn assemble_sse_single_message_is_not_doubled() {
+        let sse = sse_transcript(&[("final_answer", "Ack\n[Goal]\ng")]);
+        let c = assemble_sse(&sse, &cx()).unwrap();
+        assert_eq!(c.text.as_deref(), Some("Ack\n[Goal]\ng"));
+    }
+
+    #[test]
+    fn assemble_sse_ignores_commentary_when_final_answer_exists() {
+        let sse = sse_transcript(&[
+            ("commentary", "Ack\n[Goal]\ng"),
+            ("final_answer", "Ack\n[Goal]\ng"),
+        ]);
+        let c = assemble_sse(&sse, &cx()).unwrap();
+        assert_eq!(c.text.as_deref(), Some("Ack\n[Goal]\ng"));
+    }
+
+    #[test]
+    fn assemble_sse_drops_identical_repeated_messages() {
+        let sse = sse_transcript(&[("", "Ack\n[Goal]\ng"), ("", "Ack\n[Goal]\ng")]);
+        let c = assemble_sse(&sse, &cx()).unwrap();
+        assert_eq!(c.text.as_deref(), Some("Ack\n[Goal]\ng"));
+    }
+
+    #[test]
+    fn assemble_sse_keeps_distinct_messages() {
+        let sse = sse_transcript(&[("", "a"), ("", "b")]);
+        let c = assemble_sse(&sse, &cx()).unwrap();
+        assert_eq!(c.text.as_deref(), Some("ab"));
     }
 
     #[test]
@@ -1042,6 +1163,24 @@ data: [DONE]\n";
         let e = "data: {\"type\":\"error\",\"message\":\"a\\nb   c\"}\n\n";
         let msg = assemble_sse(e, &cx()).unwrap_err().to_string();
         assert!(!msg.contains('\n') && msg.contains("a b c"), "{msg}");
+    }
+
+    #[test]
+    fn sse_errors_are_classified_by_code() {
+        let ev = |code: &str, msg: &str| {
+            format!(
+                "data: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"code\":\"{code}\",\"message\":\"{msg}\"}}}}}}\n\n"
+            )
+        };
+        let kind = |code: &str, msg: &str| assemble_sse(&ev(code, msg), &cx()).unwrap_err().kind();
+        use noth_core::error::ErrorKind;
+        assert_eq!(kind("usage_limit_reached", "limit"), ErrorKind::Quota);
+        assert_eq!(kind("insufficient_quota", "x"), ErrorKind::Quota);
+        assert_eq!(kind("server_error", "oops"), ErrorKind::Unavailable);
+        assert_eq!(kind("rate_limit_exceeded", "slow"), ErrorKind::Unavailable);
+        assert_eq!(kind("invalid_prompt", "bad"), ErrorKind::Other);
+        let err = assemble_sse(&ev("server_error", "oops"), &cx()).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
     }
 
     fn cost_cx<'a>(billing: Billing, use_table: bool, o: &'a Overrides) -> CostContext<'a> {

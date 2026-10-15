@@ -140,6 +140,8 @@ impl Router for MockRouter {
 struct MockProvider {
     prompts: Mutex<Vec<LayeredPrompt>>,
     fail: AtomicBool,
+    /// fail 時に返す Api エラーの status と本文
+    fail_with: Mutex<(u16, String)>,
     input_tokens: Mutex<u64>,
     /// 空になるまで先頭から返す。空なら「応答<n>」
     scripted: Mutex<VecDeque<Completion>>,
@@ -150,6 +152,7 @@ impl MockProvider {
         Self {
             prompts: Mutex::default(),
             fail: AtomicBool::new(false),
+            fail_with: Mutex::new((500, "boom".into())),
             input_tokens: Mutex::new(10),
             scripted: Mutex::default(),
         }
@@ -172,10 +175,8 @@ impl Provider for MockProvider {
     ) -> Result<Completion> {
         self.prompts.lock().unwrap().push(prompt.clone());
         if self.fail.load(Ordering::SeqCst) {
-            return Err(Error::Api {
-                status: 500,
-                body: "boom".into(),
-            });
+            let (status, body) = self.fail_with.lock().unwrap().clone();
+            return Err(Error::Api { status, body });
         }
         let usage = Usage {
             input_tokens: *self.input_tokens.lock().unwrap(),
@@ -198,6 +199,9 @@ impl Provider for MockProvider {
     }
     async fn health_check(&self) -> Result<String> {
         Ok("ok".into())
+    }
+    fn label(&self) -> String {
+        "mock-model".into()
     }
 }
 
@@ -344,7 +348,7 @@ fn config(hard_limit: u64, table: toml::Table) -> Config {
         },
         context: ContextSection {
             prompt_hard_limit_tokens: hard_limit,
-            retry_max: 3,
+            retry_max: 2,
             max_tokens: 256,
         },
         router: RouterSection {
@@ -663,7 +667,15 @@ async fn provider_error_leaves_trigger_in_buffer() {
     h.provider.fail.store(true, Ordering::SeqCst);
     h.say(GENERAL, "Noth いる?").await;
 
-    assert!(h.sent().is_empty());
+    let sent = h.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, GENERAL);
+    assert!(
+        sent[0].1.starts_with("⚠️ 応答を生成できませんでした"),
+        "{sent:?}"
+    );
+    assert!(sent[0].1.contains("mock-model"), "{sent:?}");
+    // 失敗の通知は Layer 3 に入れない
     assert!(h.store.active_turns(GUILD).await.unwrap().is_empty());
     assert_eq!(h.store.buffered_messages(GUILD).await.unwrap().len(), 1);
 
@@ -673,6 +685,81 @@ async fn provider_error_leaves_trigger_in_buffer() {
     assert_eq!(turns[0].kind, TurnKind::Buffer);
     assert!(turns[0].text.contains("Noth いる?"));
     assert!(h.store.buffered_messages(GUILD).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn provider_error_post_is_rate_limited_per_channel() {
+    let mut h = Harness::new().await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.provider.fail.store(true, Ordering::SeqCst);
+    h.say(GENERAL, "Noth いる?").await;
+    h.say(GENERAL, "Noth まだ?").await;
+    assert_eq!(h.sent().len(), 1);
+
+    // 別のチャンネルには独立して知らせる
+    h.say(RANDOM, "Noth こっちは?").await;
+    let sent = h.sent();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].0, RANDOM);
+}
+
+#[tokio::test]
+async fn provider_error_message_follows_the_cause() {
+    for (status, body, expected) in [
+        (
+            503,
+            "unavailable",
+            "mock-model が応答しませんでした)。少し待ってから",
+        ),
+        (
+            401,
+            "bad key",
+            "mock-model の認証に失敗しました。管理者に確認してもらってください)",
+        ),
+        (
+            429,
+            "limit(コード: usage_limit_reached)",
+            "mock-model の利用上限に達しました)",
+        ),
+        (400, "bad request", "mock-model でエラーが発生しました)"),
+    ] {
+        let mut h = Harness::new().await;
+        h.router.set(answers("reply_only", 0.0, 0.0));
+        h.provider.fail.store(true, Ordering::SeqCst);
+        *h.provider.fail_with.lock().unwrap() = (status, body.into());
+        h.say(GENERAL, "Noth いる?").await;
+        let sent = h.sent();
+        assert!(sent[0].1.contains(expected), "{status}: {sent:?}");
+    }
+}
+
+#[tokio::test]
+async fn join_failure_is_not_swallowed_by_a_reply_failure() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(with_delivery(
+        spawn_answers("web_research"),
+        "normal_report",
+    ));
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.say(GENERAL, "天気調べて").await;
+    h.provider.fail.store(true, Ordering::SeqCst);
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.say(GENERAL, "Noth ところで").await;
+    assert_eq!(h.sent().len(), 2);
+    h.router.set(with_delivery(
+        spawn_answers("web_research"),
+        "normal_report",
+    ));
+    h.process_next_job().await;
+
+    let sent = h.sent();
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(sent[1].1.starts_with("⚠️ 応答を生成できませんでした"));
+    assert!(
+        sent[2]
+            .1
+            .starts_with("⚠️ 調査結果の報告を生成できませんでした")
+    );
 }
 
 #[tokio::test]
@@ -1297,7 +1384,14 @@ async fn join_provider_failure_keeps_conclusion_only() {
     h.provider.fail.store(true, Ordering::SeqCst);
     h.process_next_job().await;
 
-    assert_eq!(h.sent().len(), 1);
+    let sent = h.sent();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent[1]
+            .1
+            .starts_with("⚠️ 調査結果の報告を生成できませんでした"),
+        "{sent:?}"
+    );
     let turns = h.store.active_turns(GUILD).await.unwrap();
     assert_eq!(turns.len(), 3);
     assert_eq!(turns[2].kind, TurnKind::Conclusion);
