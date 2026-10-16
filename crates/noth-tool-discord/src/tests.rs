@@ -2100,3 +2100,210 @@ async fn fetch_by_message_id_still_requires_channel_permission() {
     .await;
     assert!(out.is_error && !out.text.contains("leak"), "{}", out.text);
 }
+
+mod exclusion {
+    use noth_core::exclusion::ChannelExclusions;
+
+    use super::*;
+
+    const CATEGORY: u64 = 50;
+    /// カテゴリ 50 の下のチャンネル
+    const IN_CATEGORY: u64 = 51;
+    /// チャンネル 51 のスレッド
+    const THREAD: u64 = 52;
+    const PLAIN: u64 = 7;
+
+    type Route = (String, std::result::Result<Value, ApiError>);
+
+    fn child(id: u64, kind: i64, parent: u64) -> Value {
+        json!({"id": id.to_string(), "guild_id": GUILD.to_string(), "name": "c", "type": kind, "parent_id": parent.to_string()})
+    }
+
+    fn routes() -> Vec<Route> {
+        let mut r: Vec<Route> = vec![
+            (
+                format!("/channels/{CATEGORY}"),
+                Ok(
+                    json!({"id": CATEGORY.to_string(), "guild_id": GUILD.to_string(), "name": "cat", "type": 4}),
+                ),
+            ),
+            (
+                format!("/channels/{IN_CATEGORY}"),
+                Ok(child(IN_CATEGORY, 0, CATEGORY)),
+            ),
+            (
+                format!("/channels/{THREAD}"),
+                Ok(child(THREAD, 11, IN_CATEGORY)),
+            ),
+            (format!("/channels/{PLAIN}"), Ok(in_guild_channel(PLAIN))),
+        ];
+        for id in [CATEGORY, IN_CATEGORY, THREAD, PLAIN] {
+            r.push((
+                format!("/channels/{id}/messages"),
+                Ok(json!([message(1, ALICE, false, "本文")])),
+            ));
+            r.push((format!("/channels/{id}/pins"), Ok(json!([]))));
+        }
+        r
+    }
+
+    fn api_with(extra: Vec<Route>) -> Arc<FakeApi> {
+        let api = FakeApi::with(vec![]);
+        api.routes.lock().unwrap().extend(routes());
+        api.routes.lock().unwrap().extend(extra);
+        api
+    }
+
+    fn tool_excluding(api: Arc<FakeApi>, ids: &[u64]) -> (DiscordTool, ChannelExclusions) {
+        let tool = tool_with(api, &[]);
+        let ex = ChannelExclusions::new(GUILD);
+        ex.set_config(ids.iter().copied());
+        tool.set_exclusions(ex.clone());
+        (tool, ex)
+    }
+
+    async fn read(tool: &DiscordTool, action: &str, channel: u64) -> ToolOutput {
+        run(
+            tool,
+            json!({"action": action, "channel_id": channel.to_string()}),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn excluded_channels_cannot_be_read_by_any_action() {
+        let api = api_with(vec![]);
+        let (tool, _) = tool_excluding(api.clone(), &[PLAIN]);
+        for action in ["fetch_messages", "list_pins", "channel_info"] {
+            let out = read(&tool, action, PLAIN).await;
+            assert!(
+                out.is_error && out.text == access::DENIED,
+                "{action}: {}",
+                out.text
+            );
+        }
+        let out = run(
+            &tool,
+            json!({"action": "fetch_messages", "channel_id": PLAIN.to_string(), "message_id": "1"}),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            !api.paths().iter().any(|p| p.starts_with("/channels/7/")),
+            "{:?}",
+            api.paths()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_category_excludes_its_channels_and_their_threads() {
+        let (tool, _) = tool_excluding(api_with(vec![]), &[CATEGORY]);
+        for id in [CATEGORY, IN_CATEGORY, THREAD] {
+            let out = read(&tool, "fetch_messages", id).await;
+            assert!(
+                out.is_error && out.text == access::DENIED,
+                "{id}: {}",
+                out.text
+            );
+        }
+        assert!(!read(&tool, "fetch_messages", PLAIN).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn a_channel_excludes_its_threads_only() {
+        let (tool, _) = tool_excluding(api_with(vec![]), &[IN_CATEGORY]);
+        assert!(read(&tool, "fetch_messages", THREAD).await.is_error);
+        assert!(read(&tool, "fetch_messages", IN_CATEGORY).await.is_error);
+        assert!(!read(&tool, "fetch_messages", CATEGORY).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn unresolvable_thread_parent_is_not_treated_as_clear() {
+        let broken = Err(ApiError::new(500, "boom"));
+        let (tool, _) = tool_excluding(
+            api_with(vec![(format!("/channels/{IN_CATEGORY}"), broken)]),
+            &[CATEGORY],
+        );
+        let out = read(&tool, "fetch_messages", THREAD).await;
+        assert!(out.is_error && !out.text.contains("本文"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn changes_apply_to_the_next_call() {
+        let (tool, ex) = tool_excluding(api_with(vec![]), &[]);
+        assert!(!read(&tool, "fetch_messages", IN_CATEGORY).await.is_error);
+        ex.add(CATEGORY, 1).await.unwrap();
+        assert!(read(&tool, "fetch_messages", IN_CATEGORY).await.is_error);
+        ex.remove(CATEGORY).await.unwrap();
+        assert!(!read(&tool, "fetch_messages", IN_CATEGORY).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn search_hides_excluded_channels_but_keeps_the_rest() {
+        let history = seeded_history().await;
+        let plan = 111_111_111_111_111_111u64;
+        let chat = 222_222_222_222_222_222u64;
+        // 雑談チャンネルだけカテゴリに入れて、カテゴリ経由で除外する
+        let api = api_with(vec![(
+            format!("/channels/{chat}"),
+            Ok(child(chat, 0, CATEGORY)),
+        )]);
+        let (tool, ex) = tool_excluding(api, &[CATEGORY]);
+        let search = |input: Value| {
+            let (tool, history) = (&tool, history.clone());
+            async move { json_of(&tool.call(input, &ctx(Some(history))).await.unwrap()) }
+        };
+        let ids = |v: &Value| -> Vec<String> {
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let v = search(json!({"action": "search_messages", "scope": "guild"})).await;
+        assert_eq!(ids(&v), ["3", "1"]);
+        assert!(v.get("skipped_unverifiable").is_none());
+
+        // ID を直接指定した除外は、DB の検索の段階で外れる
+        ex.add(plan, 1).await.unwrap();
+        let v = search(json!({"action": "search_messages", "scope": "guild"})).await;
+        assert!(ids(&v).is_empty());
+
+        // 除外したチャンネルを名指しで検索しても読めない
+        let out = tool
+            .call(
+                json!({"action": "search_messages", "channel_id": chat.to_string()}),
+                &ctx(Some(history.clone())),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.text);
+
+        ex.remove(plan).await.unwrap();
+        ex.set_config([]);
+        let v = search(json!({"action": "search_messages", "scope": "guild"})).await;
+        assert_eq!(ids(&v), ["3", "2", "1"]);
+    }
+
+    #[tokio::test]
+    async fn list_channels_hides_excluded_channels_and_category_members() {
+        let api = api_with(vec![(
+            "/guilds/100/channels".to_string(),
+            Ok(json!([
+                {"id": "50", "name": "Secret", "type": 4, "position": 0},
+                {"id": "51", "name": "diary", "type": 0, "position": 0, "parent_id": "50"},
+                {"id": "7", "name": "lobby", "type": 0, "position": 0},
+                {"id": "8", "name": "hidden", "type": 0, "position": 1},
+            ])),
+        )]);
+        let (tool, _) = tool_excluding(api, &[CATEGORY, 8]);
+        let v = json_of(&run(&tool, json!({"action": "list_channels"})).await);
+        assert_eq!(v["count"], 1);
+        let text = v.to_string();
+        assert!(text.contains("lobby"));
+        for hidden in ["Secret", "diary", "hidden"] {
+            assert!(!text.contains(hidden), "{text}");
+        }
+    }
+}

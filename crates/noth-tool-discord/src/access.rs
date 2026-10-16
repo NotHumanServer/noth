@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use noth_core::exclusion::ChannelExclusions;
 use noth_core::types::Audience;
 use serde_json::Value;
 
@@ -14,9 +15,20 @@ use crate::format::id_of;
 /// 存在しない・別のサーバー・権限なしを区別させない(チャンネルの存在を探る手がかりにしないため)
 pub(crate) const DENIED: &str = "依頼した人にはこのチャンネルを見る権限がありません(存在しない・別のサーバーのチャンネルも同じ表示です)";
 
+/// 除外の対象かを確かめるためのカテゴリ・親チャンネルを取れなかったとき。除外していない扱いにはしない
+const EXCLUSION_UNKNOWN: &str =
+    "このチャンネルが読める範囲かを確認できませんでした。時間を置いてもう一度試してください";
+
 const CACHE_TTL: Duration = Duration::from_secs(60);
 /// ニックネームは権限と違って古くても害が小さいので、404 や失敗も含めて長く覚える
 const NICK_TTL: Duration = Duration::from_secs(300);
+
+/// チャンネルが除外の対象か。`Unknown` は親を調べられず、どちらとも言えない
+pub(crate) enum Exclusion {
+    Excluded,
+    Clear,
+    Unknown,
+}
 
 pub(crate) enum NickLookup {
     Found(String),
@@ -149,6 +161,69 @@ impl Readers {
 }
 
 impl DiscordTool {
+    fn active_exclusions(&self) -> Option<&ChannelExclusions> {
+        self.exclusions.get().filter(|e| !e.is_empty())
+    }
+
+    /// ID だけで分かる除外(チャンネルそのもの、またはカテゴリとして指定されたもの)
+    pub(crate) fn is_excluded_id(&self, channel_id: u64) -> bool {
+        self.active_exclusions()
+            .is_some_and(|e| e.is_excluded(&[channel_id]))
+    }
+
+    pub(crate) fn excluded_ids(&self) -> Vec<u64> {
+        self.exclusions
+            .get()
+            .map(ChannelExclusions::effective)
+            .unwrap_or_default()
+    }
+
+    /// `/guilds/{id}/channels` の 1 件。スレッドは載らず、親は直接のカテゴリだけなので、API を引き直さずに判定できる
+    pub(crate) fn is_excluded_listed(&self, channel: &Value) -> bool {
+        let Some(e) = self.active_exclusions() else {
+            return false;
+        };
+        let ids: Vec<u64> = [channel.get("id"), channel.get("parent_id")]
+            .into_iter()
+            .flatten()
+            .filter_map(id_of)
+            .collect();
+        e.is_excluded(&ids)
+    }
+
+    /// チャンネルそのもの、親(カテゴリ、またはスレッドの親チャンネル)、スレッドの親チャンネルのカテゴリのどれかが除外されていれば Excluded
+    pub(crate) async fn exclusion_of(&self, channel: &Value) -> Exclusion {
+        let Some(e) = self.active_exclusions() else {
+            return Exclusion::Clear;
+        };
+        let mut chain: Vec<u64> = channel.get("id").and_then(id_of).into_iter().collect();
+        let parent = channel.get("parent_id").and_then(id_of);
+        chain.extend(parent);
+        if e.is_excluded(&chain) {
+            return Exclusion::Excluded;
+        }
+        let is_thread = matches!(
+            channel.get("type").and_then(Value::as_i64),
+            Some(ANNOUNCEMENT_THREAD | PUBLIC_THREAD | PRIVATE_THREAD)
+        );
+        let Some(parent) = parent.filter(|_| is_thread) else {
+            return Exclusion::Clear;
+        };
+        match self.channel_fetch(parent).await {
+            Ok(p) => {
+                chain.extend(p.get("parent_id").and_then(id_of));
+                if e.is_excluded(&chain) {
+                    Exclusion::Excluded
+                } else {
+                    Exclusion::Clear
+                }
+            }
+            Err(Some(err)) if !matches!(err.status, 403 | 404) => Exclusion::Unknown,
+            // 親が消えた・見えないスレッドは、カテゴリを確かめられないので除外側に倒す
+            Err(_) => Exclusion::Excluded,
+        }
+    }
+
     /// 設定した guild のチャンネルだけを返す。DM や別サーバーのチャンネルは `Err(None)`
     pub(crate) async fn channel_fetch(&self, channel_id: u64) -> Result<Value, Option<ApiError>> {
         if let Some((at, v)) = self.channels.lock().expect("lock").get(&channel_id)
@@ -348,6 +423,11 @@ impl DiscordTool {
         audience: &Audience,
     ) -> std::result::Result<Value, String> {
         let ch = self.channel_value(action, channel_id).await?;
+        match self.exclusion_of(&ch).await {
+            Exclusion::Excluded => return Err(DENIED.into()),
+            Exclusion::Unknown => return Err(EXCLUSION_UNKNOWN.into()),
+            Exclusion::Clear => {}
+        }
         if audience.channel_id == Some(channel_id) {
             return Ok(ch);
         }

@@ -1,11 +1,12 @@
 //! 読み取り専用の Discord 参照 tool。範囲と秘匿の方針は security.md §2
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use noth_core::exclusion::ChannelExclusions;
 use noth_core::history::{HistoryQuery, MessageHistory};
 use noth_core::registry::{ModuleCtx, Registry};
 use noth_core::store::MessageRow;
@@ -24,7 +25,7 @@ mod format;
 mod manifest;
 mod search;
 
-use access::NickLookup;
+use access::{Exclusion, NickLookup};
 use access::{READ_MESSAGES, VIEW_CHANNEL};
 use api::{ApiError, DiscordApi, RestApi, describe_error};
 use args::{clamp_limit, id_arg, require_id};
@@ -98,6 +99,8 @@ struct DiscordTool {
     guild: Mutex<Option<(Instant, Arc<access::GuildPerms>)>>,
     members: Mutex<HashMap<u64, MemberEntry>>,
     nicks: Mutex<HashMap<u64, (Instant, Option<String>)>>,
+    /// 起動時に Core が渡す。渡されるまでは何も除外しない(production では必ず `run` の前に渡される)
+    exclusions: OnceLock<ChannelExclusions>,
 }
 
 impl DiscordTool {
@@ -113,6 +116,7 @@ impl DiscordTool {
             guild: Mutex::new(None),
             members: Mutex::default(),
             nicks: Mutex::default(),
+            exclusions: OnceLock::new(),
         }
     }
 
@@ -230,7 +234,9 @@ impl DiscordTool {
             .history
             .as_ref()
             .ok_or("発言の検索窓口がありません(Worker から呼ばれていません)")?;
-        let q = search::build_query(input, self.guild_id, &self.tz, ctx.audience.channel_id)?;
+        let mut q = search::build_query(input, self.guild_id, &self.tz, ctx.audience.channel_id)?;
+        // カテゴリやスレッド経由の除外は行ごとの verdict で落とすが、先に外さないと除外側の行で件数の枠が埋まる
+        q.exclude_channels = self.excluded_ids();
         let found = self
             .search_readable(history.as_ref(), q, &ctx.audience)
             .await?;
@@ -334,6 +340,9 @@ impl DiscordTool {
 
     /// 削除済み・別サーバー・権限なしは Denied、429/5xx/通信の失敗は確認できなかったものとして Unverifiable
     async fn channel_verdict(&self, action: &str, channel_id: u64, audience: &Audience) -> Verdict {
+        if self.is_excluded_id(channel_id) {
+            return Verdict::Denied;
+        }
         if audience.channel_id == Some(channel_id) {
             return Verdict::Readable;
         }
@@ -342,6 +351,11 @@ impl DiscordTool {
             Err(Some(e)) if !matches!(e.status, 403 | 404) => return Verdict::Unverifiable,
             Err(_) => return Verdict::Denied,
         };
+        match self.exclusion_of(&ch).await {
+            Exclusion::Excluded => return Verdict::Denied,
+            Exclusion::Unknown => return Verdict::Unverifiable,
+            Exclusion::Clear => {}
+        }
         match self.can_read(action, &ch, audience).await {
             Ok(true) => Verdict::Readable,
             Ok(false) => Verdict::Denied,
@@ -483,7 +497,14 @@ impl DiscordTool {
             (trigger.is_some() && c.get("id").and_then(id_of) == trigger)
                 || readers.as_ref().is_some_and(|r| r.can(c, need))
         };
-        let all = raw.as_array().cloned().unwrap_or_default();
+        // 除外したチャンネルは存在しないものとして載せない。カテゴリを除外すれば配下も外れる
+        let all: Vec<Value> = raw
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| !self.is_excluded_listed(c))
+            .cloned()
+            .collect();
         let visible_parents: HashSet<u64> = all
             .iter()
             .filter(|c| kind(c) != 4 && can_view(c))
@@ -686,6 +707,10 @@ impl Tool for DiscordTool {
                 is_error: true,
             },
         })
+    }
+
+    fn set_exclusions(&self, exclusions: ChannelExclusions) {
+        let _ = self.exclusions.set(exclusions);
     }
 
     async fn health_check(&self) -> Result<String> {
