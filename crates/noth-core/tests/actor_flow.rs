@@ -2650,7 +2650,7 @@ fn correction_answers() -> Vec<(&'static str, Answer)> {
 #[tokio::test]
 async fn supplement_runs_silently_and_replies_to_the_last_trigger_when_needed() {
     let mut h = Harness::with_worker().await;
-    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
+    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要\n確信: 高".into());
     h.router
         .set(with_delivery(supplement_answers(), "normal_report"));
     h.provider.script_text("料金は月 $20 です");
@@ -2677,6 +2677,96 @@ async fn supplement_runs_silently_and_replies_to_the_last_trigger_when_needed() 
         .await
         .unwrap();
     assert_eq!(runs[0].origin, Origin::Supplement);
+}
+
+#[tokio::test]
+async fn supplement_is_not_posted_unless_confidence_is_high() {
+    for memo in [
+        "調べた\n補足の要否: 要\n確信: 中",
+        "調べた\n補足の要否: 要\n確信: 低",
+        "調べた\n補足の要否: 要",
+    ] {
+        let mut h = Harness::with_worker().await;
+        *h.worker.conclusion.lock().unwrap() = Some(memo.into());
+        h.router
+            .set(with_delivery(supplement_answers(), "normal_report"));
+        h.provider.script_text("料金は月 $20 です");
+        h.say(GENERAL, "プランは月 $10 らしい").await;
+        assert_eq!(h.process_next_job().await, "join");
+
+        assert!(h.sent().is_empty(), "{memo}");
+        assert!(h.prompts().is_empty(), "main は呼ばない: {memo}");
+        let turns = h.store.active_turns(GUILD).await.unwrap();
+        assert!(turns.iter().any(|t| t.kind == TurnKind::Conclusion));
+    }
+}
+
+#[tokio::test]
+async fn correction_without_human_follow_up_still_asks_the_join_judge() {
+    let mut h = Harness::with_worker().await;
+    *h.worker.conclusion.lock().unwrap() =
+        Some("確かに指摘どおり\n補足の要否: 要\n確信: 高".into());
+    h.router.set(with_delivery(correction_answers(), "abort"));
+    h.provider.script_text("確かにそうでした");
+    h.say(GENERAL, "それ違うよ").await;
+    let judged = h.router.states.lock().unwrap().len();
+    assert_eq!(h.process_next_job().await, "join");
+
+    assert_eq!(
+        h.router.states.lock().unwrap().len(),
+        judged + 1,
+        "後続が無くても合流判定を呼ぶ"
+    );
+    assert!(h.sent().is_empty(), "abort なら投稿しない");
+
+    let mut h = Harness::with_worker().await;
+    *h.worker.conclusion.lock().unwrap() =
+        Some("確かに指摘どおり\n補足の要否: 要\n確信: 高".into());
+    h.router
+        .set(with_delivery(correction_answers(), "normal_report"));
+    h.provider.script_text("確かにそうでした");
+    h.say(GENERAL, "それ違うよ").await;
+    assert_eq!(h.process_next_job().await, "join");
+    assert_eq!(h.sent(), vec![(GENERAL, "確かにそうでした".to_string())]);
+}
+
+#[tokio::test]
+async fn correction_acknowledgement_posts_without_high_confidence() {
+    let mut h = Harness::with_worker().await;
+    *h.worker.conclusion.lock().unwrap() =
+        Some("指摘どおり\n補足の要否: 要\n種類: 認める\n確信: 低".into());
+    h.router
+        .set(with_delivery(correction_answers(), "normal_report"));
+    h.provider
+        .script_text("無料になってたんですね、失礼しました");
+    h.say(GENERAL, "ここ数日で無料になったよ").await;
+    assert_eq!(h.process_next_job().await, "join");
+    assert_eq!(h.sent().len(), 1);
+    let hint = h
+        .prompts()
+        .last()
+        .unwrap()
+        .ephemeral_tail
+        .last()
+        .unwrap()
+        .text
+        .clone();
+    assert!(hint.contains("ぼかした書き方の禁止の例外"));
+}
+
+#[tokio::test]
+async fn addition_posts_at_medium_confidence_but_rebuttal_does_not() {
+    for (kind, posted) in [("追加", true), ("反論", false)] {
+        let mut h = Harness::with_worker().await;
+        *h.worker.conclusion.lock().unwrap() =
+            Some(format!("調べた\n補足の要否: 要\n種類: {kind}\n確信: 中"));
+        h.router
+            .set(with_delivery(supplement_answers(), "normal_report"));
+        h.provider.script_text("答えは $20 です");
+        h.say(GENERAL, "プランはいくら？").await;
+        assert_eq!(h.process_next_job().await, "join");
+        assert_eq!(!h.sent().is_empty(), posted, "{kind}");
+    }
 }
 
 #[tokio::test]
@@ -2730,7 +2820,7 @@ async fn supplement_not_needed_keeps_conclusion_in_layer3_without_posting() {
 #[tokio::test]
 async fn supplement_without_human_follow_up_skips_the_join_judge() {
     let mut h = Harness::with_worker().await;
-    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
+    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要\n確信: 高".into());
     h.router.set(with_delivery(supplement_answers(), "abort"));
     h.provider.script_text("料金は月 $20 です");
     h.say(GENERAL, "プランは月 $10 らしい").await;
@@ -2744,7 +2834,7 @@ async fn supplement_without_human_follow_up_skips_the_join_judge() {
 #[tokio::test]
 async fn supplement_is_dropped_when_the_join_judge_aborts() {
     let mut h = Harness::with_worker().await;
-    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
+    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要\n確信: 高".into());
     h.router.set(with_delivery(supplement_answers(), "abort"));
     h.say(GENERAL, "プランは月 $10 らしい").await;
     h.record_human(GENERAL, "それは違うよ、$20 だ").await;
@@ -2760,7 +2850,7 @@ async fn supplement_is_dropped_when_the_join_judge_aborts() {
 #[tokio::test]
 async fn supplement_is_dropped_when_main_writes_nothing() {
     let mut h = Harness::with_worker().await;
-    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
+    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要\n確信: 高".into());
     h.router
         .set(with_delivery(supplement_answers(), "normal_report"));
     h.provider.script_text("");

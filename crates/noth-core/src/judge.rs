@@ -293,7 +293,7 @@ pub fn join_questions(origin: Origin) -> Vec<(String, Question)> {
             ],
         ),
         // 誰にも頼まれていない調べ直しなので、人どうしの会話がすでに解決していれば黙る側に倒す
-        Origin::Supplement | Origin::Correction => (
+        Origin::Supplement => (
             "Noth は、人どうしの会話の中の発言を、誰にも頼まれずに黙って調べました。\
                 task は調べた発言(goal)と結果で、memo は結論メモです。\
                 since_fork は調べ始めてから今までに届いた全チャンネルの発言で、is_self が true のものは Noth 自身の発言です。\
@@ -303,6 +303,28 @@ pub fn join_questions(origin: Origin) -> Vec<(String, Question)> {
                 迷うときは abort にしてください。",
             [
                 ("normal_report", "会話の流れの中で補足を投稿する"),
+                (
+                    "brief_supplement",
+                    "すでに一部は出ているので、足りない点だけを短く投稿する",
+                ),
+                (
+                    "reply_anchor",
+                    "話題は移ったが、元の発言へのリプライなら通じるので投稿する",
+                ),
+                ("abort", "投稿しない"),
+            ],
+        ),
+        // 指摘した人は答えを待っている。後続の発言が無いことは黙る理由にならない
+        Origin::Correction => (
+            "Noth は、自分が前に述べたことへの指摘を受けて、黙って調べ直しました。\
+                task は指摘の発言(goal)と結果で、memo は結論メモです。\
+                since_fork は調べ始めてから今までに届いた全チャンネルの発言で、is_self が true のものは Noth 自身の発言です。\
+                指摘した人は、Noth の答えを待っています。\
+                abort にするのは、since_fork で別の人がすでに同じ訂正をしたとき、または指摘が取り下げられたときだけです。\
+                後続の発言が無いことは、abort の理由になりません。\
+                abort の理由(別の人がすでに同じ訂正をした、または指摘が取り下げられた)がなければ normal_report です。",
+            [
+                ("normal_report", "会話の流れの中で訂正を投稿する"),
                 (
                     "brief_supplement",
                     "すでに一部は出ているので、足りない点だけを短く投稿する",
@@ -1439,5 +1461,14 @@ mod tests {
         };
         assert!(text(Origin::Request).contains("頼まれた"));
         assert!(text(Origin::Supplement).contains("迷うときは abort"));
+        let c = text(Origin::Correction);
+        assert!(c.contains("指摘を受けて"));
+        assert!(c.contains("答えを待っています"));
+        assert!(c.contains("別の人がすでに同じ訂正をしたとき、または指摘が取り下げられたときだけ"));
+        assert!(c.contains("後続の発言が無いことは、abort の理由になりません"));
+        assert!(!c.contains("迷うときは abort"));
+        assert!(c.contains(
+            "理由(別の人がすでに同じ訂正をした、または指摘が取り下げられた)がなければ normal_report"
+        ));
     }
 }

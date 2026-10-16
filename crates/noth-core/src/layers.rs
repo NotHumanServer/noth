@@ -444,16 +444,22 @@ pub fn silent_goal(origin: Origin, lines: &[Line]) -> String {
 
 /// 黙って起動した Worker の結果を main に渡すときの Layer 4 の指示。投稿するかどうかは main が空の返事で決める
 pub fn silent_report_turn(chunk_id: i64, origin: Origin) -> Turn {
-    let what = match origin {
-        Origin::Correction => "Noth の前の発言への指摘を受けて",
-        _ => "人どうしの会話の発言について",
+    let (what, rules) = match origin {
+        Origin::Correction => (
+            "Noth の前の発言への指摘を受けて",
+            "相手の指摘が正しければ、「確かにそうでした」のように短く認めるだけにして、新しい主張を足さないでください。相手が誤りだと言い返すのは、結論メモが断定できているときだけです。結論メモの種類が「認める」のときは、ぼかした書き方の禁止の例外です。「無料になってたんですね、失礼しました」のような短い認めを書き、空の返事にしないでください。",
+        ),
+        _ => (
+            "人どうしの会話の発言について",
+            "必要なことだけを短く、出典を添えて書いてください。",
+        ),
     };
     Turn {
         id: None,
         role: Role::User,
         kind: TurnKind::Instruction,
         text: format!(
-            "{HEADER_DELIVERY}\n黙って調べた結果です。{what}、誰にも頼まれずに調べました。人どうしの会話への補足なので、必要なことだけを短く、出典を添えて書いてください。この発言は元の発言へのリプライとして投稿されます。不要なら空の返事にしてください。[Goal] は書かないでください。"
+            "{HEADER_DELIVERY}\n黙って調べた結果です。{what}、誰にも頼まれずに調べました。人どうしの会話への補足なので、{rules}「〜とは限らない」「〜みたい」のようなぼかした補足は書かないでください。結論メモの不確かな点が結論の中心にかかっているなら、空の返事にしてください(種類が「認める」の訂正を除く)。この発言は元の発言へのリプライとして投稿されます。不要なら空の返事にしてください。[Goal] は書かないでください。"
         ),
         chunk_id: Some(chunk_id),
     }
@@ -634,6 +640,22 @@ mod tests {
             description: description.into(),
             input_schema: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn silent_report_turn_forbids_hedging_and_splits_by_origin() {
+        let sup = silent_report_turn(1, Origin::Supplement).text;
+        let cor = silent_report_turn(1, Origin::Correction).text;
+        for t in [&sup, &cor] {
+            assert!(t.contains("「〜とは限らない」「〜みたい」のようなぼかした補足は書かない"));
+            assert!(t.contains("不確かな点が結論の中心にかかっているなら、空の返事"));
+        }
+        assert!(cor.contains("ぼかした書き方の禁止の例外"));
+        assert!(cor.contains("無料になってたんですね、失礼しました"));
+        assert!(!sup.contains("ぼかした書き方の禁止の例外"));
+        assert!(cor.contains("確かにそうでした"));
+        assert!(cor.contains("新しい主張を足さない"));
+        assert!(!sup.contains("確かにそうでした"));
     }
 
     #[test]

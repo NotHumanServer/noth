@@ -1240,9 +1240,16 @@ impl Actor {
             }
         };
         let conclusion = layers::conclusion_turn(chunk_id, run_id, Ok(memo));
-        if !supplement::needed(memo) {
-            tracing::info!(run_id, origin = run.origin.as_str(), "補足は不要でした");
-            return self.keep_conclusion_only(&conclusion, chunk_id).await;
+        match supplement::decide(memo, run.origin) {
+            supplement::Verdict::Post => {}
+            supplement::Verdict::NotNeeded => {
+                tracing::info!(run_id, origin = run.origin.as_str(), "補足は不要でした");
+                return self.keep_conclusion_only(&conclusion, chunk_id).await;
+            }
+            supplement::Verdict::Hold(reason) => {
+                tracing::info!(run_id, origin = run.origin.as_str(), %reason, "要と判断されましたが投稿しません");
+                return self.keep_conclusion_only(&conclusion, chunk_id).await;
+            }
         }
         if !self.silent_report_allowed(run, memo).await? {
             return self.keep_conclusion_only(&conclusion, chunk_id).await;
@@ -1346,8 +1353,9 @@ impl Actor {
             .into_iter()
             .filter(|r| r.id > run.fork_message_id)
             .collect();
-        // 人どうしで解決したかを尋ねる問いなので、人間の発言が無ければ答えは決まっている
-        if !self.has_human_follow_up(run).await? {
+        // 人どうしで解決したかを尋ねる問いなので、人間の発言が無ければ答えは決まっている。
+        // 訂正は Noth 自身の誤りに関わり、後続が無くても出す前に確かめたいので省かない
+        if run.origin != Origin::Correction && !self.has_human_follow_up(run).await? {
             tracing::info!(
                 run_id,
                 "トリガー後に人間の発言が無いため router を呼びません"
