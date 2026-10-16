@@ -88,6 +88,19 @@ impl Store {
         Ok(hidden)
     }
 
+    pub async fn unpromoted_channels(&self, guild: GuildId) -> Result<Vec<ChannelId>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT channel_id FROM messages
+             WHERE guild_id = ? AND hidden = 0 AND promoted_turn_id IS NULL",
+        )
+        .bind(guild as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok(r.try_get::<i64, _>("channel_id")? as ChannelId))
+            .collect()
+    }
+
     /// 行 ID で指定して外す。キューに残っていた発言が、除外の確定後に届いたとき用
     pub async fn hide_messages(&self, ids: &[i64]) -> Result<()> {
         for id in ids {

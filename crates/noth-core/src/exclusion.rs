@@ -24,6 +24,8 @@ struct Inner {
     writes: tokio::sync::Mutex<()>,
     /// config とコマンドで指定した集合が変わるたびに増える。Channel が展開を作り直す合図で、展開の更新では増えない
     changes: tokio::sync::watch::Sender<u64>,
+    /// 展開を作れていない間は true。カテゴリの配下かが分からず、除外すべき発言を取り込みうるので、その間は復元と昇格を止める
+    expansion_pending: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -71,6 +73,7 @@ impl ChannelExclusions {
                 state: RwLock::default(),
                 writes: tokio::sync::Mutex::new(()),
                 changes: tokio::sync::watch::channel(0).0,
+                expansion_pending: tokio::sync::watch::channel(false).0,
             }),
         }
     }
@@ -97,8 +100,43 @@ impl ChannelExclusions {
     /// 指定(config とコマンド)の配下を展開した、実際に除外するチャンネルとスレッドの ID。Channel が作り直すたびに丸ごと置き換える。
     /// 展開に入っていない新しいチャンネルやスレッドは、Channel が受信時に親をたどって判定する
     pub async fn set_expanded(&self, ids: impl IntoIterator<Item = ChannelId>) {
-        self.write_state().expanded = ids.into_iter().collect();
-        self.purge().await;
+        let ids: BTreeSet<ChannelId> = ids.into_iter().collect();
+        let changed = {
+            let mut state = self.write_state();
+            let changed = state.expanded != ids;
+            state.expanded = ids;
+            changed
+        };
+        // イベントのたびに呼ばれるが、集合が同じなら隠す行は増えていない
+        if changed {
+            self.purge().await;
+        }
+        // 隠し終えてから解く。先に解くと、止めていた復元が隠す前の行を拾う
+        self.inner.expansion_pending.send_replace(false);
+    }
+
+    /// 展開を作れなかったときに Channel が呼ぶ。次の `set_expanded` まで復元と昇格を止める。指定が空なら展開は要らないので何もしない
+    pub fn mark_expansion_pending(&self) {
+        if !self.is_empty() {
+            self.inner.expansion_pending.send_replace(true);
+        }
+    }
+
+    pub fn expansion_pending(&self) -> bool {
+        *self.inner.expansion_pending.borrow()
+    }
+
+    pub async fn wait_expanded(&self) {
+        let mut rx = self.inner.expansion_pending.subscribe();
+        let _ = rx.wait_for(|pending| !*pending).await;
+    }
+
+    /// Layer 3 に入る前で、まだ隠していない発言があるチャンネル。展開に載らないチャンネル(アーカイブ済みのスレッドなど)の洗い出し用
+    pub async fn unpromoted_channels(&self) -> Result<Vec<ChannelId>> {
+        match self.inner.store.get() {
+            Some(store) => store.unpromoted_channels(self.inner.guild).await,
+            None => Ok(Vec::new()),
+        }
     }
 
     /// 指定が変わったときに通知が届く。受け取った Channel は展開を作り直す
@@ -145,8 +183,12 @@ impl ChannelExclusions {
         batch
     }
 
-    /// 昇格の前の未昇格バッファから、除外したチャンネルの行を外す。理由は `filter_batch` と同じ
+    /// 昇格の前の未昇格バッファから、除外したチャンネルの行を外す。理由は `filter_batch` と同じ。
+    /// 展開を作れていない間は、どの行が除外対象か分からないので全部を保留にする(隠さず、次の昇格で拾う)
     pub async fn filter_rows(&self, rows: Vec<MessageRow>) -> Vec<MessageRow> {
+        if self.expansion_pending() {
+            return Vec::new();
+        }
         let (dropped, kept): (Vec<_>, Vec<_>) = rows
             .into_iter()
             .partition(|r| self.is_channel_excluded(r.channel_id));
@@ -466,5 +508,69 @@ mod tests {
         assert_eq!(ex.filter_rows(rows).await.len(), 1);
         let rows = vec![store.message(late).await.unwrap().unwrap()];
         assert!(ex.filter_rows(rows).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rows_are_hidden_only_when_the_expansion_changes() {
+        let store = Store::open_memory().await.unwrap();
+        let ex = ChannelExclusions::new(G);
+        ex.attach(store.clone()).await.unwrap();
+        ex.set_expanded([10]).await;
+
+        // 受信の検査を通らずに入った行。同じ集合の再設定が隠す処理を走らせなければ残る
+        let row = store.insert_message(&incoming(1, 10)).await.unwrap();
+        ex.set_expanded([10]).await;
+        assert_eq!(store.unjudged_messages(G).await.unwrap().len(), 1);
+
+        ex.set_expanded([10, 11]).await;
+        assert!(store.unjudged_messages(G).await.unwrap().is_empty());
+        assert!(store.message(row).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn promotion_is_held_while_the_expansion_is_pending_and_resumes_after() {
+        let store = Store::open_memory().await.unwrap();
+        let ex = ChannelExclusions::new(G);
+        ex.attach(store.clone()).await.unwrap();
+
+        // 指定が無ければ展開は要らないので止めない
+        ex.mark_expansion_pending();
+        assert!(!ex.expansion_pending());
+
+        ex.set_config([1]);
+        ex.mark_expansion_pending();
+        assert!(ex.expansion_pending());
+
+        let id = store.insert_message(&incoming(1, 20)).await.unwrap();
+        let rows = vec![store.message(id).await.unwrap().unwrap()];
+        assert!(ex.filter_rows(rows.clone()).await.is_empty());
+        // 保留は隠さない
+        assert_eq!(store.unjudged_messages(G).await.unwrap().len(), 1);
+
+        let waiter = {
+            let ex = ex.clone();
+            tokio::spawn(async move { ex.wait_expanded().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        ex.set_expanded([1, 2]).await;
+        waiter.await.unwrap();
+        assert!(!ex.expansion_pending());
+        assert_eq!(ex.filter_rows(rows).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unpromoted_channels_lists_only_visible_unpromoted_rows() {
+        let store = Store::open_memory().await.unwrap();
+        let ex = ChannelExclusions::new(G);
+        assert!(ex.unpromoted_channels().await.unwrap().is_empty());
+        ex.attach(store.clone()).await.unwrap();
+        for (m, c) in [(1, 10), (2, 10), (3, 20), (4, 30)] {
+            store.insert_message(&incoming(m, c)).await.unwrap();
+        }
+        store.hide_channel_messages(G, &[30]).await.unwrap();
+        let mut got = ex.unpromoted_channels().await.unwrap();
+        got.sort();
+        assert_eq!(got, vec![10, 20]);
     }
 }

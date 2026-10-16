@@ -108,9 +108,25 @@ pub async fn run(
     )));
     let drain_limit = SHUTDOWN_GRACE + actor.worker_timeout();
     let batches = restore::restore(&store, guild).await?;
-    for batch in batches {
-        let _ = jobs_tx.send(Job::Judge(batch));
-    }
+    // 展開を作れていないと、除外したカテゴリ配下の未判定の発言を Judge に回してしまう
+    let restore_task = match channel.exclusions().filter(|ex| ex.expansion_pending()) {
+        Some(ex) => {
+            tracing::warn!("除外の展開が済むまで、再起動前の未判定の発言の Judge を待ちます");
+            let tx = jobs_tx.clone();
+            Some(tokio::spawn(async move {
+                ex.wait_expanded().await;
+                for batch in batches {
+                    let _ = tx.send(Job::Judge(batch));
+                }
+            }))
+        }
+        None => {
+            for batch in batches {
+                let _ = jobs_tx.send(Job::Judge(batch));
+            }
+            None
+        }
+    };
 
     let (meter_stop, meter_stop_rx) = oneshot::channel::<()>();
     let meter_task = tokio::spawn(record_meter_events(
@@ -181,6 +197,9 @@ pub async fn run(
     channel_task.abort();
     // 新しい発言は受けない。デバウンス中の発言は未判定のまま残り、次の起動時に restore が Judge にする
     ingest_task.abort();
+    if let Some(task) = restore_task {
+        task.abort();
+    }
     let _ = stop_tx.send(());
     // 完了済みの JoinHandle をもう一度 await すると panic するので、select で終わった場合は待たない
     if !actor_task.is_finished()

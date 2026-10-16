@@ -3340,6 +3340,91 @@ async fn restore_skips_rows_of_excluded_channels() {
 }
 
 #[tokio::test]
+async fn promotion_waits_until_the_expansion_is_ready() {
+    let mut h = Harness::new().await;
+    let ex = noth_core::exclusion::ChannelExclusions::new(GUILD);
+    ex.set_config([RANDOM]);
+    ex.mark_expansion_pending();
+    h.channel.exclusions.set(ex.clone()).unwrap();
+
+    // 介入しない発言は未昇格バッファに残り、次に介入したときに Layer 3 へ昇格する
+    h.router.set(answers("silent", 0.0, 0.0));
+    h.say(GENERAL, "ただの雑談です").await;
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.say(GENERAL, "Noth はどう思う?").await;
+    assert_eq!(h.sent().len(), 1);
+    let promoted = |turns: Vec<Turn>| turns.iter().any(|t| t.text.contains("ただの雑談"));
+    assert!(!promoted(h.store.active_turns(GUILD).await.unwrap()));
+    assert_eq!(h.store.buffered_messages(GUILD).await.unwrap().len(), 1);
+
+    ex.set_expanded([RANDOM]).await;
+    h.say(GENERAL, "もう一度 Noth に聞くね").await;
+    assert!(promoted(h.store.active_turns(GUILD).await.unwrap()));
+}
+
+#[tokio::test]
+async fn restore_waits_for_the_expansion_before_judging() {
+    let store = Store::open_memory().await.unwrap();
+    for (c, n, id) in [(GENERAL, "general", 1), (RANDOM, "random", 2)] {
+        store
+            .insert_message(&incoming(c, n, "x", id))
+            .await
+            .unwrap();
+    }
+    let ex = noth_core::exclusion::ChannelExclusions::new(GUILD);
+    ex.attach(store.clone()).await.unwrap();
+    ex.set_config([RANDOM]);
+    ex.mark_expansion_pending();
+    let channel = Arc::new(MockChannel::default());
+    channel.exclusions.set(ex.clone()).unwrap();
+    let router = Arc::new(MockRouter::default());
+    router.set(answers("silent", 0.0, 0.0));
+    let (meter, meter_rx) = tokio::sync::mpsc::unbounded_channel();
+    let modules = Modules {
+        channel: channel.clone(),
+        router: router.clone(),
+        provider: Arc::new(MeteredProvider::new(
+            Arc::new(MockProvider::new()),
+            "provider-mock",
+            meter.clone(),
+        )),
+        worker: None,
+        compactor: None,
+        tools: Vec::new(),
+        commands: Vec::new(),
+        meter: meter.clone(),
+        meter_rx,
+    };
+    let cfg = config(80_000, toml::Table::new());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(noth_core::actor::run(
+        cfg,
+        modules,
+        store.clone(),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    // 展開が済むまでは、どちらのチャンネルの発言も Judge に回らない
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(store.unjudged_messages(GUILD).await.unwrap().len(), 2);
+
+    ex.set_expanded([RANDOM]).await;
+    for _ in 0..500 {
+        if store.unjudged_messages(GUILD).await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(store.unjudged_messages(GUILD).await.unwrap().is_empty());
+    // 判定に回ったのは除外していない GENERAL の 1 件だけ
+    assert_eq!(router.states.lock().unwrap().len(), 1);
+    stop_tx.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn excluded_channel_never_reaches_judge_or_layer3() {
     let mut h = Harness::new().await;
     // 除外の前に判定まで済んでいた、未昇格の発言
