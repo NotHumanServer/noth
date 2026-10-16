@@ -6,6 +6,7 @@ mod state;
 mod text;
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
 use noth_core::async_trait;
@@ -22,6 +23,7 @@ use serenity::prelude::{Client, GatewayIntents};
 
 use crate::command::{Controller, InteractionApi, RestInteractionApi};
 use crate::config::DiscordConfig;
+use crate::exclusion::{ChannelNode, Resolver, expand, node_of, unknown_ids};
 use crate::handler::Handler;
 use crate::state::{Names, SharedState};
 use crate::text::{prepare_edit, split_message, wrap_urls};
@@ -61,6 +63,25 @@ impl DiscordChannel {
 
     fn guild(&self) -> sn::GuildId {
         sn::GuildId::new(self.config.guild_id)
+    }
+
+    /// 誤記のまま気づかずに運用しないよう、config の ID が存在しない・別の guild のものなら知らせる。起動は止めない。
+    /// 一覧に無いのはアーカイブ済みのスレッドかもしれないので、個別に引いて確かめる
+    async fn warn_unknown_ignored_channels(&self, known: &[ChannelNode]) {
+        for id in unknown_ids(&self.config.ignored_channels, known) {
+            match self.http.get_channel(sn::ChannelId::new(id)).await {
+                Ok(sn::Channel::Guild(c)) if c.guild_id == self.guild() => {}
+                Ok(_) => tracing::warn!(
+                    channel_id = id,
+                    "channel.discord.ignored_channels の ID が、この guild のチャンネルではありません"
+                ),
+                Err(e) => tracing::warn!(
+                    channel_id = id,
+                    error = %transport(e),
+                    "channel.discord.ignored_channels の ID のチャンネルを取得できません。存在しないか、ID の誤りかもしれません"
+                ),
+            }
+        }
     }
 
     /// `set_commands` が呼ばれていない、またはアプリケーション情報を取れないときは None で、スラッシュコマンドなしで動く
@@ -148,6 +169,27 @@ impl Channel for DiscordChannel {
         Some(self.exclusions.clone())
     }
 
+    async fn load_exclusions(&self) {
+        let guild = self.guild();
+        let mut nodes: Vec<ChannelNode> = match self.http.get_channels(guild).await {
+            Ok(channels) => channels.iter().map(node_of).collect(),
+            Err(e) => {
+                tracing::warn!(error = %transport(e), "チャンネルの一覧を取得できないため、除外の展開は接続後に行います");
+                return;
+            }
+        };
+        match self.http.get_guild_active_threads(guild).await {
+            Ok(data) => nodes.extend(data.threads.iter().map(node_of)),
+            Err(e) => {
+                tracing::warn!(error = %transport(e), "スレッドの一覧を取得できませんでした。スレッドは受信時に親をたどって判定します")
+            }
+        }
+        self.warn_unknown_ignored_channels(&nodes).await;
+        let list = self.exclusions.list();
+        let direct: Vec<u64> = list.config.into_iter().chain(list.commanded).collect();
+        self.exclusions.set_expanded(expand(&direct, &nodes)).await;
+    }
+
     async fn run(&self, bus: BusHandle) -> Result<()> {
         let me = self.http.get_current_user().await.map_err(transport)?;
         let commands = self.command_controller().await;
@@ -160,6 +202,8 @@ impl Channel for DiscordChannel {
             self_id: me.id.get(),
             self_name: me.display_name().to_string(),
             exclusions: self.exclusions.clone(),
+            resolver: Resolver::new(self.exclusions.clone()),
+            watching: AtomicBool::new(false),
             commands,
         };
         // GUILD_MEMBERS は特権 intent なので要求しない。表示名は REST で取る

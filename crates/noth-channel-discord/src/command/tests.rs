@@ -456,6 +456,19 @@ fn reply_text(call: &Call) -> String {
     body["data"]["content"].as_str().unwrap().to_string()
 }
 
+/// add / remove は先に ephemeral で defer し、結果で最初の応答を書き換える。`calls[at]` が defer、その次が結果
+fn deferred_text(calls: &[Call], at: usize) -> String {
+    let Call::Callback(_, defer) = &calls[at] else {
+        panic!("{calls:?}")
+    };
+    assert_eq!(defer["type"], 5);
+    assert_eq!(defer["data"]["flags"], 64);
+    let Call::Edit(body) = &calls[at + 1] else {
+        panic!("{calls:?}")
+    };
+    body["content"].as_str().unwrap().to_string()
+}
+
 #[tokio::test]
 async fn ignore_add_takes_effect_immediately_and_remove_undoes_it() {
     let f = fixture(FakeApi::default(), Some(MASTER), false);
@@ -464,13 +477,13 @@ async fn ignore_add_takes_effect_immediately_and_remove_undoes_it() {
         .handle(ignore_cmd(MASTER, IgnoreOp::Add, Some(500)))
         .await;
     assert!(f.exclusions.is_excluded(&[500]));
-    assert!(reply_text(&f.api.calls()[0]).contains("<#500> を除外に追加しました"));
+    assert!(deferred_text(&f.api.calls(), 0).contains("<#500> を除外に追加しました"));
 
     f.controller
         .handle(ignore_cmd(MASTER, IgnoreOp::Remove, Some(500)))
         .await;
     assert!(!f.exclusions.is_excluded(&[500]));
-    assert!(reply_text(&f.api.calls()[1]).contains("<#500> を除外から外しました"));
+    assert!(deferred_text(&f.api.calls(), 2).contains("<#500> を除外から外しました"));
 }
 
 #[tokio::test]
@@ -485,8 +498,8 @@ async fn ignore_add_twice_and_remove_unknown_are_reported() {
         .handle(ignore_cmd(MASTER, IgnoreOp::Remove, Some(501)))
         .await;
     let calls = f.api.calls();
-    assert!(reply_text(&calls[1]).contains("すでに除外されています"));
-    assert!(reply_text(&calls[2]).contains("除外されていません"));
+    assert!(deferred_text(&calls, 2).contains("すでに除外されています"));
+    assert!(deferred_text(&calls, 4).contains("除外されていません"));
 }
 
 #[tokio::test]
@@ -507,7 +520,7 @@ async fn config_entries_cannot_be_removed_by_command() {
         .handle(ignore_cmd(MASTER, IgnoreOp::Remove, Some(700)))
         .await;
     assert!(f.exclusions.is_excluded(&[700]));
-    let text = reply_text(&f.api.calls()[0]);
+    let text = deferred_text(&f.api.calls(), 0);
     assert!(
         text.contains("config") && text.contains("外せません"),
         "{text}"
@@ -529,8 +542,8 @@ async fn non_master_cannot_change_exclusions() {
         .handle(ignore_cmd(MASTER + 1, IgnoreOp::Add, Some(600)))
         .await;
     let calls = f.api.calls();
-    assert_eq!(calls.len(), 5, "{calls:?}");
-    for call in &calls[1..] {
+    assert_eq!(calls.len(), 6, "{calls:?}");
+    for call in &calls[2..] {
         assert_denied(std::slice::from_ref(call));
     }
     assert_eq!(f.exclusions.effective(), vec![500]);
@@ -564,13 +577,13 @@ async fn ignore_list_shows_origin_ephemerally() {
         .handle(ignore_cmd(MASTER, IgnoreOp::List, None))
         .await;
     let calls = f.api.calls();
-    assert_eq!(calls.len(), 3, "{calls:?}");
-    let Call::Callback(_, defer) = &calls[1] else {
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    let Call::Callback(_, defer) = &calls[2] else {
         panic!()
     };
     assert_eq!(defer["type"], 5);
     assert_eq!(defer["data"]["flags"], 64);
-    let Call::Edit(body) = &calls[2] else {
+    let Call::Edit(body) = &calls[3] else {
         panic!("{calls:?}")
     };
     assert!(is_v2(body));
@@ -734,4 +747,54 @@ mod rest {
             assert!(!format!("{e}").contains(secret), "{e}");
         }
     }
+}
+
+struct Named(&'static str);
+
+#[async_trait]
+impl Command for Named {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+    fn description(&self) -> &'static str {
+        "x"
+    }
+    async fn run(&self, _env: &CommandEnv) -> Result<Report> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn duplicate_subcommand_names_are_registered_once() {
+    let api = Arc::new(FakeApi::default());
+    let host = Arc::new(CommandHost::new(
+        vec![
+            Arc::new(Named("context")),
+            Arc::new(Named("context")),
+            Arc::new(Named("ignore")),
+        ],
+        CommandEnv::new(Arc::new(NoSnapshot)),
+    ));
+    Controller::new(
+        api.clone(),
+        host,
+        Some(MASTER),
+        GUILD,
+        ChannelExclusions::new(GUILD),
+    )
+    .sync()
+    .await;
+    let calls = api.calls();
+    let [Call::Sync(body)] = calls.as_slice() else {
+        panic!()
+    };
+    let names: Vec<&str> = body[0]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["context", "ignore"]);
+    // 後ろの組み込みの ignore グループ(type 2)ではなく、先の Command(type 1)が残る
+    assert_eq!(body[0]["options"][1]["type"], 1);
 }

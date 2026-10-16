@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use noth_core::async_trait;
 use noth_core::bus::{BusEvent, BusHandle};
@@ -10,7 +12,7 @@ use serenity::all as sn;
 use serenity::prelude::{Context, EventHandler};
 
 use crate::command::{Controller, IgnoreOp, Incoming, Kind};
-use crate::exclusion;
+use crate::exclusion::{self, Resolver};
 use crate::state::{Names, SharedState, from_stage};
 use crate::text::{
     AuthorKind, bot_display_name, classify_author, is_aside, message_chars, replace_mentions,
@@ -25,6 +27,9 @@ pub(crate) struct Handler {
     pub(crate) self_id: UserId,
     pub(crate) self_name: String,
     pub(crate) exclusions: ChannelExclusions,
+    pub(crate) resolver: Resolver,
+    /// 展開を作り直す常駐タスクを 1 回だけ起こすため。`cache_ready` は再接続でも届く
+    pub(crate) watching: AtomicBool,
     /// スラッシュコマンドを受け付けないときは None
     pub(crate) commands: Option<Arc<Controller>>,
 }
@@ -37,6 +42,77 @@ impl EventHandler for Handler {
 
     async fn resume(&self, _ctx: Context, _event: sn::ResumedEvent) {
         self.state.set(ConnectionState::Connected);
+    }
+
+    async fn cache_ready(&self, ctx: Context, _guilds: Vec<sn::GuildId>) {
+        if self.watching.swap(true, Ordering::SeqCst) {
+            self.rebuild_exclusions(&ctx).await;
+            return;
+        }
+        let exclusions = self.exclusions.clone();
+        let cache = ctx.cache.clone();
+        let guild_id = self.guild_id;
+        tokio::spawn(async move {
+            let mut changes = exclusions.changes();
+            loop {
+                exclusion::rebuild(&exclusions, &cache, guild_id).await;
+                if changes.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn channel_create(&self, ctx: Context, _channel: sn::GuildChannel) {
+        self.rebuild_exclusions(&ctx).await;
+    }
+
+    async fn channel_update(
+        &self,
+        ctx: Context,
+        _old: Option<sn::GuildChannel>,
+        _new: sn::GuildChannel,
+    ) {
+        self.rebuild_exclusions(&ctx).await;
+    }
+
+    async fn channel_delete(
+        &self,
+        ctx: Context,
+        _channel: sn::GuildChannel,
+        _messages: Option<Vec<sn::Message>>,
+    ) {
+        self.rebuild_exclusions(&ctx).await;
+    }
+
+    async fn category_delete(&self, ctx: Context, _category: sn::GuildChannel) {
+        self.rebuild_exclusions(&ctx).await;
+    }
+
+    async fn thread_create(&self, ctx: Context, _thread: sn::GuildChannel) {
+        self.rebuild_exclusions(&ctx).await;
+    }
+
+    async fn thread_update(
+        &self,
+        ctx: Context,
+        _old: Option<sn::GuildChannel>,
+        _new: sn::GuildChannel,
+    ) {
+        self.rebuild_exclusions(&ctx).await;
+    }
+
+    async fn thread_delete(
+        &self,
+        ctx: Context,
+        _thread: sn::PartialGuildChannel,
+        _full: Option<sn::GuildChannel>,
+    ) {
+        self.rebuild_exclusions(&ctx).await;
+    }
+
+    async fn thread_list_sync(&self, ctx: Context, _sync: sn::ThreadListSyncEvent) {
+        self.rebuild_exclusions(&ctx).await;
     }
 
     async fn shard_stage_update(&self, _ctx: Context, event: sn::ShardStageUpdateEvent) {
@@ -62,11 +138,13 @@ impl EventHandler for Handler {
         ) {
             return;
         }
-        // 自分の発言や Bot の目印も含め、除外したチャンネルのものは何も取り込まない
-        if exclusion::is_excluded(&self.exclusions, msg.channel_id.get(), |id| {
-            exclusion::lookup(&ctx, self.guild_id, id)
-        })
-        .await
+        // Bot の目印も、存在が除外したチャンネルの手がかりになるので、作者の判定より先に捨てる
+        if self
+            .resolver
+            .is_excluded(msg.channel_id.get(), Instant::now(), |id| {
+                exclusion::lookup(&ctx, self.guild_id, id)
+            })
+            .await
         {
             return;
         }
@@ -200,6 +278,17 @@ impl EventHandler for Handler {
         if let Err(e) = self.bus.publish(BusEvent::MessageReceived(incoming)).await {
             tracing::error!(error = %e, "failed to publish message");
         }
+    }
+}
+
+impl Handler {
+    /// 除外が無いときの発言ごとの更新を避けるため、指定が空なら何もしない。
+    /// 指定が空になる変更の後始末は、`cache_ready` で起こした常駐タスクが行う
+    async fn rebuild_exclusions(&self, ctx: &Context) {
+        if self.exclusions.is_empty() {
+            return;
+        }
+        exclusion::rebuild(&self.exclusions, &ctx.cache, self.guild_id).await;
     }
 }
 

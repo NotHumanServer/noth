@@ -71,6 +71,24 @@ impl IgnoreOp {
     }
 }
 
+/// 同じ名前のサブコマンドを送ると Discord が登録全体を拒否し、`/noth` がすべて使えなくなる。先に出てきた方を残す
+fn drop_duplicate_names(subs: Vec<Value>) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    subs.into_iter()
+        .filter(|s| {
+            let name = s["name"].as_str().unwrap_or_default().to_string();
+            let fresh = seen.insert(name.clone());
+            if !fresh {
+                tracing::warn!(
+                    name,
+                    "/noth のサブコマンド名が重複しているため、後のものは登録しません"
+                );
+            }
+            fresh
+        })
+        .collect()
+}
+
 pub(crate) struct Controller {
     api: Arc<dyn InteractionApi>,
     host: Arc<CommandHost>,
@@ -108,6 +126,7 @@ impl Controller {
             .map(|c| json!({"type": 1, "name": c.name(), "description": c.description()}))
             .collect();
         subs.push(ignore::definition());
+        let subs = drop_duplicate_names(subs);
         json!([{
             "type": 1,
             "name": ROOT,
@@ -117,8 +136,8 @@ impl Controller {
         }])
     }
 
-    /// コマンドが 0 件でも空配列を送る。PUT はこの application の guild コマンドをすべて置き換えるので、
-    /// command module を無効にしたり master を消したりしたときに、前回登録した `/noth` が残らない。
+    /// master がいれば `ignore` を常に登録し、いなければ空配列を送る。PUT はこの application の guild コマンドをすべて置き換えるので、
+    /// master を消したときに、前回登録した `/noth` が残らない。
     /// 代わりに、Noth 以外が登録した guild コマンドも消える(今の Noth には他のコマンドが無い)
     pub(crate) async fn sync(&self) {
         if self.master.is_none() {
@@ -197,8 +216,7 @@ impl Controller {
 
     /// 3 秒の受付期限に収めるため、先に defer してから中身を作って最初の応答を書き換える
     async fn slash(&self, ix: &Incoming, command: &str) {
-        let defer = json!({"flags": FLAG_EPHEMERAL});
-        if !self.callback(ix, CALLBACK_DEFER_MESSAGE, Some(defer)).await {
+        if !self.defer(ix).await {
             return;
         }
         let report = match self.host.run(command).await {
@@ -219,32 +237,42 @@ impl Controller {
                 self.reply_ephemeral(ix, "チャンネルを指定してください")
                     .await
             }
-            (IgnoreOp::Add, Some(id)) => {
-                let text = match self.exclusions.add(id, ix.user_id).await {
-                    Ok(outcome) => ignore::added_message(id, &outcome),
-                    Err(e) => {
-                        tracing::warn!(error = %e, channel = id, "除外の追加を保存できませんでした");
-                        SAVE_FAILED.to_string()
-                    }
-                };
-                self.reply_ephemeral(ix, &text).await;
-            }
-            (IgnoreOp::Remove, Some(id)) => {
-                let text = match self.exclusions.remove(id).await {
-                    Ok(outcome) => ignore::removed_message(id, &outcome),
-                    Err(e) => {
-                        tracing::warn!(error = %e, channel = id, "除外の解除を保存できませんでした");
-                        SAVE_FAILED.to_string()
-                    }
-                };
-                self.reply_ephemeral(ix, &text).await;
-            }
+            (op, Some(id)) => self.ignore_change(ix, op, id).await,
         }
     }
 
-    async fn ignore_list(&self, ix: &Incoming) {
+    /// 保存は 3 秒の受付期限に収まる保証がないので、`list` と同じく先に defer する
+    async fn ignore_change(&self, ix: &Incoming, op: IgnoreOp, id: u64) {
+        if !self.defer(ix).await {
+            return;
+        }
+        let text = if op == IgnoreOp::Add {
+            match self.exclusions.add(id, ix.user_id).await {
+                Ok(outcome) => ignore::added_message(id, &outcome),
+                Err(e) => {
+                    tracing::warn!(error = %e, channel = id, "除外の追加を保存できませんでした");
+                    SAVE_FAILED.to_string()
+                }
+            }
+        } else {
+            match self.exclusions.remove(id).await {
+                Ok(outcome) => ignore::removed_message(id, &outcome),
+                Err(e) => {
+                    tracing::warn!(error = %e, channel = id, "除外の解除を保存できませんでした");
+                    SAVE_FAILED.to_string()
+                }
+            }
+        };
+        self.edit_or_log(ix, &plain(&text)).await;
+    }
+
+    async fn defer(&self, ix: &Incoming) -> bool {
         let defer = json!({"flags": FLAG_EPHEMERAL});
-        if !self.callback(ix, CALLBACK_DEFER_MESSAGE, Some(defer)).await {
+        self.callback(ix, CALLBACK_DEFER_MESSAGE, Some(defer)).await
+    }
+
+    async fn ignore_list(&self, ix: &Incoming) {
+        if !self.defer(ix).await {
             return;
         }
         let report = ignore::list_report(&self.exclusions.list());
