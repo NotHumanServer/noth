@@ -180,7 +180,11 @@ fn shell_host_rule(host: &HostInfo) -> String {
             host.home.display()
         ));
     }
-    s.push_str("作業用の「一時環境」ではありません。「どこに作った?」と聞かれたら、結論メモの「置き場所」を答え、根拠なく「置けていない」と断定しないでください。\n");
+    s.push_str("作業用の「一時環境」ではありません。「どこに作った?」と聞かれたら、結論メモの「置き場所」を答え、根拠なく「置けていない」と断定しないでください。");
+    if host.workspace.is_some() {
+        s.push_str("Noth の作業ディレクトリ・作業場所・ワーキングディレクトリを聞かれたら、まず workspace のパスを答えてください。cwd や `pwd` を明示して聞かれたときは、その結果をそのまま答え、それが run ごとの下書きであること(空なら run の終わりに、中身があっても日数で消えること)を添えてください。Worker に頼むときは、Goal に workspace のパスも含めて答えさせてください。");
+    }
+    s.push('\n');
     s
 }
 
@@ -859,6 +863,10 @@ mod tests {
         let c = harness_rules(true, &tools, &m, &[], Some(&no_ws));
         assert!(c.contains("mac-mini") && !c.contains("workspace"));
         assert!(a.contains("結論メモの「置き場所」"));
+        assert!(a.contains("まず workspace のパスを答えてください"));
+        assert!(a.contains("cwd や `pwd` を明示して聞かれたときは、その結果をそのまま答え、それが run ごとの下書きであること(空なら run の終わりに、中身があっても日数で消えること)を添えてください。"));
+        assert!(a.contains("Goal に workspace のパスも含めて答えさせてください"));
+        assert!(!c.contains("ワーキングディレクトリ"));
         let web = harness_rules(true, &[spec("web_search", "x")], &m, &[], Some(&host()));
         assert!(!web.contains("mac-mini"));
         assert!(!harness_rules(true, &tools, &m, &[], None).contains("mac-mini"));
