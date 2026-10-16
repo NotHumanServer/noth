@@ -1,6 +1,6 @@
 # Noth アーキテクチャ: Core の公開 trait
 
-本書は、module が実装する trait として `noth-core` が公開するもの(`Channel` / `Router` / `Provider` / `Tool` / `Compactor`)を定義します。シグネチャは意図を示すための骨子で、実装時にエラー型の詳細を詰めます。どの module がどの trait を実装するかは [modules.md](modules.md)、Provider のキャッシュ戦略は [caching.md](caching.md)、Tool の承認ポリシーは [security.md](security.md) を参照してください。
+本書は、module が実装する trait として `noth-core` が公開するもの(`Channel` / `Router` / `Provider` / `Tool` / `Compactor` / `Command`)を定義します。シグネチャは意図を示すための骨子で、実装時にエラー型の詳細を詰めます。どの module がどの trait を実装するかは [modules.md](modules.md)、Provider のキャッシュ戦略は [caching.md](caching.md)、Tool の承認ポリシーは [security.md](security.md) を参照してください。
 
 trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`async-trait` を使わずに `async fn` を定義した trait は trait オブジェクト(`dyn Trait`)として扱えず、返される Future の `Send` も保証されないため、非同期メソッドは `async-trait` クレートで定義します。
 
@@ -31,6 +31,8 @@ pub trait Channel: Send + Sync {
     async fn typing(&self, channel_id: ChannelId) -> Result<()>;
     /// 投稿済みの発言を書き換える。Worker の進捗を Ack に追記するのに使う。既定は未対応(Err)
     async fn edit(&self, channel_id: ChannelId, message_id: MessageId, text: &str) -> Result<()>;
+    /// 管理コマンドを受け付ける Channel だけが実装する。`run` の前に 1 回呼ばれる。既定は何もしない
+    fn set_commands(&self, host: Arc<CommandHost>) {}
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
     /// `noth doctor` の疎通確認。成功時は表示用の短い説明を返す
@@ -166,3 +168,38 @@ pub trait Compactor: Send + Sync {
 ```
 
 要約の生成には main と同じ provider を使いますが、Layer 1(Profile)を入れず、Layer 0 の「要約は三人称の事実記述にする」規約だけを与えます。キャラクターの文体が要約に混ざるのを防ぐためです。
+
+## 7. `Command`
+
+運営者が Channel から呼ぶ管理コマンドです。何を調べて何を返すかだけを定め、スラッシュコマンドへの割り当て、実行できる人の判定、画面への描画は Channel が行います。そのため `Command` は Discord の型に依存しません。
+
+```rust
+#[async_trait]
+pub trait Command: Send + Sync {
+    /// Channel 側のコマンド名(`/noth <name>`)になる
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    async fn run(&self, env: &CommandEnv) -> Result<Report>;
+}
+
+/// 1 画面分の報告。Channel が自分の表示形式に当てはめる
+pub struct Report { pub title: String, pub sections: Vec<ReportSection> }
+pub struct ReportSection { pub heading: String, pub body: String /* Markdown */ }
+```
+
+`Channel` には、対応する実装だけが持つメソッド `fn set_commands(&self, host: Arc<CommandHost>)` があります(既定は何もしない)。Core が `run` の前に 1 回呼び、`CommandHost` が有効なコマンドの一覧と実行環境を渡します。
+
+`CommandEnv::context()` は `ContextSnapshot` を返します。actor の状態は actor だけが読めるので、問い合わせは actor の仕事のキュー(`Job::Snapshot`)に積まれ、いま処理中の仕事の後に答えます。読み取り専用で、Layer の状態は変えません。
+
+```rust
+pub struct ContextSnapshot {
+    pub model: String,
+    pub layers: Vec<LayerSize>,          // tools / Layer 0 / 1 / 1.5 / 2 / 3。文字数と推定トークン数。本文は持たない
+    pub last_request: Option<RequestUsage>, // 直近の main・Join のリクエストの input_tokens、キャッシュの読み込みと書き込み
+    pub hard_limit_tokens: u64,          // prompt_hard_limit_tokens
+    pub turns: usize, pub turn_channels: usize, pub episodes: usize,
+    pub workers_running: usize, pub workers_queued: usize,
+}
+```
+
+推定トークン数は ASCII 約 4 文字を 1、それ以外の 1 文字を 1 として数えた粗い値です(tokenizer は provider ごとに違う)。`input_tokens` はキャッシュの読み書きを含むプロンプト全体で、`prompt_hard_limit_tokens` の判定に使われる値と同じです。

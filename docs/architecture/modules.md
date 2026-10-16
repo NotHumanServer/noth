@@ -12,7 +12,7 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 
 | 種別 | module | 内容 |
 |---|---|---|
-| channel | `channel-discord` | Discord への接続、発言の受信とデバウンス、Bot からの投稿。Noth 以外の Bot(`author.bot`。webhook は除く)の発言は本文を入れない目印だけを流す |
+| channel | `channel-discord` | Discord への接続、発言の受信とデバウンス、Bot からの投稿。Noth 以外の Bot(`author.bot`。webhook は除く)の発言は本文を入れない目印だけを流す。`command-*` module があれば、guild コマンド `/noth` を登録して受け付ける(master だけ。§3) |
 | router | `router-systemone` | System One API(Jev / Clef)で発言の性質(宛先 `addressee`、外部作業の要否、訂正、補足の価値)・ノイズ判定・話題区切り・合流判定を行う。動き方は Core が決める |
 | router | `router-mention` | ルールベース。メンション・リプライ・キーワード一致時のみ `addressee = noth_request`、他は `other`。外部作業・訂正・補足の問いは常に 0.0(Worker は起動しない)。話題区切りは「前の発言から一定時間空いた、またはチャンネルが変わった」で判定する。System One を契約していなくても起動でき、テストにも使う |
 | provider | `provider-openai` | OpenAI Chat Completions 形式。Responses 形式も同 module 内で選べる |
@@ -39,8 +39,11 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 | tool | `tool-web-agent` | 自然言語の目標で実サイトを操作。バックエンドは `tinyfish`(Agent API `run-async` + ポーリング) | 未登録なら tool 一覧に出ないので使えない |
 | tool | `tool-discord` | 読み取り専用の Discord 参照。サーバー内チャンネルの REST 取得(`fetch_messages` / `list_pins` / `list_channels` など)と、Noth が記録済みの発言の検索(`search_messages`)。`fetch_messages` は `message_id` を `before` / `after` / `around` で指定でき(Noth 以外の Bot の本文も content と embed のテキストで読める。目印の message_id から読む用途)、`channel_id` を省略するとトリガーのチャンネルを取り、`search_messages` はチャンネルを指定しないとトリガーのチャンネルだけを検索する(サーバー全体は `scope: "guild"`。Bot の目印は対象外)。Bot トークンと `guild_id` は `[channel.discord]` を流用し、読めるのは依頼した人全員に見えるチャンネルだけで、操作は `[channel.discord] guild_id` のサーバーに限る([security.md §2](security.md#2-discord-側の対策)) | Worker が過去ログやサーバー構成を参照できない旨を結論メモに書く。`channel-discord` が有効でないと起動しない(トークンを共有するため) |
 | tool | `tool-shell` | ホスト上でのコマンド実行。サンドボックスなし([security.md](security.md)) | 未登録なら tool 一覧に出ないので使えない。Worker は実行できない旨を結論メモに書く |
+| command | `command-context` | `/noth context`。main の文脈の使用量を 1 画面にまとめる。Layer 0〜3 と tool 定義ごとのトークン数と割合(文字数からの推定を、直近のリクエストの実測 `usage.input_tokens` に比例配分したもの)、`prompt_hard_limit_tokens` に対する合計の割合と圧縮の基準までの残り、直近のリクエストのキャッシュの読み込み・書き込み・未キャッシュ、モデル名、Layer 3 のターン数とチャンネル数、Layer 2 のエピソード数、動いている Worker の数を出す。Layer 4 はリクエスト中だけ存在するので含めない。読み取り専用で、本文は表示しない | `/noth` コマンドを登録しない。他の module の動作は変わらない |
 
 tool module は `worker` が有効なときだけ意味を持ちます。`worker` 無効で tool が有効な構成は `noth doctor` が警告します。
+
+command module は管理者向けの操作で、Discord などの Channel が受け付けます。コマンドを実行できるのは `[channel.discord] master` に書いた 1 人だけで、結果は実行した本人にだけ見えます(Channel 側の振る舞いは [discord-setup.md §2.6](../discord-setup.md#26-管理コマンド-noth-context-を使う)、trait は [traits.md §7](traits.md#7-command))。`master` が未設定なら、`command-context` が有効でもコマンドは登録されず、誰にも使えません。コマンドに対応しない Channel では何も起きません。
 
 ## 4. 共有クレート(module ではない)
 
@@ -72,6 +75,7 @@ noth/
 │   ├── noth-tool-web-agent/
 │   ├── noth-tool-discord/
 │   ├── noth-tool-shell/
+│   ├── noth-command-context/
 │   └── noth-backend-tinyfish/
 └── src/main.rs                   # バイナリクレート noth。feature で module を束ねる
 ```
@@ -84,6 +88,7 @@ default = [
   "channel-discord", "router-systemone", "router-mention",
   "provider-anthropic", "worker", "compactor",
   "tool-web-search", "tool-web-fetch", "tool-shell", "tool-discord",
+  "command-context",
 ]
 channel-discord   = ["dep:noth-channel-discord"]
 router-systemone  = ["dep:noth-router-systemone"]
@@ -98,6 +103,7 @@ tool-web-fetch    = ["dep:noth-tool-web-fetch",  "dep:noth-backend-tinyfish"]
 tool-web-agent    = ["dep:noth-tool-web-agent",  "dep:noth-backend-tinyfish"]
 tool-shell        = ["dep:noth-tool-shell"]
 tool-discord      = ["dep:noth-tool-discord"]
+command-context   = ["dep:noth-command-context"]
 ```
 
 `main.rs` は `#[cfg(feature = "...")]` で各 module の登録関数を Module Registry に渡すだけにし、ロジックを持ちません。

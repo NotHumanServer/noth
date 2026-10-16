@@ -193,6 +193,7 @@ enabled = [
   "tool-web-fetch",
   "tool-shell",
   "tool-discord",              # 読み取り専用の Discord 参照。[channel.discord] のトークンと guild_id を使う
+  "command-context",           # /noth context(master だけ。使用量の表示)。[channel.discord] master が要る
 ]
 
 [profile]
@@ -206,6 +207,7 @@ retry_max                = 2     # provider の 429 / 5xx・タイムアウト�
 guild_id      = "123456789012345678"
 token         = "${DISCORD_BOT_TOKEN}"
 allowed_users = ["111111111111111111", "222222222222222222"]
+master        = "111111111111111111"  # 管理コマンド(/noth ...)を使える唯一のユーザー ID。省略するとコマンドは誰にも使えない
 debounce_secs = 2.0
 
 [router]
@@ -350,6 +352,14 @@ max_duration_secs  = 300         # TinyFish 側で run を打ち切る秒数。A
 [backend.tinyfish]
 api_key = "${TINYFISH_API_KEY}"
 ```
+
+`[channel.discord] master` は、管理コマンド(`/noth context` など。[architecture/modules.md §3](architecture/modules.md#3-任意-module-を無効にしたときの動作) の `command-*` module)を実行できる唯一のユーザーの ID です。
+
+- ID は `guild_id` と同じく文字列で書く(`noth config set channel.discord.master <ID>` なら自動で文字列になる)。複数人は書けない
+- 省略すると、`command-*` module が有効でもコマンドは Discord に登録されず、誰にも使えない
+- `allowed_users` とは独立している。`master` が `allowed_users` に入っていなくてもコマンドは使えるが、その人の発言は Noth には届かない
+- `master` 以外が実行しても、本人にだけ「権限がありません」と返り、結果は誰にも見えない
+- 変更はプロセスの再起動で反映される(起動時にコマンドの登録を同期する)
 
 ### 4.3 `.env`
 

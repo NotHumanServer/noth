@@ -8,7 +8,7 @@ Noth は少人数の Discord サーバーに常駐する AI エージェント�
 |---|---|---|
 | [architecture/overview.md](architecture/overview.md) | 設計原則、Core と module の全体像、Core の責務、起動シーケンス、MVP に含めないもの | 最初に読む |
 | [architecture/modules.md](architecture/modules.md) | module の命名規則と一覧、無効時の動作、preset、Cargo workspace と feature | module を足す・外す |
-| [architecture/traits.md](architecture/traits.md) | Core の公開 trait(`Channel` / `Router` / `Provider` / `Tool` / `Compactor`)と共通型 | module を実装する |
+| [architecture/traits.md](architecture/traits.md) | Core の公開 trait(`Channel` / `Router` / `Provider` / `Tool` / `Compactor` / `Command`)と共通型 | module を実装する |
 | [architecture/caching.md](architecture/caching.md) | provider ごとの KV キャッシュ戦略、main と Worker のキャッシュ共有、コスト | provider を実装する、Fork の挙動を変える |
 | [architecture/security.md](architecture/security.md) | 信頼境界、Discord 側と Web 側の対策、承認ポリシー、`tool-shell` の運用 | tool を足す、本番に置く |
 | [architecture/dependencies.md](architecture/dependencies.md) | 採用クレートと版、出典 | 依存を更新する |
