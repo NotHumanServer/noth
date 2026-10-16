@@ -7,12 +7,16 @@ use serde_json::Value;
 
 const API_BASE: &str = "https://discord.com/api/v10";
 const TIMEOUT: Duration = Duration::from_secs(15);
+/// 起動時の登録でだけ待つ。これを超える待ちは再試行せず、次の起動に任せる
+const SYNC_RETRY_WAIT_MAX_SECS: f64 = 30.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ApiError {
     /// 0 は接続・タイムアウトなど応答が得られなかった場合
     pub(crate) status: u16,
     pub(crate) body: String,
+    /// 429 のときだけ。Discord が示す待ち秒数
+    pub(crate) retry_after: Option<f64>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -76,29 +80,45 @@ impl RestInteractionApi {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder, body: &Value) -> Result<(), ApiError> {
-        let res = req.json(body).send().await.map_err(|e| ApiError {
-            status: 0,
-            body: if e.is_timeout() {
-                "タイムアウトしました".into()
-            } else {
-                e.to_string()
-            },
+        let res = req.json(body).send().await.map_err(|e| {
+            // interaction の token は URL に入っていて、reqwest のエラー文にもそのまま出るので外す
+            let e = e.without_url();
+            ApiError {
+                status: 0,
+                body: if e.is_timeout() {
+                    "タイムアウトしました".into()
+                } else {
+                    e.to_string()
+                },
+                retry_after: None,
+            }
         })?;
         let status = res.status().as_u16();
         if (200..300).contains(&status) {
             return Ok(());
         }
+        let header_retry = res
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<f64>().ok());
         let text = res.text().await.unwrap_or_default();
+        let retry_after = (status == 429)
+            .then(|| {
+                serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("retry_after").and_then(Value::as_f64))
+                    .or(header_retry)
+            })
+            .flatten();
         Err(ApiError {
             status,
             body: text.chars().take(300).collect(),
+            retry_after,
         })
     }
-}
 
-#[async_trait]
-impl InteractionApi for RestInteractionApi {
-    async fn sync_commands(&self, body: &Value) -> Result<(), ApiError> {
+    async fn put_commands(&self, body: &Value) -> Result<(), ApiError> {
         let url = format!(
             "{}/applications/{}/guilds/{}/commands",
             self.base, self.application_id, self.guild_id
@@ -108,6 +128,23 @@ impl InteractionApi for RestInteractionApi {
             .put(url)
             .header("Authorization", format!("Bot {}", self.bot_token));
         self.send(req, body).await
+    }
+}
+
+#[async_trait]
+impl InteractionApi for RestInteractionApi {
+    async fn sync_commands(&self, body: &Value) -> Result<(), ApiError> {
+        match self.put_commands(body).await {
+            Err(ApiError {
+                status: 429,
+                retry_after: Some(secs),
+                ..
+            }) if secs <= SYNC_RETRY_WAIT_MAX_SECS => {
+                tokio::time::sleep(Duration::from_secs_f64(secs.max(0.0))).await;
+                self.put_commands(body).await
+            }
+            other => other,
+        }
     }
 
     // interaction の token は URL に含まれ、Authorization は要らない

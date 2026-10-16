@@ -2,6 +2,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use jiff::Timestamp;
+
 use super::{Actor, Job};
 use crate::command::{ContextSnapshot, ContextSource, LayerSize, RequestUsage, estimate_tokens};
 use crate::layers::HEADER_EPISODE;
@@ -52,12 +54,21 @@ impl Actor {
         // main と Worker に同じ定義を渡しているので、シリアライズした長さをその大きさとみなす
         let tools = serde_json::to_string(&self.tools).unwrap_or_default();
 
-        let last_request = match self.store.last_usage(self.guild).await? {
-            Some(usage) => Some(RequestUsage {
-                input_tokens: usage.input_tokens,
-                cache_read_tokens: usage.cached_tokens,
-                cache_write_tokens: self.store.last_prompt_cache_write(self.guild).await?,
-            }),
+        let last_request = match self.store.last_prompt_request(self.guild).await? {
+            Some(req) => {
+                let compacted_since = self
+                    .store
+                    .last_compaction_at(self.guild)
+                    .await?
+                    .is_some_and(|at| at > req.at);
+                Some(RequestUsage {
+                    input_tokens: req.input_tokens,
+                    cache_read_tokens: req.cache_read_tokens,
+                    cache_write_tokens: req.cache_write_tokens,
+                    age_secs: (Timestamp::now().as_second() - req.at.as_second()).max(0) as u64,
+                    compacted_since,
+                })
+            }
             None => None,
         };
         let runs = self.store.active_runs(self.guild).await?;

@@ -86,14 +86,17 @@ pub struct LayerSize {
     pub est_tokens: u64,
 }
 
-/// 直近の main(または Join)のリクエストの実測
+/// 直近の main(または Join)のリクエストの実測。課金記録の 1 行から作るので、3 つの値は同じリクエストのもの
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestUsage {
-    /// プロンプト全体(キャッシュの読み書きを含む)。ハード上限の判定に使われる値
+    /// プロンプト全体(キャッシュの読み書きを含む)
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
-    /// 課金記録が無いときは None
-    pub cache_write_tokens: Option<u64>,
+    pub cache_write_tokens: u64,
+    /// リクエストから問い合わせまでの秒数
+    pub age_secs: u64,
+    /// このリクエストのあとに Layer 3 を圧縮した。いまの文脈の大きさとは合わない
+    pub compacted_since: bool,
 }
 
 /// 今の main の文脈の大きさ。本文は運ばない

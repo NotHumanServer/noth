@@ -35,7 +35,12 @@ impl Command for ContextCommand {
 
 fn render(snap: &ContextSnapshot) -> Report {
     let est_sum: u64 = snap.layers.iter().map(|l| l.est_tokens).sum();
-    let measured = snap.last_request.as_ref().map(|r| r.input_tokens);
+    // 圧縮したあとの実測は古い文脈の大きさなので、合計には使わない
+    let measured = snap
+        .last_request
+        .as_ref()
+        .filter(|r| !r.compacted_since)
+        .map(|r| r.input_tokens);
     let total = measured.unwrap_or(est_sum);
 
     // 層ごとの内訳は文字数からの推定でしか出せないので、実測の合計に比例配分して合計を実測に合わせる
@@ -46,7 +51,7 @@ fn render(snap: &ContextSnapshot) -> Report {
 
     let mut sections = vec![ReportSection {
         heading: "全体".into(),
-        body: overall(snap, total, measured.is_some()),
+        body: overall(snap, total),
     }];
 
     let rows: Vec<String> = snap
@@ -66,7 +71,7 @@ fn render(snap: &ContextSnapshot) -> Report {
     let basis = if measured.is_some() {
         "文字数から推定した比率を、直近の実測の合計に合わせて配分"
     } else {
-        "文字数からの推定(まだリクエストがありません)"
+        "文字数からの推定"
     };
     sections.push(ReportSection {
         heading: "層ごとの使用量".into(),
@@ -100,12 +105,14 @@ fn render(snap: &ContextSnapshot) -> Report {
     }
 }
 
-fn overall(snap: &ContextSnapshot, total: u64, measured: bool) -> String {
+fn overall(snap: &ContextSnapshot, total: u64) -> String {
     let limit = snap.hard_limit_tokens;
-    let source = if measured {
-        "直近のリクエストの実測"
-    } else {
-        "推定"
+    let source = match &snap.last_request {
+        Some(r) if !r.compacted_since => {
+            format!("直近のリクエストの実測・{}", ago(r.age_secs))
+        }
+        Some(_) => "推定。直近の実測は圧縮の前のものなので使っていません".to_string(),
+        None => "推定。まだリクエストがありません".to_string(),
     };
     let remaining = if total > limit {
         "基準を超えています。次の応答の前に古いターンを Layer 2 へ圧縮します".to_string()
@@ -128,21 +135,36 @@ fn cache(snap: &ContextSnapshot) -> String {
         return "リクエストの記録がまだありません".into();
     };
     let total = req.input_tokens;
-    let write = req.cache_write_tokens.unwrap_or(0);
-    let uncached = total.saturating_sub(req.cache_read_tokens + write);
-    let write_row = match req.cache_write_tokens {
-        Some(_) => format!("書き込み   {}", cache_row(write, total)),
-        None => "書き込み   記録なし".to_string(),
-    };
-    code_block(&[
-        format!("読み込み   {}", cache_row(req.cache_read_tokens, total)),
-        write_row,
-        format!("未キャッシュ {}", cache_row(uncached, total)),
-    ])
+    let uncached = total.saturating_sub(req.cache_read_tokens + req.cache_write_tokens);
+    let mut head = format!("{}のリクエスト", ago(req.age_secs));
+    if req.compacted_since {
+        head.push_str("(このあとに圧縮したため、いまの文脈とは一致しません)");
+    }
+    let table = code_block(&[
+        cache_row("読み込み", req.cache_read_tokens, total),
+        cache_row("書き込み", req.cache_write_tokens, total),
+        cache_row("未キャッシュ", uncached, total),
+    ]);
+    format!("{head}\n{table}")
 }
 
-fn cache_row(tokens: u64, total: u64) -> String {
-    format!("{:>7} tok ({:>3}%)", group(tokens), percent(tokens, total))
+/// 日本語のラベルは全角 2 桁なので、全角の空白で埋めて表の桁をそろえる
+fn cache_row(label: &str, tokens: u64, total: u64) -> String {
+    const LABEL_WIDTH: usize = 6;
+    let pad = "　".repeat(LABEL_WIDTH.saturating_sub(label.chars().count()));
+    format!(
+        "{label}{pad} {:>7} tok ({:>3}%)",
+        group(tokens),
+        percent(tokens, total)
+    )
+}
+
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}秒前"),
+        60..3600 => format!("{}分前", secs / 60),
+        _ => format!("{}時間前", secs / 3600),
+    }
 }
 
 fn percent(part: u64, whole: u64) -> u64 {
@@ -153,14 +175,12 @@ fn percent(part: u64, whole: u64) -> u64 {
     }
 }
 
-/// 割合が 100% を超えても棒は満タンで止める
 fn gauge(part: u64, whole: u64) -> String {
     let filled = if whole == 0 {
         0
     } else {
         ((part as u128 * BAR_WIDTH as u128).div_ceil(whole as u128) as usize).min(BAR_WIDTH)
     };
-    // 0 より大きければ 1 マス以上見せる。ceil で足りている
     format!(
         "{}{} {:>3}%",
         "█".repeat(filled),
@@ -205,6 +225,16 @@ mod tests {
             name,
             chars: est as usize * 2,
             est_tokens: est,
+        }
+    }
+
+    fn usage(input: u64, read: u64, write: u64) -> RequestUsage {
+        RequestUsage {
+            input_tokens: input,
+            cache_read_tokens: read,
+            cache_write_tokens: write,
+            age_secs: 300,
+            compacted_since: false,
         }
     }
 
@@ -258,15 +288,10 @@ mod tests {
 
     #[test]
     fn measured_total_scales_layers_and_reports_remaining() {
-        let usage = RequestUsage {
-            input_tokens: 1_000,
-            cache_read_tokens: 800,
-            cache_write_tokens: Some(100),
-        };
-        let report = render(&snapshot(Some(usage)));
+        let report = render(&snapshot(Some(usage(1_000, 800, 100))));
         let overall = body(&report, "全体");
         assert!(
-            overall.contains("合計 1,000 トークン(直近のリクエストの実測)"),
+            overall.contains("合計 1,000 トークン(直近のリクエストの実測・5分前)"),
             "{overall}"
         );
         assert!(
@@ -283,6 +308,7 @@ mod tests {
         assert!(cache.contains("800 tok ( 80%)"), "{cache}");
         assert!(cache.contains("100 tok ( 10%)"), "{cache}");
         assert!(cache.contains("未キャッシュ"), "{cache}");
+        assert!(cache.starts_with("5分前のリクエスト"), "{cache}");
         let extra = body(&report, "補足");
         for needle in [
             "model-x",
@@ -298,22 +324,53 @@ mod tests {
     fn without_a_request_falls_back_to_estimate() {
         let report = render(&snapshot(None));
         let overall = body(&report, "全体");
-        assert!(overall.contains("合計 1,000 トークン(推定)"), "{overall}");
-        assert!(body(&report, "層ごとの使用量").contains("まだリクエストがありません"));
+        assert!(
+            overall.contains("合計 1,000 トークン(推定。まだリクエストがありません)"),
+            "{overall}"
+        );
+        assert!(body(&report, "層ごとの使用量").contains("文字数からの推定"));
         assert!(body(&report, "キャッシュ(直近のリクエスト)").contains("記録がまだありません"));
     }
 
     #[test]
-    fn over_limit_is_called_out_and_unknown_write_is_marked() {
-        let usage = RequestUsage {
-            input_tokens: 2_500,
-            cache_read_tokens: 0,
-            cache_write_tokens: None,
-        };
-        let report = render(&snapshot(Some(usage)));
+    fn over_limit_is_called_out() {
+        let report = render(&snapshot(Some(usage(2_500, 0, 0))));
         assert!(body(&report, "全体").contains("基準を超えています"));
         assert!(body(&report, "全体").contains("125%"));
-        assert!(body(&report, "キャッシュ(直近のリクエスト)").contains("書き込み   記録なし"));
+    }
+
+    #[test]
+    fn measurement_before_a_compaction_is_not_used_for_the_total() {
+        let mut stale = usage(9_000, 8_000, 500);
+        stale.compacted_since = true;
+        let report = render(&snapshot(Some(stale)));
+        let overall = body(&report, "全体");
+        assert!(overall.contains("合計 1,000 トークン(推定。"), "{overall}");
+        assert!(overall.contains("圧縮の前のもの"), "{overall}");
+        let cache = body(&report, "キャッシュ(直近のリクエスト)");
+        assert!(cache.contains("このあとに圧縮した"), "{cache}");
+        assert!(cache.contains("8,000 tok"), "{cache}");
+    }
+
+    #[test]
+    fn cache_labels_are_padded_to_the_same_width() {
+        let report = render(&snapshot(Some(usage(1_000, 800, 100))));
+        let cache = body(&report, "キャッシュ(直近のリクエスト)");
+        let widths: Vec<usize> = cache
+            .lines()
+            .filter(|l| l.contains(" tok ("))
+            .map(|l| l.split(' ').next().unwrap().chars().count())
+            .collect();
+        assert_eq!(widths, [6, 6, 6], "{cache}");
+    }
+
+    #[test]
+    fn ago_picks_a_readable_unit() {
+        assert_eq!(ago(5), "5秒前");
+        assert_eq!(ago(59), "59秒前");
+        assert_eq!(ago(60), "1分前");
+        assert_eq!(ago(3599), "59分前");
+        assert_eq!(ago(7200), "2時間前");
     }
 
     #[tokio::test]

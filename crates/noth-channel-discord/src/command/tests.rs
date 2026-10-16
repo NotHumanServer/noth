@@ -43,6 +43,7 @@ impl FakeApi {
             Err(ApiError {
                 status: 400,
                 body: "rejected".into(),
+                retry_after: None,
             })
         } else {
             Ok(())
@@ -142,13 +143,17 @@ fn fixture(api: FakeApi, master: Option<u64>, fail: bool) -> Fixture {
 }
 
 fn slash(user_id: u64, guild_id: Option<u64>, sub: Option<&str>) -> Incoming {
+    slash_named("noth", user_id, guild_id, sub)
+}
+
+fn slash_named(name: &str, user_id: u64, guild_id: Option<u64>, sub: Option<&str>) -> Incoming {
     Incoming {
         id: 77,
         token: "tok".into(),
         user_id,
         guild_id,
         kind: Kind::Slash {
-            name: "noth".into(),
+            name: name.into(),
             sub: sub.map(Into::into),
         },
     }
@@ -295,12 +300,25 @@ async fn command_failure_is_shown_in_the_deferred_reply() {
     let Call::Edit(body) = &calls[1] else {
         panic!("{calls:?}")
     };
-    assert!(
-        body["content"]
-            .as_str()
-            .unwrap()
-            .contains("取得に失敗しました")
-    );
+    let text = body["content"].as_str().unwrap();
+    assert!(text.contains("取得に失敗しました"));
+    assert!(!text.contains("actor が停止"), "{text}");
+}
+
+#[tokio::test]
+async fn refresh_failure_is_a_fixed_followup() {
+    let f = fixture(FakeApi::default(), Some(MASTER), true);
+    f.controller
+        .handle(button(MASTER, "noth:refresh:context"))
+        .await;
+    let calls = f.api.calls();
+    let Call::Followup(body) = &calls[1] else {
+        panic!("{calls:?}")
+    };
+    let text = body["content"].as_str().unwrap();
+    assert!(text.contains("更新に失敗しました"));
+    assert!(!text.contains("actor が停止"), "{text}");
+    assert_eq!(body["flags"], 64);
 }
 
 #[tokio::test]
@@ -313,7 +331,24 @@ async fn unknown_subcommand_is_rejected_ephemerally() {
     f.controller
         .handle(button(MASTER, "noth:refresh:nope"))
         .await;
-    assert_eq!(f.api.calls().len(), 3);
+    f.controller
+        .handle(slash_named("other", MASTER, Some(GUILD), Some("context")))
+        .await;
+    let calls = f.api.calls();
+    assert_eq!(calls.len(), 4);
+    for call in calls {
+        let Call::Callback(_, body) = call else {
+            panic!()
+        };
+        assert_eq!(body["type"], 4);
+        assert_eq!(body["data"]["flags"], 64);
+        assert!(
+            body["data"]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("未知の")
+        );
+    }
     assert_eq!(f.runs.load(Ordering::SeqCst), 0);
 }
 
@@ -371,6 +406,19 @@ async fn sync_clears_commands_when_master_is_unset() {
     assert_eq!(f.api.calls(), [Call::Sync(json!([]))]);
 }
 
+#[tokio::test]
+async fn sync_clears_commands_when_no_command_is_enabled() {
+    let api = Arc::new(FakeApi::default());
+    let host = Arc::new(CommandHost::new(
+        Vec::new(),
+        CommandEnv::new(Arc::new(NoSnapshot)),
+    ));
+    Controller::new(api.clone(), host, Some(MASTER), GUILD)
+        .sync()
+        .await;
+    assert_eq!(api.calls(), [Call::Sync(json!([]))]);
+}
+
 mod rest {
     use std::sync::Mutex;
 
@@ -392,7 +440,9 @@ mod rest {
                 log.lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&buf[..n]).to_string());
-                let body = if status.starts_with('4') {
+                let body = if status.starts_with("429") {
+                    r#"{"message":"slow","retry_after":0.01}"#
+                } else if status.starts_with('4') {
                     r#"{"message":"Invalid Form Body"}"#
                 } else {
                     ""
@@ -455,5 +505,45 @@ mod rest {
         );
         assert!(seen[2].contains(r#"{"flags":32768}"#));
         assert!(seen[3].starts_with("POST /webhooks/5/itok "), "{}", seen[3]);
+    }
+
+    #[tokio::test]
+    async fn sync_retries_once_after_a_short_rate_limit() {
+        let (base, seen) = serve(vec!["429 Too Many Requests", "200 OK"]).await;
+        let api = RestInteractionApi::with_base("bot-tok".into(), 5, 10, base);
+        api.sync_commands(&json!([])).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_retry_a_second_rate_limit_and_callbacks_never_retry() {
+        let (base, seen) = serve(vec![
+            "429 Too Many Requests",
+            "429 Too Many Requests",
+            "429 Too Many Requests",
+        ])
+        .await;
+        let api = RestInteractionApi::with_base("bot-tok".into(), 5, 10, base);
+        let e = api.sync_commands(&json!([])).await.unwrap_err();
+        assert_eq!((e.status, e.retry_after), (429, Some(0.01)));
+        assert!(api.callback(77, "itok", &json!({})).await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn connection_error_does_not_leak_the_interaction_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let api = RestInteractionApi::with_base("bot-tok".into(), 5, 10, base);
+        let secret = "SECRET-INTERACTION-TOKEN";
+        for e in [
+            api.callback(77, secret, &json!({})).await.unwrap_err(),
+            api.edit_original(secret, &json!({})).await.unwrap_err(),
+            api.followup(secret, &json!({})).await.unwrap_err(),
+        ] {
+            assert_eq!(e.status, 0);
+            assert!(!format!("{e}").contains(secret), "{e}");
+        }
     }
 }

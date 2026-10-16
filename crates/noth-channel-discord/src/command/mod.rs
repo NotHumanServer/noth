@@ -13,6 +13,10 @@ use render::{FLAG_EPHEMERAL, embed_message, parse_refresh, plain, text_message, 
 /// Discord 側のコマンド名。サブコマンドが各 `Command::name()` になる
 const ROOT: &str = "noth";
 const DENIED: &str = "権限がありません";
+const UNKNOWN_COMMAND: &str = "未知のコマンドです";
+/// 内部のエラー文は画面に出さず、ログにだけ残す
+const FAILED: &str = "取得に失敗しました。ログを確認してください";
+const REFRESH_FAILED: &str = "更新に失敗しました。ログを確認してください";
 
 const CALLBACK_MESSAGE: u8 = 4;
 const CALLBACK_DEFER_MESSAGE: u8 = 5;
@@ -73,11 +77,11 @@ impl Controller {
         }])
     }
 
+    /// コマンドが 0 件でも空配列を送る。PUT はこの application の guild コマンドをすべて置き換えるので、
+    /// command module を無効にしたり master を消したりしたときに、前回登録した `/noth` が残らない。
+    /// 代わりに、Noth 以外が登録した guild コマンドも消える(今の Noth には他のコマンドが無い)
     pub(crate) async fn sync(&self) {
-        if self.host.commands().is_empty() {
-            return;
-        }
-        if self.master.is_none() {
+        if self.master.is_none() && !self.host.commands().is_empty() {
             tracing::info!(
                 "channel.discord.master が未設定のため、/noth コマンドは登録せず、誰にも使えません"
             );
@@ -98,9 +102,9 @@ impl Controller {
         match &ix.kind {
             Kind::Slash { name, sub } if name == ROOT => match sub {
                 Some(sub) if self.has(sub) => self.slash(&ix, sub).await,
-                _ => self.reply_ephemeral(&ix, "未知のコマンドです").await,
+                _ => self.reply_ephemeral(&ix, UNKNOWN_COMMAND).await,
             },
-            Kind::Slash { .. } => {}
+            Kind::Slash { .. } => self.reply_ephemeral(&ix, UNKNOWN_COMMAND).await,
             Kind::Button { custom_id } => match parse_refresh(custom_id) {
                 Some(command) if self.has(command) => self.refresh(&ix, command).await,
                 _ => self.reply_ephemeral(&ix, "未知の操作です").await,
@@ -142,8 +146,7 @@ impl Controller {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, command, "コマンドの実行に失敗しました");
-                self.edit_or_log(ix, &plain(&format!("取得に失敗しました: {e}")))
-                    .await;
+                self.edit_or_log(ix, &plain(FAILED)).await;
                 return;
             }
         };
@@ -182,8 +185,7 @@ impl Controller {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, command, "コマンドの再実行に失敗しました");
-                self.followup(ix, plain(&format!("更新に失敗しました: {e}")))
-                    .await;
+                self.followup(ix, plain(REFRESH_FAILED)).await;
                 return;
             }
         };

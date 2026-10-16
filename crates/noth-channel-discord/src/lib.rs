@@ -57,7 +57,7 @@ impl DiscordChannel {
         sn::GuildId::new(self.config.guild_id)
     }
 
-    /// コマンドを持たない、またはアプリケーション情報を取れないときは None で、スラッシュコマンドなしで動く
+    /// コマンドが 0 件でも作る(前回登録したコマンドを外すため)。`set_commands` が呼ばれていない、またはアプリケーション情報を取れないときは None で、スラッシュコマンドなしで動く
     async fn command_controller(&self) -> Option<Arc<Controller>> {
         let host = self
             .commands

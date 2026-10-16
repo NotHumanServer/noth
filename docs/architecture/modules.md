@@ -43,7 +43,7 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 
 tool module は `worker` が有効なときだけ意味を持ちます。`worker` 無効で tool が有効な構成は `noth doctor` が警告します。
 
-command module は管理者向けの操作で、Discord などの Channel が受け付けます。コマンドを実行できるのは `[channel.discord] master` に書いた 1 人だけで、結果は実行した本人にだけ見えます(Channel 側の振る舞いは [discord-setup.md §2.6](../discord-setup.md#26-管理コマンド-noth-context-を使う)、trait は [traits.md §7](traits.md#7-command))。`master` が未設定なら、`command-context` が有効でもコマンドは登録されず、誰にも使えません。コマンドに対応しない Channel では何も起きません。
+command module は管理者向けの操作で、Discord などの Channel が受け付けます。コマンドを実行できるのは `[channel.discord] master` に書いた 1 人だけで、結果は実行した本人にだけ見えます(Channel 側の振る舞いは [discord-setup.md §2.6](../discord-setup.md#26-管理コマンド-noth-context-を使う)、trait は [traits.md §7](traits.md#7-command))。`master` が未設定なら、`command-context` が有効でもコマンドは登録されず、誰にも使えません。コマンドに対応しない Channel では何も起きません。`channel-discord` は起動のたびに guild コマンドを丸ごと置き換える（コマンドが 0 件でも空にする）ので、`command-context` を無効にした再起動で `/noth` も消えます。`/noth` は guild の全員に見えますが（`default_member_permissions` は設定しない）、master 以外が選んでも本人にだけ断りが返ります。
 
 ## 4. 共有クレート(module ではない)
 

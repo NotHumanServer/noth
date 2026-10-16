@@ -714,6 +714,12 @@ async fn snapshot_reports_layers_usage_and_counts_without_changing_state() {
     h.say(GENERAL, "質問1").await;
     h.say(RANDOM, "質問2").await;
     let prompts_before = h.prompts().len();
+    // 課金記録は run() が計測イベントから保存するので、この harness では自分で保存する
+    while let Ok(event) = h.meter_rx.try_recv() {
+        if let MeterEvent::Cost(cost) = event {
+            h.store.record_cost(GUILD, &cost).await.unwrap();
+        }
+    }
 
     let snap = snapshot(&mut h).await;
     assert_eq!(snap.model, "mock-model");
@@ -735,11 +741,16 @@ async fn snapshot_reports_layers_usage_and_counts_without_changing_state() {
     assert_eq!(snap.turn_channels, 2);
     let req = snap.last_request.expect("実測が入る");
     assert_eq!(req.input_tokens, 1234);
-    // 課金記録は run() が計測イベントから保存するので、この harness では空
-    assert_eq!(req.cache_write_tokens, None);
+    assert_eq!((req.cache_read_tokens, req.cache_write_tokens), (0, 0));
+    assert!(!req.compacted_since);
     assert_eq!(snap.hard_limit_tokens, 80_000);
     assert_eq!((snap.workers_running, snap.workers_queued), (0, 0));
     assert_eq!(h.prompts().len(), prompts_before);
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    h.store.insert_digest(GUILD, "要約").await.unwrap();
+    let after = snapshot(&mut h).await;
+    assert!(after.last_request.unwrap().compacted_since);
 }
 
 #[tokio::test]
