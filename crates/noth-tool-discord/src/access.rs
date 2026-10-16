@@ -15,6 +15,14 @@ use crate::format::id_of;
 pub(crate) const DENIED: &str = "依頼した人にはこのチャンネルを見る権限がありません(存在しない・別のサーバーのチャンネルも同じ表示です)";
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
+/// ニックネームは権限と違って古くても害が小さいので、404 や失敗も含めて長く覚える
+const NICK_TTL: Duration = Duration::from_secs(300);
+
+pub(crate) enum NickLookup {
+    Found(String),
+    Missing,
+    RateLimited,
+}
 const ADMINISTRATOR: u64 = 1 << 3;
 pub(crate) const VIEW_CHANNEL: u64 = 1 << 10;
 const READ_MESSAGE_HISTORY: u64 = 1 << 16;
@@ -195,10 +203,40 @@ impl DiscordTool {
         action: &str,
         user_id: u64,
     ) -> std::result::Result<Option<Vec<u64>>, String> {
-        if let Some((at, r)) = self.members.lock().expect("lock").get(&user_id)
+        match self.member_entry(user_id).await {
+            Ok(m) => Ok(m.map(|(r, _)| r)),
+            Err(e) => Err(crate::api::describe_error(action, &e)),
+        }
+    }
+
+    /// REST のメッセージ一覧は `member` を付けないので、サーバーでのニックネームはここで補う。
+    /// 404 や失敗も覚えて、同じ相手に何度も問い合わせない
+    pub(crate) async fn member_nick(&self, user_id: u64) -> NickLookup {
+        if let Some((at, n)) = self.nicks.lock().expect("lock").get(&user_id)
+            && at.elapsed() < NICK_TTL
+        {
+            return n.clone().map_or(NickLookup::Missing, NickLookup::Found);
+        }
+        let nick = match self.member_entry(user_id).await {
+            Ok(m) => m.and_then(|(_, nick)| nick),
+            Err(e) if e.status == 429 => return NickLookup::RateLimited,
+            Err(_) => None,
+        };
+        self.nicks
+            .lock()
+            .expect("lock")
+            .insert(user_id, (Instant::now(), nick.clone()));
+        nick.map_or(NickLookup::Missing, NickLookup::Found)
+    }
+
+    async fn member_entry(
+        &self,
+        user_id: u64,
+    ) -> std::result::Result<Option<(Vec<u64>, Option<String>)>, ApiError> {
+        if let Some((at, r, n)) = self.members.lock().expect("lock").get(&user_id)
             && at.elapsed() < CACHE_TTL
         {
-            return Ok(Some(r.clone()));
+            return Ok(Some((r.clone(), n.clone())));
         }
         let m = match self
             .api
@@ -207,7 +245,7 @@ impl DiscordTool {
         {
             Ok(m) => m,
             Err(e) if e.status == 404 => return Ok(None),
-            Err(e) => return Err(crate::api::describe_error(action, &e)),
+            Err(e) => return Err(e),
         };
         let roles: Vec<u64> = m
             .get("roles")
@@ -216,11 +254,16 @@ impl DiscordTool {
             .flatten()
             .filter_map(id_of)
             .collect();
+        let nick = m
+            .get("nick")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         self.members
             .lock()
             .expect("lock")
-            .insert(user_id, (Instant::now(), roles.clone()));
-        Ok(Some(roles))
+            .insert(user_id, (Instant::now(), roles.clone(), nick.clone()));
+        Ok(Some((roles, nick)))
     }
 
     /// 出力が届く先は、依頼した人と、トリガーのチャンネルを見られる全員(@everyone が見られるなら @everyone も)。

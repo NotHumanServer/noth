@@ -370,6 +370,131 @@ async fn fetch_masks_unallowed_authors_and_replaces_mentions() {
 }
 
 #[tokio::test]
+async fn author_shows_nick_and_global_name_from_member_lookup() {
+    let mut with_member = message(12, ALICE, false, "b");
+    with_member["author"]["global_name"] = json!("Bob");
+    with_member["member"] = json!({"nick": "bobby"});
+    let mut same = message(13, ALICE, false, "c");
+    same["author"]["global_name"] = json!("Alice");
+    same["member"] = json!({"nick": "Alice"});
+    let mut no_member = message(11, ALICE, false, "a");
+    no_member["author"]["global_name"] = json!("さどるふ");
+    let api = FakeApi::with(vec![
+        ("/channels/7", Ok(in_guild_channel(7))),
+        (
+            "/channels/7/messages",
+            Ok(json!([same, with_member, no_member])),
+        ),
+        (
+            "/guilds/100/members/1",
+            Ok(json!({"roles": [], "nick": "さd"})),
+        ),
+    ]);
+    let tool = tool_with(api, &[]);
+    let v = json_of(
+        &run(
+            &tool,
+            json!({"action": "fetch_messages", "channel_id": "7"}),
+        )
+        .await,
+    );
+    let m = v["messages"].as_array().unwrap();
+    assert_eq!(m[0]["author"], "さd（さどるふ）");
+    assert_eq!(m[1]["author"], "bobby（Bob）");
+    assert_eq!(m[2]["author"], "Alice");
+}
+
+fn member_gets(api: &FakeApi, user: u64) -> usize {
+    let path = format!("/guilds/100/members/{user}");
+    api.paths().iter().filter(|p| **p == path).count()
+}
+
+#[tokio::test]
+async fn nick_lookup_is_cached_across_calls() {
+    let api = FakeApi::with(vec![
+        ("/channels/7", Ok(in_guild_channel(7))),
+        (
+            "/channels/7/messages",
+            Ok(json!([message(11, ALICE, false, "a")])),
+        ),
+        (
+            "/guilds/100/members/1",
+            Ok(json!({"roles": [], "nick": "さd"})),
+        ),
+    ]);
+    let tool = tool_with(api.clone(), &[]);
+    let input = json!({"action": "fetch_messages", "channel_id": "7"});
+    for _ in 0..2 {
+        let v = json_of(&run(&tool, input.clone()).await);
+        assert_eq!(v["messages"][0]["author"], "さd（User1）");
+    }
+    assert_eq!(member_gets(&api, ALICE), 1);
+}
+
+#[tokio::test]
+async fn failed_nick_lookup_falls_back_to_global_name_and_is_remembered() {
+    for status in [404, 429, 500] {
+        let api = FakeApi::with(vec![
+            ("/channels/7", Ok(in_guild_channel(7))),
+            (
+                "/channels/7/messages",
+                Ok(json!([message(11, ALICE, false, "a")])),
+            ),
+            ("/guilds/100/members/1", Err(ApiError::new(status, "x"))),
+        ]);
+        let tool = tool_with(api.clone(), &[]);
+        let input = json!({"action": "fetch_messages", "channel_id": "7"});
+        let ctx = ctx_for(None, &[], Some(7));
+        for _ in 0..2 {
+            let out = tool.call(input.clone(), &ctx).await.unwrap();
+            assert_eq!(json_of(&out)["messages"][0]["author"], "User1");
+        }
+        // 429 は覚えずに打ち切るだけなので、呼び出しごとに 1 回ずつ試す
+        let expected = if status == 429 { 2 } else { 1 };
+        assert_eq!(member_gets(&api, ALICE), expected, "status {status}");
+    }
+}
+
+#[tokio::test]
+async fn members_outside_allowed_users_are_never_looked_up() {
+    let api = FakeApi::with(vec![
+        ("/channels/7", Ok(in_guild_channel(7))),
+        (
+            "/channels/7/messages",
+            Ok(json!([message(12, STRANGER, false, "x")])),
+        ),
+    ]);
+    let tool = tool_with(api.clone(), &[]);
+    let ctx = ctx_for(None, &[], Some(7));
+    let input = json!({"action": "fetch_messages", "channel_id": "7"});
+    json_of(&tool.call(input, &ctx).await.unwrap());
+    assert_eq!(member_gets(&api, STRANGER), 0);
+}
+
+#[tokio::test]
+async fn mention_replacement_uses_the_looked_up_nick() {
+    let mut m = message(11, ALICE, false, &format!("<@{ALICE}> こんにちは"));
+    m["mentions"] = json!([{"id": ALICE.to_string(), "username": "a", "global_name": "Alice"}]);
+    let api = FakeApi::with(vec![
+        ("/channels/7", Ok(in_guild_channel(7))),
+        ("/channels/7/messages", Ok(json!([m]))),
+        (
+            "/guilds/100/members/1",
+            Ok(json!({"roles": [], "nick": "さd"})),
+        ),
+    ]);
+    let tool = tool_with(api, &[]);
+    let v = json_of(
+        &run(
+            &tool,
+            json!({"action": "fetch_messages", "channel_id": "7"}),
+        )
+        .await,
+    );
+    assert_eq!(v["messages"][0]["content"], "さd（Alice） こんにちは");
+}
+
+#[tokio::test]
 async fn fetch_limit_is_clamped_and_anchor_is_exclusive() {
     let api = FakeApi::with(vec![
         ("/channels/7", Ok(in_guild_channel(7))),
@@ -900,7 +1025,7 @@ async fn author_prefers_guild_nick() {
         )
         .await,
     );
-    assert_eq!(v["messages"][0]["author"], "あるす");
+    assert_eq!(v["messages"][0]["author"], "あるす（User1）");
 }
 
 #[tokio::test]

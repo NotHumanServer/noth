@@ -24,6 +24,7 @@ mod format;
 mod manifest;
 mod search;
 
+use access::NickLookup;
 use access::{READ_MESSAGES, VIEW_CHANNEL};
 use api::{ApiError, DiscordApi, RestApi, describe_error};
 use args::{clamp_limit, id_arg, require_id};
@@ -82,6 +83,9 @@ struct Me {
     name: String,
 }
 
+/// 取得時刻、ロール、サーバーでのニックネーム
+type MemberEntry = (Instant, Vec<u64>, Option<String>);
+
 struct DiscordTool {
     api: Arc<dyn DiscordApi>,
     guild_id: u64,
@@ -92,7 +96,8 @@ struct DiscordTool {
     /// 権限の計算に使う情報の短期キャッシュ。ロールやオーバーライトの変更が数十秒遅れて反映される
     channels: Mutex<HashMap<u64, (Instant, Value)>>,
     guild: Mutex<Option<(Instant, Arc<access::GuildPerms>)>>,
-    members: Mutex<HashMap<u64, (Instant, Vec<u64>)>>,
+    members: Mutex<HashMap<u64, MemberEntry>>,
+    nicks: Mutex<HashMap<u64, (Instant, Option<String>)>>,
 }
 
 impl DiscordTool {
@@ -107,6 +112,7 @@ impl DiscordTool {
             channels: Mutex::default(),
             guild: Mutex::new(None),
             members: Mutex::default(),
+            nicks: Mutex::default(),
         }
     }
 
@@ -166,6 +172,44 @@ impl DiscordTool {
         }
     }
 
+    /// 発言者とメンションの相手のうち `member` が付いていない allowed_users のニックネームを引く
+    async fn with_nicks<'a>(&self, mut viewer: Viewer<'a>, msgs: &[Value]) -> Viewer<'a> {
+        let mut wanted: HashSet<u64> = HashSet::new();
+        for m in msgs {
+            let users = std::iter::once(m.get("author")).chain(
+                m.get("mentions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(Some),
+            );
+            for u in users.flatten() {
+                let has_nick = u.get("member").is_some_and(|mem| {
+                    mem.get("nick")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| !n.is_empty())
+                });
+                if let Some(id) = u.get("id").and_then(id_of)
+                    && !has_nick
+                    && self.allowed.contains(&id)
+                {
+                    wanted.insert(id);
+                }
+            }
+        }
+        for id in wanted {
+            match self.member_nick(id).await {
+                NickLookup::Found(nick) => {
+                    viewer.nicks.insert(id, nick);
+                }
+                NickLookup::Missing => {}
+                // 残りを叩き続けると制限が長引くので、取れた分とグローバル名で返す
+                NickLookup::RateLimited => break,
+            }
+        }
+        viewer
+    }
+
     async fn viewer<'a>(&'a self, action: &str) -> std::result::Result<Viewer<'a>, String> {
         let me = self.me(action).await?;
         Ok(Viewer {
@@ -173,6 +217,7 @@ impl DiscordTool {
             self_name: &me.name,
             allowed: &self.allowed,
             tz: &self.tz,
+            nicks: HashMap::new(),
         })
     }
 
@@ -338,6 +383,7 @@ impl DiscordTool {
                 )
                 .await?;
             let viewer = self.viewer(ACTION).await?;
+            let viewer = self.with_nicks(viewer, std::slice::from_ref(&raw)).await;
             let messages = vec![message_summary(&raw, &viewer, CONTENT_MAX_CHARS)];
             return Ok(listing("messages", messages, 0));
         }
@@ -345,6 +391,9 @@ impl DiscordTool {
             .get(ACTION, &format!("/channels/{channel_id}/messages"), &query)
             .await?;
         let viewer = self.viewer(ACTION).await?;
+        let viewer = self
+            .with_nicks(viewer, raw.as_array().map_or(&[][..], Vec::as_slice))
+            .await;
         // Discord は新しい順で返す。読みやすいよう古い順に直す
         let messages: Vec<Value> = raw
             .as_array()
@@ -395,6 +444,8 @@ impl DiscordTool {
             _ => Vec::new(),
         };
         let viewer = self.viewer(ACTION).await?;
+        let pinned: Vec<Value> = items.iter().map(|m| (*m).clone()).collect();
+        let viewer = self.with_nicks(viewer, &pinned).await;
         let messages: Vec<Value> = items
             .into_iter()
             .map(|m| message_summary(m, &viewer, PIN_CONTENT_MAX_CHARS))

@@ -14,6 +14,8 @@ pub(crate) struct Viewer<'a> {
     pub(crate) self_name: &'a str,
     pub(crate) allowed: &'a HashSet<u64>,
     pub(crate) tz: &'a TimeZone,
+    /// REST の応答に `member` が無いときの補い。サーバーでのニックネーム
+    pub(crate) nicks: HashMap<u64, String>,
 }
 
 pub(crate) fn id_of(v: &Value) -> Option<u64> {
@@ -32,13 +34,21 @@ pub(crate) fn user_name(user: &Value) -> String {
         .to_string()
 }
 
-/// channel-discord が author_name に保存する名前と揃える(サーバーでの表示名 → グローバル名 → username)
-fn display_name(user: &Value, member: Option<&Value>) -> String {
-    member
+/// サーバーでのニックネームとグローバル名の両方を示す。Noth が普段使う呼び名(ニックネーム)と、
+/// アカウント本来の名前の両方で人を指せるようにするため。同じ、または片方だけなら 1 つ
+fn display_name(user: &Value, member: Option<&Value>, nicks: &HashMap<u64, String>) -> String {
+    let nick = member
         .and_then(|m| m.get("nick"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map_or_else(|| user_name(user), str::to_string)
+        .map(str::to_string)
+        .or_else(|| nicks.get(&user.get("id").and_then(id_of)?).cloned());
+    let global = user_name(user);
+    match nick {
+        Some(n) if global.is_empty() || n == global => n,
+        Some(n) => format!("{n}（{global}）"),
+        None => global,
+    }
 }
 
 pub(crate) fn format_time(ts: Timestamp, tz: &TimeZone) -> String {
@@ -152,7 +162,7 @@ pub(crate) fn message_summary(msg: &Value, viewer: &Viewer, content_max: usize) 
         .filter_map(|u| {
             Some((
                 u.get("id").and_then(id_of)?,
-                display_name(u, u.get("member")),
+                display_name(u, u.get("member"), &viewer.nicks),
             ))
         })
         .collect();
@@ -166,7 +176,7 @@ pub(crate) fn message_summary(msg: &Value, viewer: &Viewer, content_max: usize) 
     );
     let mut out = json!({
         "id": id,
-        "author": display_name(author, msg.get("member")),
+        "author": display_name(author, msg.get("member"), &viewer.nicks),
         "at": at,
         "content": content,
     });
