@@ -15,7 +15,7 @@ Noth はサーバーの全チャンネルを常時観測し、「同じ空間に
 
 | # | コンポーネント | 担当 module | 役割 |
 |---|---|---|---|
-| ① | Ingest & Debouncer | `channel-discord` + Core | `allowed_users` の発言を受信して SQLite に保存し、チャンネル単位でデバウンスしてから actor のキューに積む。Noth 以外の Bot の発言は本文を入れない目印だけを残す(§4.4) |
+| ① | Ingest & Debouncer | `channel-discord` + Core | `allowed_users` の発言を受信して SQLite に保存し、チャンネル単位でデバウンスしてから actor のキューに積む。Noth 以外の Bot の発言は本文を入れない目印だけを残す(§4.4)。除外したチャンネル(カテゴリ配下とスレッドを含む。§6)の発言は、Noth 自身と Bot の目印も含めて取り込まない |
 | ② | Gatekeeper & Attention Router(System One) | `router-*` | 文字列を生成せず、確率付きの構造化判定を1クエリで並列に返す。発言の性質(宛先、外部作業の要否、訂正、補足の価値)、ノイズ判定、話題の区切り、過去チャンクの関連度選択、Worker 合流判定。動き方は Core が決める(§4.3) |
 | ③ | Main Profile Engine(main) | `provider-*` + Core | サーバーの仲間としての対話生成と、自律タスクの起動宣言(Ack)。tool 定義は受け取るが **実行は常に Worker** |
 | ④ | Ephemeral Task Worker(作業用 LLM) | `worker` + `tool-*` | main から Fork した使い捨てのワーカー。tool を使って調査・作業し、完了後に結論メモだけを main に返して終了する |
@@ -452,8 +452,11 @@ Noth の話をしているが返事を求められていない発言に、絵文
 | `heartbeat` | 常駐プロセスの最終更新時刻と接続状態。`noth status` がプロセス外から読む |
 | `memory_versions` | MEMORY.md を書き換える前の版。書き換えた理由(`memo` / `dreaming`)と時刻 |
 | `dreams` | Dreaming の対象日、状態(finished / failed / skipped)、日次レポートのパス、開始・終了時刻、失敗理由 |
+| `ignored_channels` | `/noth ignore add` で除外したチャンネルまたはカテゴリの ID、実行した人、時刻。config の `ignored_channels` は保存しない |
 
 `allowed_users` 以外のユーザーの発言は Channel で捨てるため、どのテーブルにも入りません。Noth 以外の Bot の発言は本文を保存せず、`messages` に目印だけを `is_bot_marker` 付きで入れます(§4.4)。`search_messages` の対象にはしません。
+
+除外したチャンネル(config の `ignored_channels` と `/noth ignore` の和集合。カテゴリを指定すると配下のチャンネルも、チャンネルを指定するとそのスレッドも含む)の発言は、Channel で捨てるため、`messages` にも Layer 3 にも入りません。除外する前に記録済みの発言は消さず(Layer 3 は追記だけ)、`search_messages` が結果から外します。再起動時の復元(§6.1)は DB の行から Judge を作るので、除外の前に記録された未判定の発言は復元で判定に回り得ます。
 
 ### 6.1 再起動時の復元
 

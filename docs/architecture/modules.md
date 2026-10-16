@@ -12,7 +12,7 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 
 | 種別 | module | 内容 |
 |---|---|---|
-| channel | `channel-discord` | Discord への接続、発言の受信とデバウンス、Bot からの投稿。Noth 以外の Bot(`author.bot`。webhook は除く)の発言は本文を入れない目印だけを流す。`command-*` module があれば、guild コマンド `/noth` を登録して受け付ける(master だけ。§3) |
+| channel | `channel-discord` | Discord への接続、発言の受信とデバウンス、Bot からの投稿。Noth 以外の Bot(`author.bot`。webhook は除く)の発言は本文を入れない目印だけを流す。`command-*` module があれば、guild コマンド `/noth` を登録して受け付ける(master だけ。§3)。チャンネルの除外(`[channel.discord] ignored_channels` と `/noth ignore add|remove|list`。カテゴリ配下とスレッドを含む)を持ち、除外したチャンネルの発言は取り込まない。除外の状態は Core の `ChannelExclusions` で、`tool-discord` と共有する([security.md §2](security.md#2-discord-側の対策)) |
 | router | `router-systemone` | System One API(Jev / Clef)で発言の性質(宛先 `addressee`、外部作業の要否、訂正、補足の価値)・ノイズ判定・話題区切り・合流判定を行う。動き方は Core が決める |
 | router | `router-mention` | ルールベース。メンション・リプライ・キーワード一致時のみ `addressee = noth_request`、他は `other`。外部作業・訂正・補足の問いは常に 0.0(Worker は起動しない)。話題区切りは「前の発言から一定時間空いた、またはチャンネルが変わった」で判定する。System One を契約していなくても起動でき、テストにも使う |
 | provider | `provider-openai` | OpenAI Chat Completions 形式。Responses 形式も同 module 内で選べる |
@@ -43,7 +43,7 @@ router と provider は **有効なものがちょうど1つ** でなければ�
 
 tool module は `worker` が有効なときだけ意味を持ちます。`worker` 無効で tool が有効な構成は `noth doctor` が警告します。
 
-command module は管理者向けの操作で、Discord などの Channel が受け付けます。コマンドを実行できるのは `[channel.discord] master` に書いた 1 人だけで、結果は実行した本人にだけ見えます(Channel 側の振る舞いは [discord-setup.md §2.6](../discord-setup.md#26-管理コマンド-noth-context-を使う)、trait は [traits.md §7](traits.md#7-command))。`master` が未設定なら、`command-context` が有効でもコマンドは登録されず、誰にも使えません。コマンドに対応しない Channel では何も起きません。`channel-discord` は起動のたびに guild コマンドを丸ごと置き換える（コマンドが 0 件でも空にする）ので、`command-context` を無効にした再起動で `/noth` も消えます。`/noth` は guild の全員に見えますが（`default_member_permissions` は設定しない）、master 以外が選んでも本人にだけ断りが返ります。
+command module は管理者向けの操作で、Discord などの Channel が受け付けます。コマンドを実行できるのは `[channel.discord] master` に書いた 1 人だけで、結果は実行した本人にだけ見えます(Channel 側の振る舞いは [discord-setup.md §2.6](../discord-setup.md#26-管理コマンド-noth-context-を使う)、trait は [traits.md §7](traits.md#7-command))。`master` が未設定なら、`command-context` が有効でもコマンドは登録されず、誰にも使えません。コマンドに対応しない Channel では何も起きません。`channel-discord` は起動のたびに guild コマンドを丸ごと置き換える（コマンドが 0 件でも空にする）ので、`master` を消した再起動で `/noth` も消えます。`/noth ignore`(チャンネルの除外。[discord-setup.md §2.7](../discord-setup.md#27-チャンネルを除外する-noth-ignore))は `Command` ではなく `channel-discord` が直接受け持つ組み込みの操作で、引数(チャンネル)を取って状態を書き換えるためです。`master` があれば、`command-*` module が 1 つも無くても登録されます。`/noth` は guild の全員に見えますが（`default_member_permissions` は設定しない）、master 以外が選んでも本人にだけ断りが返ります。
 
 ## 4. 共有クレート(module ではない)
 

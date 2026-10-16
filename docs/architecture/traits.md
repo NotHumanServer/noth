@@ -33,6 +33,8 @@ pub trait Channel: Send + Sync {
     async fn edit(&self, channel_id: ChannelId, message_id: MessageId, text: &str) -> Result<()>;
     /// 管理コマンドを受け付ける Channel だけが実装する。`run` の前に 1 回呼ばれる。既定は何もしない
     fn set_commands(&self, host: Arc<CommandHost>) {}
+    /// 除外するチャンネルを管理する Channel だけが返す。`noth run` が起動時に DB の保存分を読み込ませ、tool と共有する。既定は None
+    fn exclusions(&self) -> Option<ChannelExclusions> { None }
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
     /// `noth doctor` の疎通確認。成功時は表示用の短い説明を返す
@@ -124,6 +126,8 @@ pub struct ToolSpec { pub name: String, pub description: String, pub input_schem
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn call(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput>;
+    /// 除外したチャンネルを参照させない tool だけが実装する。`noth run` が起動時に 1 回呼ぶ。既定は何もしない
+    fn set_exclusions(&self, exclusions: ChannelExclusions) {}
 }
 ```
 
@@ -145,6 +149,8 @@ pub struct HistoryQuery {
     pub author: Option<String>,
     pub since: Option<Timestamp>,
     pub until: Option<Timestamp>,
+    /// 除外したチャンネルの ID。除外を外す側(カテゴリ配下・スレッド)は Store から分からないので、tool が行ごとに確かめる
+    pub exclude_channels: Vec<ChannelId>,
     pub limit: usize,
 }
 

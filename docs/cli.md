@@ -210,6 +210,7 @@ guild_id      = "123456789012345678"
 token         = "${DISCORD_BOT_TOKEN}"
 allowed_users = ["111111111111111111", "222222222222222222"]
 master        = "111111111111111111"  # 管理コマンド(/noth ...)を使える唯一のユーザー ID。省略するとコマンドは誰にも使えない
+ignored_channels = ["333333333333333333"]  # Noth が完全に無視するチャンネルまたはカテゴリの ID。省略可。コマンドでは外せない
 debounce_secs = 2.0
 
 [router]
@@ -363,6 +364,14 @@ api_key = "${TINYFISH_API_KEY}"
 - `allowed_users` とは独立している。`master` が `allowed_users` に入っていなくてもコマンドは使えるが、その人の発言は Noth には届かない
 - `master` 以外が実行しても、本人にだけ「権限がありません」と返り、結果は誰にも見えない
 - 変更はプロセスの再起動で反映される(起動時にコマンドの登録を同期する)
+
+`[channel.discord] ignored_channels` は、Noth が完全に無視するチャンネルの ID の配列です。動作の全体は [architecture/security.md §2](architecture/security.md#2-discord-側の対策) と [context-layers.md §6](context-layers.md#6-sqlite-に持つデータ)、使い方は [discord-setup.md §2.7](discord-setup.md#27-チャンネルを除外する-noth-ignore) にあります。
+
+- チャンネルの ID か、カテゴリの ID を書く(`allowed_users` と同じく文字列)。カテゴリを書くと、その下のチャンネルもまとめて除外する。除外したチャンネルのスレッドも除外する
+- 省略すると、config 由来の除外は無い
+- `master` が Discord で `/noth ignore add` した除外は SQLite(`ignored_channels` テーブル)に保存し、再起動しても残る。実効の除外は、config とコマンドの和集合
+- config に書いた除外は、コマンドでは外せない。外すときは config から消して再起動する
+- config の変更は再起動で反映される。コマンドでの追加・削除は、再起動なしで次の発言から効く
 
 ### 4.3 `.env`
 
