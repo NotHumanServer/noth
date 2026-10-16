@@ -165,7 +165,11 @@ impl DiscordTool {
         self.exclusions.get().filter(|e| !e.is_empty())
     }
 
-    /// ID だけで分かる除外(チャンネルそのもの、またはカテゴリとして指定されたもの)
+    pub(crate) fn exclusions_active(&self) -> bool {
+        self.active_exclusions().is_some()
+    }
+
+    /// ID だけで分かる除外(指定そのもの、または展開済みの配下)
     pub(crate) fn is_excluded_id(&self, channel_id: u64) -> bool {
         self.active_exclusions()
             .is_some_and(|e| e.is_excluded(&[channel_id]))

@@ -235,7 +235,7 @@ impl DiscordTool {
             .as_ref()
             .ok_or("発言の検索窓口がありません(Worker から呼ばれていません)")?;
         let mut q = search::build_query(input, self.guild_id, &self.tz, ctx.audience.channel_id)?;
-        // カテゴリやスレッド経由の除外は行ごとの verdict で落とすが、先に外さないと除外側の行で件数の枠が埋まる
+        // 行ごとの判定だけだと、除外側の行が 1 ページを埋めて読める行が件数に届かない。展開済みの ID は先に SQL で外す
         q.exclude_channels = self.excluded_ids();
         let found = self
             .search_readable(history.as_ref(), q, &ctx.audience)
@@ -343,7 +343,9 @@ impl DiscordTool {
         if self.is_excluded_id(channel_id) {
             return Verdict::Denied;
         }
-        if audience.channel_id == Some(channel_id) {
+        // トリガーのチャンネルでも、展開に入っていない新しいスレッドは親を確かめるまで除外かどうか分からない。
+        // 除外が無いときだけ、取得を省ける
+        if audience.channel_id == Some(channel_id) && !self.exclusions_active() {
             return Verdict::Readable;
         }
         let ch = match self.channel_fetch(channel_id).await {
@@ -355,6 +357,9 @@ impl DiscordTool {
             Exclusion::Excluded => return Verdict::Denied,
             Exclusion::Unknown => return Verdict::Unverifiable,
             Exclusion::Clear => {}
+        }
+        if audience.channel_id == Some(channel_id) {
+            return Verdict::Readable;
         }
         match self.can_read(action, &ch, audience).await {
             Ok(true) => Verdict::Readable,
@@ -497,7 +502,7 @@ impl DiscordTool {
             (trigger.is_some() && c.get("id").and_then(id_of) == trigger)
                 || readers.as_ref().is_some_and(|r| r.can(c, need))
         };
-        // 除外したチャンネルは存在しないものとして載せない。カテゴリを除外すれば配下も外れる
+        // Noth にとって存在しないチャンネルなので、一覧の名前からも手がかりを与えない
         let all: Vec<Value> = raw
             .as_array()
             .into_iter()

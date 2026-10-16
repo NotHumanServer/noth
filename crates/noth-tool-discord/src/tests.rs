@@ -2306,4 +2306,108 @@ mod exclusion {
             assert!(!text.contains(hidden), "{text}");
         }
     }
+
+    /// トリガーのチャンネルを持つ検索。`scope: guild` でトリガー以外の行も対象にする
+    async fn search_guild_from(
+        tool: &DiscordTool,
+        history: Arc<Store>,
+        trigger: u64,
+    ) -> Vec<String> {
+        let out = tool
+            .call(
+                json!({"action": "search_messages", "scope": "guild"}),
+                &ctx_for(Some(history), &[ALICE], Some(trigger)),
+            )
+            .await
+            .unwrap();
+        json_of(&out)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["channel_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_trigger_channel_is_denied_when_it_sits_under_an_excluded_category() {
+        let history = seeded_history().await;
+        let plan = 111_111_111_111_111_111u64;
+        let api = api_with(vec![(
+            format!("/channels/{plan}"),
+            Ok(child(plan, 0, CATEGORY)),
+        )]);
+        let (tool, _) = tool_excluding(api, &[CATEGORY]);
+
+        // トリガー自身が除外カテゴリの配下なら、トリガーだからといって読めるとはしない
+        let out = tool
+            .call(
+                json!({"action": "fetch_messages", "channel_id": plan.to_string()}),
+                &ctx_for(None, &[ALICE], Some(plan)),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error && out.text == access::DENIED, "{}", out.text);
+        let channels = search_guild_from(&tool, history, plan).await;
+        assert_eq!(channels, ["222222222222222222"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_thread_not_in_the_expansion_is_still_denied_as_the_trigger() {
+        let (tool, _) = tool_excluding(api_with(vec![]), &[CATEGORY]);
+        // 展開に載る前のスレッド(52)。親 51 のカテゴリ 50 が除外されている
+        let out = tool
+            .call(
+                json!({"action": "fetch_messages"}),
+                &ctx_for(None, &[ALICE], Some(THREAD)),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error && out.text == access::DENIED, "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn excluded_rows_do_not_crowd_out_readable_rows_in_search() {
+        let store = Store::open_memory().await.unwrap();
+        let plan = 111_111_111_111_111_111u64;
+        let chat = 222_222_222_222_222_222u64;
+        store
+            .insert_message(&incoming(
+                1,
+                (plan, "noth開発計画"),
+                "Alice",
+                "古い読める発言",
+                1_000,
+            ))
+            .await
+            .unwrap();
+        // 新しい側に、除外するチャンネルの発言を検索の最大ページ数ぶんより多く積む
+        let rows = SEARCH_PAGE_SIZE * SEARCH_MAX_PAGES + 50;
+        for i in 0..rows {
+            store
+                .insert_message(&incoming(
+                    10 + i as u64,
+                    (chat, "雑談"),
+                    "Alice",
+                    "除外側",
+                    2_000 + i as i64,
+                ))
+                .await
+                .unwrap();
+        }
+        let history = Arc::new(store);
+        let (tool, ex) = tool_excluding(api_with(vec![]), &[]);
+        // 展開済みの ID は SQL で外れるので、1 ページ目に読める行が届く
+        ex.set_expanded([chat]).await;
+        let out = tool
+            .call(
+                json!({"action": "search_messages", "scope": "guild"}),
+                &ctx(Some(history.clone())),
+            )
+            .await
+            .unwrap();
+        let v = json_of(&out);
+        assert_eq!(v["messages"][0]["content"], "古い読める発言");
+        assert_eq!(v["count"], 1);
+        assert!(v.get("truncated").is_none() && v.get("skipped_unverifiable").is_none());
+    }
 }
