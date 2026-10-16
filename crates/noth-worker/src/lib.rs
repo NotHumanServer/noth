@@ -8,7 +8,6 @@ use noth_core::traits::{Provider, Tool, Worker, WorkerOutcome, WorkerProgress, W
 use noth_core::types::*;
 use noth_core::{Error, Result};
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
 
 pub fn register(reg: &mut Registry) {
     reg.register_worker(factory);
@@ -52,17 +51,20 @@ impl AgentWorker {
         }
     }
 
-    async fn run_call(
-        &self,
-        call: &ToolCall,
-        tctx: &ToolContext,
-        progress: Option<&UnboundedSender<WorkerProgress>>,
-    ) -> ToolResult {
-        if let Some(tx) = progress {
-            let _ = tx.send(WorkerProgress {
+    async fn run_call(&self, call: &ToolCall, tctx: &ToolContext, task: &WorkerTask) -> ToolResult {
+        let step = WorkerProgress {
+            tool: call.name.clone(),
+            summary: progress_summary(&call.name, &call.input),
+        };
+        task.tool_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(WorkerProgress {
                 tool: call.name.clone(),
-                summary: progress_summary(&call.name, &call.input),
+                summary: log_summary(&call.name, &call.input),
             });
+        if let Some(tx) = &task.progress {
+            let _ = tx.send(step);
         }
         let (output, is_error) = match self.execute(call, tctx).await {
             Ok(o) => (o.text, o.is_error),
@@ -104,22 +106,88 @@ fn is_secret_name(name: &str) -> bool {
     SECRET_WORDS.iter().any(|w| lower.contains(w))
 }
 
-/// 進捗は Discord に出るため、コマンドラインに混ざった秘密らしき値は伏せる
+const SECRET_FLAGS: &[&str] = &["-u", "--user", "--proxy-user"];
+/// `-u` は sort や cut では別の意味なので、認証の引数として使う実行ファイルだけで秘密として扱う
+const AUTH_FLAG_COMMANDS: &[&str] = &["curl", "wget", "http"];
+
+fn unquote(word: &str) -> &str {
+    word.trim_matches(|c| matches!(c, '"' | '\'' | ',' | '{' | '}'))
+}
+
+/// URL から `user:pass@`、`?` 以降、`#` 以降を落とす。クエリやフラグメントにトークンが載ることがあるため
+fn strip_url_secrets(url: &str) -> String {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    let url = &url[..end];
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{scheme}://{host}{path}")
+}
+
+/// 進捗は Discord に、tool_log は DB に残るため、コマンドラインに混ざった秘密らしき値は伏せる
 fn mask_secrets(line: &str) -> String {
     let mut mask_next = false;
+    let exe = line
+        .split_whitespace()
+        .find(|w| !w.contains('='))
+        .map(|w| w.rsplit('/').next().unwrap_or(w))
+        .unwrap_or("");
+    let auth_flags = AUTH_FLAG_COMMANDS.contains(&exe);
     line.split_whitespace()
+        .map(|word| {
+            if std::mem::take(&mut mask_next) {
+                // `Authorization: Bearer <token>` は、Bearer の次が token
+                mask_next = matches!(
+                    unquote(word).to_lowercase().as_str(),
+                    "bearer" | "basic" | "token"
+                );
+                return "***".to_string();
+            }
+            if word.contains("://") {
+                return strip_url_secrets(word);
+            }
+            if auth_flags && SECRET_FLAGS.contains(&word) {
+                mask_next = true;
+                return word.to_string();
+            }
+            if let Some(at) = word.find(['=', ':']) {
+                let (name, rest) = word.split_at(at);
+                if is_secret_name(unquote(name)) {
+                    if rest.len() == 1 {
+                        mask_next = true;
+                        return word.to_string();
+                    }
+                    return format!("{name}{}***", &rest[..1]);
+                }
+            } else if word.starts_with('-') && is_secret_name(word.trim_start_matches('-')) {
+                mask_next = true;
+            }
+            word.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 文章に近い入力(検索語、goal)向け。`key` や `author` を含む普通の単語まで伏せないよう、
+/// `name=value` の形と `Bearer <token>` だけを見る
+fn mask_assignments(text: &str) -> String {
+    let mut mask_next = false;
+    text.split_whitespace()
         .map(|word| {
             if std::mem::take(&mut mask_next) {
                 return "***".to_string();
             }
-            if let Some((name, _)) = word.split_once('=') {
-                if is_secret_name(name) {
-                    return format!("{name}=***");
-                }
-            } else if is_secret_name(word.trim_start_matches('-')) {
+            if unquote(word).eq_ignore_ascii_case("bearer") {
                 mask_next = true;
             }
-            word.to_string()
+            match word.split_once('=') {
+                Some((name, value)) if !value.is_empty() && is_secret_name(unquote(name)) => {
+                    format!("{name}=***")
+                }
+                _ => word.to_string(),
+            }
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -192,6 +260,68 @@ fn progress_summary(tool: &str, input: &Value) -> String {
         _ => String::new(),
     };
     ellipsize(&summary, SUMMARY_MAX_CHARS)
+}
+
+const LOG_TEXT_CHARS: usize = 40;
+
+/// tool_log 用。進捗より控えめに、URL のクエリや shell の引数など秘密になりうる部分を残さない
+fn log_summary(tool: &str, input: &Value) -> String {
+    let short = |s: &str| {
+        ellipsize(
+            &mask_assignments(s.lines().next().unwrap_or("")),
+            LOG_TEXT_CHARS,
+        )
+    };
+    match tool {
+        "web_search" => str_field(input, "query")
+            .map(|q| format!("「{}」", short(q.trim())))
+            .unwrap_or_default(),
+        "web_fetch" => {
+            let urls = input.get("urls").and_then(Value::as_array);
+            match urls.and_then(|u| u.first()).and_then(Value::as_str) {
+                Some(first) => {
+                    let first = strip_url_secrets(first);
+                    match urls.map_or(0, |u| u.len()) {
+                        1 => first,
+                        n => format!("{first} ほか {} 件", n - 1),
+                    }
+                }
+                None => String::new(),
+            }
+        }
+        "web_agent" => format!(
+            "{} : {}",
+            strip_url_secrets(str_field(input, "url").unwrap_or("")),
+            short(str_field(input, "goal").unwrap_or(""))
+        ),
+        "discord" => {
+            let action = str_field(input, "action").unwrap_or("");
+            let id = ["channel_id", "user_id"]
+                .iter()
+                .find_map(|k| match input.get(*k)? {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                });
+            let query = str_field(input, "query").map(short);
+            match (query, id) {
+                (Some(q), _) => format!("{action}「{q}」"),
+                (None, Some(id)) => format!("{action} {id}"),
+                (None, None) => action.to_string(),
+            }
+        }
+        "shell" => {
+            let mut words = str_field(input, "command")
+                .and_then(|c| c.lines().next())
+                .unwrap_or("")
+                .split_whitespace()
+                .filter(|w| !w.contains('='));
+            let exe = words.next().unwrap_or("");
+            let exe = exe.rsplit('/').next().unwrap_or(exe);
+            format!("{exe} (引数 {} 個)", words.count())
+        }
+        _ => String::new(),
+    }
 }
 
 fn truncate(text: String, max_chars: usize) -> String {
@@ -393,7 +523,7 @@ impl Worker for AgentWorker {
             let mut results = Vec::with_capacity(completion.tool_calls.len());
             for call in &completion.tool_calls {
                 tracing::info!(run_id = %task.run_id, iteration, tool = %call.name, "worker: tool を実行");
-                results.push(self.run_call(call, &tctx, task.progress.as_ref()).await);
+                results.push(self.run_call(call, &tctx, &task).await);
             }
             prompt.tool_exchange.push(ExchangeItem::Assistant {
                 text: completion.text,
@@ -537,6 +667,7 @@ mod tests {
             progress: None,
             history: None,
             audience: Default::default(),
+            tool_log: Default::default(),
         }
     }
 
@@ -904,6 +1035,90 @@ mod tests {
             ("shell", "`ls`")
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn mask_secrets_hides_headers_basic_auth_and_url_secrets() {
+        let m = mask_secrets;
+        let s = m("curl -H \"Authorization: Bearer abc123\" https://h/x");
+        assert!(!s.contains("abc123"), "{s}");
+        assert!(!m("curl -u alice:s3cret https://h").contains("s3cret"));
+        assert!(!m("curl --user alice:s3cret https://h").contains("s3cret"));
+        assert!(!m("run token=abc key=def password=ghi").contains("abc"));
+        assert!(!m("run token=abc key=def password=ghi").contains("ghi"));
+        assert!(!m("echo {\"token\":\"abc999\"}").contains("abc999"));
+        let s = m("curl https://u:pw99@h.example/p?api=zzz#frag");
+        assert_eq!(s, "curl https://h.example/p");
+        assert_eq!(m("ls -la /tmp"), "ls -la /tmp");
+    }
+
+    #[test]
+    fn ordinary_words_are_not_masked() {
+        assert_eq!(mask_secrets("sort -u names.txt"), "sort -u names.txt");
+        assert_eq!(
+            mask_secrets("OpenAI API key pricing"),
+            "OpenAI API key pricing"
+        );
+        assert_eq!(
+            mask_secrets("echo author of the book"),
+            "echo author of the book"
+        );
+        assert_eq!(
+            mask_assignments("OpenAI API key pricing"),
+            "OpenAI API key pricing"
+        );
+        assert_eq!(mask_assignments("author of the book"), "author of the book");
+        assert_eq!(
+            mask_assignments("token=abc Bearer xyz9 limit"),
+            "token=*** Bearer *** limit"
+        );
+        let s = log_summary("web_search", &json!({"query": "OpenAI API key pricing"}));
+        assert_eq!(s, "「OpenAI API key pricing」");
+        assert!(mask_secrets("curl -u a:b https://h").contains("-u ***"));
+        assert!(mask_secrets("/usr/bin/curl -u a:b https://h").contains("-u ***"));
+    }
+
+    #[test]
+    fn log_summaries_drop_secrets() {
+        assert_eq!(
+            log_summary(
+                "web_fetch",
+                &json!({"urls": ["https://u:p@a.example/x?token=zzz#f", "https://b"]})
+            ),
+            "https://a.example/x ほか 1 件"
+        );
+        assert_eq!(
+            log_summary(
+                "shell",
+                &json!({"command": "API_KEY=sk-1 curl -H 'X: y' https://a.example/?k=1"})
+            ),
+            "curl (引数 3 個)"
+        );
+        let long = format!("token=abc {}", "あ".repeat(100));
+        let s = log_summary("web_agent", &json!({"url": "https://a/?k=1", "goal": long}));
+        assert!(s.starts_with("https://a/ : token=***"), "{s}");
+        assert!(s.chars().count() < 80);
+        let s = log_summary(
+            "discord",
+            &json!({"action": "search_messages", "query": format!("password=hunter2 {}", "あ".repeat(100))}),
+        );
+        assert!(!s.contains("hunter2"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn tool_log_is_filled_without_a_progress_channel() {
+        let p = MockProvider::new(vec![call("web_search"), text("メモ")]);
+        let w = worker(
+            p,
+            vec![tool("web_search", Ok("r".into()))],
+            settings(3, 100),
+        );
+        let t = task(Origin::Supplement);
+        let log = t.tool_log.clone();
+        w.run(t).await;
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].tool, "web_search");
     }
 
     #[tokio::test]

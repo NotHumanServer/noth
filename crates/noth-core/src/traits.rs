@@ -194,6 +194,9 @@ pub struct WorkerProgress {
     pub summary: String,
 }
 
+/// Worker が呼んだ tool の要約を呼んだ順に積む。timeout で Worker が打ち切られても、そこまでの分を Core が読める
+pub type ToolLog = std::sync::Arc<std::sync::Mutex<Vec<WorkerProgress>>>;
+
 /// Fork 時に Core が渡す。`base` は main の Layer 0〜3 と tool 定義をそのまま複製したもの
 #[derive(Debug, Clone)]
 pub struct WorkerTask {
@@ -208,6 +211,8 @@ pub struct WorkerTask {
     pub history: Option<std::sync::Arc<dyn crate::history::MessageHistory>>,
     /// tool の `ToolContext::audience` にそのまま渡す
     pub audience: Audience,
+    /// 呼んだ tool の要約を積む。`progress` と違い、進捗を出さない run でも積む
+    pub tool_log: ToolLog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

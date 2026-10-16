@@ -9,6 +9,7 @@ use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 
 use crate::history::{HistoryQuery, MessageHistory};
+use crate::traits::WorkerProgress;
 use crate::types::*;
 use crate::{Error, Result};
 
@@ -177,6 +178,50 @@ pub struct NewWorkerRun {
 const MESSAGE_COLUMNS: &str = "id, guild_id, channel_id, channel_name, message_id, user_id, author_name, is_self, mentions_self, reply_to_self, reply_to_message_id, reply_to_author, reply_to_is_self, reply_to_excerpt, content, created_at, chunk_id, is_noise, decision_id, promoted_turn_id, is_bot_marker, bot_marker_chars";
 const CHUNK_COLUMNS: &str = "id, guild_id, channel_id, started_at, ended_at, compacted";
 const RUN_COLUMNS: &str = "run_id, status, origin, goal, started_at, finished_at, channel_id, chunk_id, trigger_message_id, fork_message_id, conclusion, delivery_style";
+
+const TOOL_LOG_MAX_CHARS: usize = 4000;
+const TOOL_LOG_NAME_CHARS: usize = 40;
+const TOOL_LOG_SUMMARY_CHARS: usize = 200;
+
+/// `[{"tool":…,"summary":…}, …]` にする。`max_chars` を超えるときは古い呼び出しから落とす。
+/// 根拠として効くのは最後の検索や取得なので、新しい方を残す。
+/// 秘密を伏せるのは要約を作る Worker 側で、ここは長さだけを守る
+pub fn encode_tool_log(calls: &[WorkerProgress], max_chars: usize) -> String {
+    let mut entries: Vec<(String, String)> = calls
+        .iter()
+        .map(|c| {
+            (
+                c.tool.chars().take(TOOL_LOG_NAME_CHARS).collect(),
+                c.summary.chars().take(TOOL_LOG_SUMMARY_CHARS).collect(),
+            )
+        })
+        .collect();
+    let encode = |entries: &[(String, String)]| {
+        Value::Array(
+            entries
+                .iter()
+                .map(|(tool, summary)| serde_json::json!({ "tool": tool, "summary": summary }))
+                .collect(),
+        )
+        .to_string()
+    };
+    let mut start = 0;
+    while start + 1 < entries.len() && encode(&entries[start..]).chars().count() > max_chars {
+        start += 1;
+    }
+    // 1 件だけで上限を超えるときは、要約を半分ずつに切って収める
+    let last = &mut entries[start..];
+    while encode(last).chars().count() > max_chars {
+        let Some((_, summary)) = last.last_mut() else {
+            break;
+        };
+        if summary.is_empty() {
+            break;
+        }
+        *summary = summary.chars().take(summary.chars().count() / 2).collect();
+    }
+    encode(&entries[start..])
+}
 
 fn ts(ms: i64) -> Timestamp {
     // 範囲外の値は壊れた行なので epoch に倒す(読み出しで panic させない)
@@ -940,6 +985,24 @@ impl Store {
         .await?;
         Ok(())
     }
+    pub async fn set_tool_log(&self, run_id: &str, calls: &[WorkerProgress]) -> Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("UPDATE worker_runs SET tool_log = ? WHERE run_id = ?")
+            .bind(encode_tool_log(calls, TOOL_LOG_MAX_CHARS))
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    pub async fn tool_log(&self, run_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT tool_log FROM worker_runs WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.try_get("tool_log")).transpose()?.flatten())
+    }
     pub async fn set_delivery_style(&self, run_id: &str, style: &str) -> Result<()> {
         sqlx::query("UPDATE worker_runs SET delivery_style = ? WHERE run_id = ?")
             .bind(style)
@@ -1424,6 +1487,51 @@ mod tests {
             trigger_message_id: Some(42),
             fork_message_id: 7,
         }
+    }
+
+    fn call(tool: &str, summary: &str) -> WorkerProgress {
+        WorkerProgress {
+            tool: tool.into(),
+            summary: summary.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_log_is_saved_and_capped() {
+        let s = Store::open_memory().await.unwrap();
+        s.insert_worker_run(G, &new_run("r1")).await.unwrap();
+        assert_eq!(s.tool_log("r1").await.unwrap(), None);
+        s.set_tool_log(
+            "r1",
+            &[
+                call("web_search", "「OpenCode Zen 無料」"),
+                call("web_fetch", "https://opencode.ai/docs/zen/"),
+            ],
+        )
+        .await
+        .unwrap();
+        let v: Value = serde_json::from_str(&s.tool_log("r1").await.unwrap().unwrap()).unwrap();
+        assert_eq!(v[0]["tool"], "web_search");
+        assert_eq!(v[1]["summary"], "https://opencode.ai/docs/zen/");
+
+        let many: Vec<_> = (0..500)
+            .map(|i| call("web_search", &format!("「検索語 {i}」")))
+            .collect();
+        let json = encode_tool_log(&many, 400);
+        assert!(json.chars().count() <= 400);
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let last = v.as_array().unwrap().last().unwrap();
+        assert_eq!(last["summary"], "「検索語 499」");
+        assert_ne!(v[0]["summary"], "「検索語 0」");
+    }
+
+    #[test]
+    fn tool_log_cuts_names_and_a_single_oversized_entry() {
+        let long = call(&"t".repeat(100), &"x".repeat(1000));
+        let json = encode_tool_log(&[long], 120);
+        assert!(json.chars().count() <= 120);
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v[0]["tool"].as_str().unwrap().chars().count(), 40);
     }
 
     #[tokio::test]

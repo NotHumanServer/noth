@@ -250,10 +250,12 @@ impl Worker for MockWorker {
     async fn run(&self, task: WorkerTask) -> WorkerOutcome {
         let goal = task.goal.clone();
         let tx = task.progress.clone();
+        let tool_log = task.tool_log.clone();
         self.tasks.lock().unwrap().push(task);
         let steps = self.progress.lock().unwrap().clone();
         for (wait, p) in steps {
             tokio::time::sleep(wait).await;
+            tool_log.lock().unwrap().push(p.clone());
             if let Some(tx) = &tx {
                 let _ = tx.send(p);
             }
@@ -1323,6 +1325,33 @@ async fn join_provider_failure_keeps_conclusion_only() {
     let turns = h.store.active_turns(GUILD).await.unwrap();
     assert_eq!(turns.len(), 3);
     assert_eq!(turns[2].kind, TurnKind::Conclusion);
+}
+
+#[tokio::test]
+async fn tool_log_survives_a_worker_timeout() {
+    let mut h = Harness::setup(Setup {
+        worker: true,
+        timeout_secs: 1,
+        ..Setup::default()
+    })
+    .await;
+    *h.worker.delay.lock().unwrap() = Duration::from_secs(10);
+    *h.worker.progress.lock().unwrap() = vec![(
+        Duration::ZERO,
+        WorkerProgress {
+            tool: "web_search".into(),
+            summary: "「OpenCode Zen」".into(),
+        },
+    )];
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.say(GENERAL, "天気調べて").await;
+    h.process_next_job().await;
+
+    let run = &runs(&h.store, RunStatus::Failed).await[0];
+    let log = h.store.tool_log(&run.run_id).await.unwrap().unwrap();
+    assert!(log.contains("OpenCode Zen"), "{log}");
 }
 
 #[tokio::test]
@@ -2648,6 +2677,36 @@ async fn supplement_runs_silently_and_replies_to_the_last_trigger_when_needed() 
         .await
         .unwrap();
     assert_eq!(runs[0].origin, Origin::Supplement);
+}
+
+#[tokio::test]
+async fn silent_run_records_the_tool_log() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(supplement_answers());
+    *h.worker.progress.lock().unwrap() = vec![
+        (
+            Duration::ZERO,
+            WorkerProgress {
+                tool: "web_search".into(),
+                summary: "「OpenCode Zen 無料」".into(),
+            },
+        ),
+        (
+            Duration::ZERO,
+            WorkerProgress {
+                tool: "web_fetch".into(),
+                summary: "https://opencode.ai/docs/zen/".into(),
+            },
+        ),
+    ];
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    assert_eq!(h.process_next_job().await, "join");
+
+    let run_id = h.worker.tasks.lock().unwrap()[0].run_id.clone();
+    let log = h.store.tool_log(&run_id).await.unwrap().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&log).unwrap();
+    assert_eq!(v[0]["tool"], "web_search");
+    assert_eq!(v[1]["summary"], "https://opencode.ai/docs/zen/");
 }
 
 #[tokio::test]

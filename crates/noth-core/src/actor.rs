@@ -19,8 +19,8 @@ use crate::markers::{self, Folded};
 use crate::registry::Modules;
 use crate::store::{MessageRow, NewWorkerRun, RunStatus, Store, WorkerRunRow};
 use crate::traits::{
-    Channel, Compactor, Completion, LayeredPrompt, Provider, Router, Worker, WorkerOutcome,
-    WorkerTask,
+    Channel, Compactor, Completion, LayeredPrompt, Provider, Router, ToolLog, Worker,
+    WorkerOutcome, WorkerTask,
 };
 use crate::types::*;
 use crate::{Error, Result, bus, heartbeat, ingest, memory, progress, restore, supplement};
@@ -998,9 +998,11 @@ impl Actor {
             progress: progress_tx,
             history: Some(std::sync::Arc::new(store.clone())),
             audience,
+            tool_log: ToolLog::default(),
         };
         tokio::spawn(async move {
             let run_id = task.run_id.clone();
+            let tool_log = task.tool_log.clone();
             // キュー待ちも含めて timeout_secs で打ち切る
             let (status, text) =
                 match tokio::time::timeout(timeout, execute(worker, slots, &store, task)).await {
@@ -1018,6 +1020,10 @@ impl Actor {
                 let _ = tokio::time::timeout(PROGRESS_FINAL_WAIT, handle).await;
             }
             tracing::info!(run_id = %run_id, status = status.as_str(), "Worker が終了しました");
+            let calls = tool_log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Err(e) = store.set_tool_log(&run_id, &calls).await {
+                tracing::warn!(error = %e, run_id = %run_id, "tool の呼び出しの要約を保存できませんでした");
+            }
             if let Err(e) = store.finish_run(&run_id, status, &text).await {
                 tracing::error!(error = %e, run_id = %run_id, "Worker の結果を SQLite に保存できなかったため、この調査の結果は Discord に報告されません");
             }
