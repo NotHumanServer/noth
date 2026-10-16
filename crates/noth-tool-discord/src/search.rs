@@ -28,6 +28,7 @@ pub(crate) fn build_query(
         author: text_arg(input, "author"),
         since: None,
         until: None,
+        exclude_channels: Vec::new(),
         limit: clamp_limit(input, DEFAULT_LIMIT),
     };
     let channel = match input.get("channel_id") {

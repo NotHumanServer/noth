@@ -4,6 +4,7 @@ pub mod bus;
 pub mod command;
 pub mod config;
 pub mod error;
+pub mod exclusion;
 pub mod heartbeat;
 pub mod history;
 pub mod ingest;

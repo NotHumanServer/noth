@@ -20,6 +20,8 @@ pub struct HistoryQuery {
     pub author: Option<String>,
     pub since: Option<Timestamp>,
     pub until: Option<Timestamp>,
+    /// 除外したチャンネルの ID。カテゴリや親チャンネルの配下は Store から分からないので、呼び出し側が行ごとに確かめる
+    pub exclude_channels: Vec<ChannelId>,
     pub limit: usize,
 }
 

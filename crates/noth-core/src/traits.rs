@@ -65,6 +65,11 @@ pub trait Channel: Send + Sync {
     }
     /// 管理コマンドを受け付ける Channel だけが実装する。`run` の前に 1 回呼ばれる。対応しない Channel は何もしない
     fn set_commands(&self, _host: std::sync::Arc<crate::command::CommandHost>) {}
+    /// 除外するチャンネルを管理する Channel だけが返す。起動時に DB の保存分を読み込み、tool と共有する。
+    /// 返さない Channel はチャンネルを除外できない
+    fn exclusions(&self) -> Option<crate::exclusion::ChannelExclusions> {
+        None
+    }
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
     /// `noth doctor` の疎通確認。結果の説明を返す
@@ -189,6 +194,8 @@ pub trait Tool: Send + Sync {
     async fn account_status(&self) -> Result<Option<String>> {
         Ok(None)
     }
+    /// 除外したチャンネルを参照させない tool だけが実装する。`run` の前に 1 回呼ばれる
+    fn set_exclusions(&self, _exclusions: crate::exclusion::ChannelExclusions) {}
 }
 
 /// Worker が tool を呼ぶ直前に Core へ知らせる。Discord の Ack を編集して進み具合を見せるため

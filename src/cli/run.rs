@@ -40,6 +40,12 @@ pub async fn run(cfg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
     let config = load(cfg)?;
     let modules = crate::registry().build(&config)?;
     let store = Store::open(&config.paths.database()).await?;
+    if let Some(exclusions) = modules.channel.exclusions() {
+        exclusions.attach(store.clone()).await?;
+        for (_, tool) in &modules.tools {
+            tool.set_exclusions(exclusions.clone());
+        }
+    }
     tracing::info!("noth を起動します");
     noth_core::actor::run(config, modules, store, shutdown_signal()).await?;
     tracing::info!("noth を終了しました");

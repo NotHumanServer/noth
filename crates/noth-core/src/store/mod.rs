@@ -13,7 +13,10 @@ use crate::traits::WorkerProgress;
 use crate::types::*;
 use crate::{Error, Result};
 
+mod exclusions;
 mod usage;
+
+pub use exclusions::IgnoredChannelRow;
 
 #[derive(Clone)]
 pub struct Store {
@@ -532,14 +535,21 @@ impl Store {
     /// 新しい順。文字列の絞り込みは SQLite の lower() に頼るので、大文字小文字を区別しないのは ASCII だけ。SQLite 側の lower() に合わせ、引数も ASCII だけ小文字にする
     pub async fn search_messages(&self, q: &HistoryQuery) -> Result<Vec<MessageRow>> {
         let lower = |s: &Option<String>| s.as_ref().map(|s| s.to_ascii_lowercase());
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        // 値は ? で束ね、SQL に入れるのは個数分のプレースホルダだけ
+        let excluded = if q.exclude_channels.is_empty() {
+            String::new()
+        } else {
+            let marks = vec!["?"; q.exclude_channels.len()].join(", ");
+            format!("\n               AND channel_id NOT IN ({marks})")
+        };
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND is_bot_marker = 0
                AND (? IS NULL OR channel_id = ?)
                AND (? IS NULL OR lower(channel_name) = ?)
                AND (? IS NULL OR instr(lower(content), ?) > 0)
                AND (? IS NULL OR instr(lower(author_name), ?) > 0)
                AND (? IS NULL OR created_at >= ?)
-               AND (? IS NULL OR created_at < ?)
+               AND (? IS NULL OR created_at < ?){excluded}
              ORDER BY created_at DESC, id DESC LIMIT ?"
         )))
         .bind(q.guild_id as i64)
@@ -554,10 +564,11 @@ impl Store {
         .bind(q.since.map(|t| t.as_millisecond()))
         .bind(q.since.map(|t| t.as_millisecond()))
         .bind(q.until.map(|t| t.as_millisecond()))
-        .bind(q.until.map(|t| t.as_millisecond()))
-        .bind(q.limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        .bind(q.until.map(|t| t.as_millisecond()));
+        for channel in &q.exclude_channels {
+            query = query.bind(*channel as i64);
+        }
+        let rows = query.bind(q.limit as i64).fetch_all(&self.pool).await?;
         rows.iter().map(message_row).collect()
     }
     /// 発言が 1 件も無ければ 0
@@ -1837,6 +1848,7 @@ mod tests {
             author: None,
             since: None,
             until: None,
+            exclude_channels: Vec::new(),
             limit: 10,
         }
     }
@@ -1901,6 +1913,16 @@ mod tests {
             ..query()
         };
         assert_eq!(search_ids(&s, &limited).await, vec![3]);
+        let excluded = HistoryQuery {
+            exclude_channels: vec![11, 999],
+            ..query()
+        };
+        assert_eq!(search_ids(&s, &excluded).await, vec![3, 1]);
+        let all_excluded = HistoryQuery {
+            exclude_channels: vec![11, 10],
+            ..query()
+        };
+        assert!(search_ids(&s, &all_excluded).await.is_empty());
     }
 
     #[tokio::test]
