@@ -556,6 +556,34 @@ impl Harness {
         self.actor.handle_judge(batch).await.unwrap();
     }
 
+    /// 判定にかけずに記録だけする。Worker の実行中に届いた人間の発言を作る
+    async fn record_human(&mut self, channel_id: ChannelId, content: &str) {
+        self.record_from(channel_id, 1, content, None).await;
+    }
+
+    async fn record_from(
+        &mut self,
+        channel_id: ChannelId,
+        user_id: UserId,
+        content: &str,
+        bot_marker: Option<BotMarker>,
+    ) {
+        let name = if channel_id == GENERAL {
+            "general"
+        } else {
+            "random"
+        };
+        self.next_message_id += 1;
+        let mut msg = incoming(channel_id, name, content, self.next_message_id);
+        msg.user_id = user_id;
+        msg.bot_marker = bot_marker;
+        self.store.insert_message(&msg).await.unwrap();
+    }
+
+    fn router_calls(&self) -> usize {
+        self.router.states.lock().unwrap().len()
+    }
+
     fn sent(&self) -> Vec<(ChannelId, String)> {
         self.channel.sent.lock().unwrap().clone()
     }
@@ -1222,6 +1250,7 @@ async fn join_reply_anchor_replies_to_trigger() {
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
     let trigger_message_id = h.next_message_id;
+    h.record_human(GENERAL, "ところで昼ごはんは").await;
     h.process_next_job().await;
     assert_eq!(
         *h.channel.reply_to.lock().unwrap(),
@@ -1230,11 +1259,24 @@ async fn join_reply_anchor_replies_to_trigger() {
 }
 
 #[tokio::test]
+async fn join_without_human_follow_up_is_normal_report_even_if_router_says_anchor() {
+    let mut h = Harness::with_worker().await;
+    h.router.set(with_delivery(spawn_answers(), "reply_anchor"));
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.say(GENERAL, "天気調べて").await;
+    h.process_next_job().await;
+    assert_eq!(*h.channel.reply_to.lock().unwrap(), vec![None, None]);
+    let run = &runs(&h.store, RunStatus::Finished).await[0];
+    assert_eq!(run.delivery_style.as_deref(), Some("normal_report"));
+}
+
+#[tokio::test]
 async fn join_abort_posts_nothing() {
     let mut h = Harness::with_worker().await;
     h.router.set(with_delivery(spawn_answers(), "abort"));
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
+    h.record_human(GENERAL, "ところで昼ごはんは").await;
     let before = h.store.active_turns(GUILD).await.unwrap();
 
     h.process_next_job().await;
@@ -1252,6 +1294,7 @@ async fn join_router_error_is_abort() {
     h.router.set(spawn_answers());
     h.provider.script_text("調べるね\n[Goal]\n天気");
     h.say(GENERAL, "天気調べて").await;
+    h.record_human(GENERAL, "ところで昼ごはんは").await;
     h.router.fail.store(true, Ordering::SeqCst);
     h.process_next_job().await;
     assert_eq!(h.sent().len(), 1);
@@ -2626,11 +2669,26 @@ async fn supplement_not_needed_keeps_conclusion_in_layer3_without_posting() {
 }
 
 #[tokio::test]
+async fn supplement_without_human_follow_up_skips_the_join_judge() {
+    let mut h = Harness::with_worker().await;
+    *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
+    h.router.set(with_delivery(supplement_answers(), "abort"));
+    h.provider.script_text("料金は月 $20 です");
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    let judged = h.router.states.lock().unwrap().len();
+    assert_eq!(h.process_next_job().await, "join");
+
+    assert_eq!(h.router.states.lock().unwrap().len(), judged);
+    assert_eq!(h.sent(), vec![(GENERAL, "料金は月 $20 です".to_string())]);
+}
+
+#[tokio::test]
 async fn supplement_is_dropped_when_the_join_judge_aborts() {
     let mut h = Harness::with_worker().await;
     *h.worker.conclusion.lock().unwrap() = Some("調べた\n補足の要否: 要".into());
     h.router.set(with_delivery(supplement_answers(), "abort"));
     h.say(GENERAL, "プランは月 $10 らしい").await;
+    h.record_human(GENERAL, "それは違うよ、$20 だ").await;
     assert_eq!(h.process_next_job().await, "join");
 
     assert!(h.sent().is_empty());
@@ -2817,4 +2875,94 @@ async fn reply_with_react_line_posts_text_and_reacts() {
     assert_eq!(reactions_of(&h).len(), 1);
     let turns = h.store.active_turns(GUILD).await.unwrap();
     assert_eq!(turns[1].text, "どういたしまして");
+}
+
+fn marker() -> BotMarker {
+    BotMarker {
+        author_name: "bot".into(),
+        reply_to_author: None,
+        chars: 3,
+    }
+}
+
+/// 依頼を出して Join の直前まで進める。router は reply_anchor を返す設定
+async fn request_with_anchor_router() -> Harness {
+    let mut h = Harness::with_worker().await;
+    h.router.set(with_delivery(spawn_answers(), "reply_anchor"));
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.say(GENERAL, "天気調べて").await;
+    h
+}
+
+#[tokio::test]
+async fn join_without_follow_up_does_not_call_router() {
+    let mut h = request_with_anchor_router().await;
+    let before = h.router_calls();
+    h.process_next_job().await;
+    assert_eq!(h.router_calls(), before);
+    assert_eq!(h.sent().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_run_without_follow_up_is_still_reported() {
+    let mut h = Harness::with_worker().await;
+    h.worker.fail.store(true, Ordering::SeqCst);
+    h.router.set(with_delivery(spawn_answers(), "abort"));
+    h.provider.script_text("調べるね\n[Goal]\n天気");
+    h.provider.script_text("調べられなかったよ");
+    h.say(GENERAL, "天気調べて").await;
+    let before = h.router_calls();
+    h.process_next_job().await;
+    assert_eq!(h.router_calls(), before);
+    assert_eq!(h.sent().len(), 2);
+    let run = &runs(&h.store, RunStatus::Failed).await[0];
+    assert_eq!(run.delivery_style.as_deref(), Some("normal_report"));
+}
+
+#[tokio::test]
+async fn silent_failed_run_posts_nothing() {
+    let mut h = Harness::with_worker().await;
+    h.worker.fail.store(true, Ordering::SeqCst);
+    h.router
+        .set(with_delivery(supplement_answers(), "normal_report"));
+    h.say(GENERAL, "プランは月 $10 らしい").await;
+    h.process_next_job().await;
+    assert!(h.sent().is_empty());
+    assert!(h.prompts().is_empty());
+}
+
+#[tokio::test]
+async fn other_channel_human_does_not_count_but_requester_does() {
+    let mut h = request_with_anchor_router().await;
+    let before = h.router_calls();
+    h.record_from(RANDOM, 2, "別の場所の別の人", None).await;
+    h.process_next_job().await;
+    assert_eq!(h.router_calls(), before);
+
+    let mut h = request_with_anchor_router().await;
+    let before = h.router_calls();
+    h.record_from(RANDOM, 1, "さっきのいらなかった", None).await;
+    h.process_next_job().await;
+    assert_eq!(h.router_calls(), before + 1);
+}
+
+#[tokio::test]
+async fn bot_markers_alone_are_not_follow_up() {
+    let mut h = request_with_anchor_router().await;
+    let before = h.router_calls();
+    h.record_from(GENERAL, 9, "", Some(marker())).await;
+    h.process_next_job().await;
+    assert_eq!(h.router_calls(), before);
+}
+
+#[tokio::test]
+async fn follow_up_pushed_out_of_the_router_window_is_still_counted() {
+    let mut h = request_with_anchor_router().await;
+    let before = h.router_calls();
+    h.record_human(GENERAL, "話題を変えるね").await;
+    for _ in 0..40 {
+        h.record_from(RANDOM, 9, "", Some(marker())).await;
+    }
+    h.process_next_job().await;
+    assert_eq!(h.router_calls(), before + 1);
 }

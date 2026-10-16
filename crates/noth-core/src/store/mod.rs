@@ -438,6 +438,41 @@ impl Store {
         .await?;
         rows.iter().map(message_row).collect()
     }
+    /// `after_id` より後に、`channel_id` の人間の発言、または `requester` の発言(チャンネル不問)があるか。
+    /// Noth 自身と Bot の目印は人間に数えない。件数の窓に切られないよう SQL で数える
+    pub async fn has_human_message_after(
+        &self,
+        guild: GuildId,
+        after_id: i64,
+        channel_id: ChannelId,
+        requester: Option<UserId>,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE guild_id = ? AND id > ? AND is_self = 0 AND is_bot_marker = 0 AND (channel_id = ? OR user_id = ?))",
+        )
+        .bind(guild as i64)
+        .bind(after_id)
+        .bind(channel_id as i64)
+        .bind(requester.map_or(-1, |u| u as i64))
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+    /// Discord の message_id から発言者を引く
+    pub async fn author_of_message(
+        &self,
+        guild: GuildId,
+        message_id: MessageId,
+    ) -> Result<Option<UserId>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT user_id FROM messages WHERE guild_id = ? AND message_id = ?",
+        )
+        .bind(guild as i64)
+        .bind(message_id as i64)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|u| u as UserId))
+    }
     pub async fn message(&self, id: i64) -> Result<Option<MessageRow>> {
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = ?"

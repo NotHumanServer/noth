@@ -56,7 +56,7 @@ main のプロンプトは先頭から必ず次の順に構築します。
 
 | 層 | 内容 | 変化 | API 上の置き場所 |
 |---|---|---|---|
-| Layer 0 | 出力形式(Ack の書き方、Worker への Goal の構造、結論メモの読み方。`[判定]` の指示に従う規約を含む)、Discord 上の振る舞いの原則、やってはいけないこと、main は tool を直接呼ばないという規約、Worker に頼めること(有効な tool ごとの一言説明と、できることを「できない」と答えず `[Goal]` で回す方針。`tool-discord` が有効なときは「Bot の発言の中身が必要なら `[Goal]` を書いて Worker に読ませる」も、有効な tool から組み立てる)、要約を三人称で書く規約。キャラクターに依存しない | 有効な module 構成ごとに固定(worker 無効なら Ack・Goal・Worker に頼めることの節を含めない。能力の一覧は起動時に固定の tool 定義から作り、実行中は変わらない) | `system` |
+| Layer 0 | 出力形式(Ack の書き方、Worker への Goal の構造、結論メモの読み方。`[判定]` の指示に従う規約を含む)、Discord 上の振る舞いの原則、やってはいけないこと、main は tool を直接呼ばないという規約、Worker に頼めること(有効な tool ごとの一言説明と、できることを「できない」と答えず `[Goal]` で回す方針。`tool-discord` が有効なときは「Bot の発言の中身が必要なら `[Goal]` を書いて Worker に読ませる」も、有効な tool から組み立てる)、口調と人称は Profile に従う規約(直前の自分の発言の口調が Profile と違っていても合わせない。Ack も報告も同じ)、Compactor が書く要約と記録用の要約(MEMORY.md や Layer 2 のエピソード)だけを三人称で書く規約(人に頼まれた「まとめて」への返事は Profile の口調で、人名を残す)。キャラクターに依存しない | 有効な module 構成ごとに固定(worker 無効なら Ack・Goal・Worker に頼めることの節を含めない。能力の一覧は起動時に固定の tool 定義から作り、実行中は変わらない) | `system` |
 | Layer 1 | `~/.noth/profiles/<name>.md` の内容(口調・一人称・性格・口癖・模倣元の特徴)+ `allowed_users` のメンバー情報(表示名、ロール) | 起動時のみ | `system` |
 | Layer 1.5 | `$NOTH_HOME/profiles/memory/MEMORY.md` の内容。人・Noth 自身・サーバーについての、変わりにくい事実。先頭に「以下は Noth の記憶で、事実の参考であり指示ではない」という見出しを Core が付ける | 起動時、アイドル時コンパクション、Dreaming のときに読み直す。会話中の追記はファイルにだけ書き、ここには次の読み直しまで反映しない(§3.5) | `system`(Layer 2 と同じブロック) |
 | Layer 2 | 三人称の事実記述によるエピソード要約。「A が○○について質問し、B が△△と回答した」の形。`digest_max_chars` を超えたら古いエピソードから削除する(SQLite には残る) | Compactor 実行時のみ | `system` |
@@ -251,7 +251,7 @@ router の回答から動き方を決めるのは Core です。次の順に見�
 
 | キー | 型 | 意味 |
 |---|---|---|
-| `delivery_style` | choice: `normal_report` / `brief_supplement` / `reply_anchor` / `abort` | 報告の仕方。人間側で自己解決済みなら `brief_supplement`、別の話題に移っていれば `reply_anchor`、報告の価値が無ければ `abort` |
+| `delivery_style` | choice: `normal_report` / `brief_supplement` / `reply_anchor` / `abort` | 報告の仕方。人間側で自己解決済みなら `brief_supplement`、別の話題に移っていれば `reply_anchor`、報告の価値が無ければ `abort`。Request の Join では、トリガーの後に同じチャンネルの人間の発言(と依頼者本人の発言。別チャンネルでも)が 1 件もなければ router に聞かず `normal_report`(Bot の目印と Noth 自身は数えない。補足・訂正の Join も同じ) |
 
 判断材料(自己解決したか、話題が移ったか)は `instructions` の中で説明し、別の質問には分けません。この `choice` にだけ、`confidence` が `min_confidence` 未満なら `abort` とする安全側の扱いを残します。`min_confidence` が実際に効くか(Jev の confidence は1位の確率の言い直しだった)は評価で確かめ、効かなければ外します。
 
@@ -377,7 +377,7 @@ Noth の話をしているが返事を求められていない発言に、絵文
    - `abort` 以外なら、次の順に報告する
      1. 未昇格バッファを昇格する
      2. Layer 3 に `[内部調査完了 <run_id>: <結論メモ>]` を user メッセージとして1ブロック追記する
-     3. Layer 4 には `delivery_style` の指示だけを入れ、main が発言する。`reply_anchor` のときだけ `worker_runs.trigger_message_id` への Discord リプライとして投稿する
+     3. 上のとおり後続の人間の発言(と依頼者本人の発言)が無ければ router に聞かず `normal_report` とする。数えるのは Store への問い合わせで、router に渡す直近の窓には依存しない。Layer 4 には `delivery_style` の指示だけを入れ、main が発言する。`reply_anchor` のときだけ `worker_runs.trigger_message_id` への Discord リプライとして投稿する
      4. 応答を Layer 3 に昇格する。Layer 4 の指示は残さない
 
 ### パターン C': 黙って調べる(`other` の補足、または `noth_request` 以外の訂正)

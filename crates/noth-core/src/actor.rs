@@ -1064,52 +1064,65 @@ impl Actor {
             .into_iter()
             .filter(|r| r.id > run.fork_message_id)
             .collect();
-        let channel_name = self
-            .channel_names
-            .get(&run.channel_id)
-            .cloned()
-            .unwrap_or_else(|| run.channel_id.to_string());
-        let state = judge::build_join_state(
-            &judge::JoinInput {
+        // 後続の人間の発言が無ければ話題は移っていないので、router の reply_anchor や abort を採らない
+        let style = if !self.has_human_follow_up(&run).await? {
+            tracing::info!(
                 run_id,
-                goal: &run.goal,
-                channel: &channel_name,
-                concluded: outcome.is_ok(),
-                memo: &memo,
-                since_fork: &since_fork,
-            },
-            &self.config.router,
-        );
-        let (style, kind, answers, latency_ms) = match self
-            .router
-            .decide(&state, &judge::join_questions(Origin::Request))
-            .await
-        {
-            Ok(decision) => (
-                judge::binarize_delivery(&decision, self.config.router.thresholds.min_confidence),
-                "join",
-                judge::answers_json(&decision),
-                decision.latency.as_millis() as i64,
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, run_id, "router の合流判定に失敗しました。報告しません");
-                (
-                    DeliveryStyle::Abort,
-                    "join_error",
-                    json!({ "error": e.to_string() }),
-                    0,
+                "トリガー後に人間の発言が無いため router を呼びません"
+            );
+            DeliveryStyle::NormalReport
+        } else {
+            let channel_name = self
+                .channel_names
+                .get(&run.channel_id)
+                .cloned()
+                .unwrap_or_else(|| run.channel_id.to_string());
+            let state = judge::build_join_state(
+                &judge::JoinInput {
+                    run_id,
+                    goal: &run.goal,
+                    channel: &channel_name,
+                    concluded: outcome.is_ok(),
+                    memo: &memo,
+                    since_fork: &since_fork,
+                },
+                &self.config.router,
+            );
+            let (style, kind, answers, latency_ms) = match self
+                .router
+                .decide(&state, &judge::join_questions(Origin::Request))
+                .await
+            {
+                Ok(decision) => (
+                    judge::binarize_delivery(
+                        &decision,
+                        self.config.router.thresholds.min_confidence,
+                    ),
+                    "join",
+                    judge::answers_json(&decision),
+                    decision.latency.as_millis() as i64,
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, run_id, "router の合流判定に失敗しました。報告しません");
+                    (
+                        DeliveryStyle::Abort,
+                        "join_error",
+                        json!({ "error": e.to_string() }),
+                        0,
+                    )
+                }
+            };
+            self.store
+                .insert_decision(
+                    guild,
+                    kind,
+                    &self.router.model_label(),
+                    &answers,
+                    latency_ms,
                 )
-            }
+                .await?;
+            style
         };
-        self.store
-            .insert_decision(
-                guild,
-                kind,
-                &self.router.model_label(),
-                &answers,
-                latency_ms,
-            )
-            .await?;
         self.store
             .set_delivery_style(run_id, style.as_str())
             .await?;
@@ -1303,6 +1316,18 @@ impl Actor {
         self.enforce_hard_limit(chunk_id).await
     }
 
+    /// トリガーの後に、同じチャンネルの人間の発言か、依頼者本人の発言(別チャンネルでも)があるか。
+    /// 依頼者が別の場所で「いらなかった」と言った場合も router に尋ねて abort できるようにするため
+    async fn has_human_follow_up(&self, run: &WorkerRunRow) -> Result<bool> {
+        let requester = match run.trigger_message_id {
+            Some(id) => self.store.author_of_message(self.guild, id).await?,
+            None => None,
+        };
+        self.store
+            .has_human_message_after(self.guild, run.fork_message_id, run.channel_id, requester)
+            .await
+    }
+
     /// 調べている間に人どうしで解決していないかを、合流判定と同じ仕組みで router に尋ねる。
     /// 判定に失敗したら投稿しない側に倒す
     async fn silent_report_allowed(&self, run: &WorkerRunRow, memo: &str) -> Result<bool> {
@@ -1315,6 +1340,17 @@ impl Actor {
             .into_iter()
             .filter(|r| r.id > run.fork_message_id)
             .collect();
+        // 人どうしで解決したかを尋ねる問いなので、人間の発言が無ければ答えは決まっている
+        if !self.has_human_follow_up(run).await? {
+            tracing::info!(
+                run_id,
+                "トリガー後に人間の発言が無いため router を呼びません"
+            );
+            self.store
+                .set_delivery_style(run_id, DeliveryStyle::NormalReport.as_str())
+                .await?;
+            return Ok(true);
+        }
         let channel_name = self
             .channel_names
             .get(&run.channel_id)

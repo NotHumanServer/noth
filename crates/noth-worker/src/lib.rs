@@ -331,7 +331,8 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
          - 分かったこと・やったこと\n\
          - 出典(URL。Web を使った場合)\n\
          - 不確かな点(確認できなかったことは必ずここに書く)\n\
-         tool の生の出力はメモに含めないでください。",
+         tool の生の出力はメモに含めないでください。\n\
+         結論メモは口調を付けず、事実を体言止めか、だ・である調で書いてください。人名は会話に出てくる表示名のまま書いてください。discord tool が返す「さd（さどるふ）」のような括弧つきの名前は、括弧の前の呼び名で書いてください。",
         task.origin.as_str(),
         task.goal
     );
@@ -619,6 +620,9 @@ mod tests {
         assert!(both.contains("web_fetch"));
         assert!(both.contains("無料"));
         assert!(both.contains("スニペットだけで結論しない"));
+        assert!(both.contains("結論メモは口調を付けず"));
+        assert!(both.contains("表示名のまま"));
+        assert!(both.contains("括弧の前の呼び名"));
         assert!(both.contains("2〜4 回検索"));
         assert!(both.contains("3〜5 ページ"));
         assert!(both.contains("突き合わせ"));
