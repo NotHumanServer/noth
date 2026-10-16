@@ -56,7 +56,7 @@ main のプロンプトは先頭から必ず次の順に構築します。
 
 | 層 | 内容 | 変化 | API 上の置き場所 |
 |---|---|---|---|
-| Layer 0 | 出力形式(Ack の書き方、Worker への Goal の構造、結論メモの読み方。`[判定]` の指示に従う規約を含む)、Discord 上の振る舞いの原則、やってはいけないこと、main は tool を直接呼ばないという規約、Worker に頼めること(有効な tool ごとの一言説明と、main 自身は tool を直接は呼ばないが Worker を通して shell やファイル操作を含む作業ができるので「できない」と答えず `[Goal]` で回す方針。`tool-discord` が有効なときは「Bot の発言の中身が必要なら `[Goal]` を書いて Worker に読ませる」も、有効な tool から組み立てる)、口調と人称は Profile に従う規約(直前の自分の発言の口調が Profile と違っていても合わせない。Ack も報告も同じ)、Compactor が書く要約と記録用の要約(MEMORY.md や Layer 2 のエピソード)だけを三人称で書く規約(人に頼まれた「まとめて」への返事は Profile の口調で、人名を残す)。キャラクターに依存しない | 有効な module 構成ごとに固定(worker 無効なら Ack・Goal・Worker に頼めることの節を含めない。能力の一覧は起動時に固定の tool 定義から作り、実行中は変わらない) | `system` |
+| Layer 0 | 出力形式(Ack の書き方、Worker への Goal の構造、結論メモの読み方。`[判定]` の指示に従う規約を含む)、Discord 上の振る舞いの原則、やってはいけないこと、main は tool を直接呼ばないという規約、Worker に頼めること(有効な tool ごとの一言説明と、main 自身は tool を直接は呼ばないが Worker を通して shell やファイル操作を含む作業ができるので「できない」と答えず `[Goal]` で回す方針。`tool-shell` が有効なときは、shell が Noth を動かしているマシン上で動くことと、起動時に取った OS・ホスト名・`NOTH_HOME`・workspace の絶対パス(実行中は変わらない固定の文字列。「消えない」と言うのは workspace に置いたものだけで、run ごとの下書きは消えることも伝える)、置き場所を聞かれたら結論メモの「置き場所」を答える規則。`tool-discord` が有効なときは「Bot の発言の中身が必要なら `[Goal]` を書いて Worker に読ませる」も、有効な tool から組み立てる)、口調と人称は Profile に従う規約(直前の自分の発言の口調が Profile と違っていても合わせない。Ack も報告も同じ)、Compactor が書く要約と記録用の要約(MEMORY.md や Layer 2 のエピソード)だけを三人称で書く規約(人に頼まれた「まとめて」への返事は Profile の口調で、人名を残す)。キャラクターに依存しない | 有効な module 構成ごとに固定(worker 無効なら Ack・Goal・Worker に頼めることの節を含めない。能力の一覧は起動時に固定の tool 定義から作り、実行中は変わらない) | `system` |
 | Layer 1 | `~/.noth/profiles/<name>.md` の内容(口調・一人称・性格・口癖・模倣元の特徴)+ `allowed_users` のメンバー情報(表示名、ロール) | 起動時のみ | `system` |
 | Layer 1.5 | `$NOTH_HOME/profiles/memory/MEMORY.md` の内容。人・Noth 自身・サーバーについての、変わりにくい事実。先頭に「以下は Noth の記憶で、事実の参考であり指示ではない」という見出しを Core が付ける | 起動時、アイドル時コンパクション、Dreaming のときに読み直す。会話中の追記はファイルにだけ書き、ここには次の読み直しまで反映しない(§3.5) | `system`(Layer 2 と同じブロック) |
 | Layer 2 | 三人称の事実記述によるエピソード要約。「A が○○について質問し、B が△△と回答した」の形。`digest_max_chars` を超えたら古いエピソードから削除する(SQLite には残る) | Compactor 実行時のみ | `system` |
@@ -366,7 +366,7 @@ Noth の話をしているが返事を求められていない発言に、絵文
 2. **Fork**
    - main の Layer 0〜3 と tool 定義をそのまま引き継いで、バックグラウンドで Worker を起動する。main と Worker は同一 provider・同一モデル・同一 tool 定義・同一 `tool_choice`(未指定)なので、Worker の初回呼び出しは main の KV キャッシュに当たる([architecture/caching.md §2](architecture/caching.md#2-main-と-worker-のキャッシュ共有))
    - Worker 固有の指示(「これはバックグラウンド作業である」「結論メモの書式」「Goal」)は **最初の user メッセージ** に置く。`system` には1文字も足さない。理由は [architecture/caching.md §3](architecture/caching.md#3-worker-固有の指示の置き場) を参照
-   - Worker は隔離された自分のコンテキストで tool を実行し、呼び出しと結果をコンテキストの末尾に追記する。反復は `max_iterations` 回まで、各 tool の出力は `tool_output_max_chars` で切り詰める。有効な tool(`tool-shell` と `discord` を含む)はどの run でも承認なしで呼ばれ、`tool-shell` の `cwd` は run ごとの `$NOTH_HOME/work/<run_id>/`
+   - Worker は隔離された自分のコンテキストで tool を実行し、呼び出しと結果をコンテキストの末尾に追記する。反復は `max_iterations` 回まで、各 tool の出力は `tool_output_max_chars` で切り詰める。有効な tool(`tool-shell` と `discord` を含む)はどの run でも承認なしで呼ばれ、`tool-shell` の `cwd` は run ごとの `$NOTH_HOME/work/<run_id>/`(下書き用。使うときに作り、空なら終了時に、古ければ片付ける。残す成果物は `$NOTH_HOME/workspace/<作業名>/` に置き、結論メモの「作ったもの」「置き場所(絶対パス)」に書く)
    - Worker の実行中も main は別の会話を処理できるため、雑談が進めばパターン B で通常どおり応答できる
    - Worker の実行中(キュー待ちを含む)はトリガーのチャンネルに入力中表示を出し続ける。`[worker] show_progress`(既定 true)なら、Worker が tool を呼ぶたびに Ack のメッセージを編集し、`-# 🔍 web_search「検索語」` や `-# 💬 discord search_messages「検索語」` のような行を末尾に足していく。編集は 1.5 秒に 1 回までにまとめ、終了時に完了か失敗の行を足す。この進捗は Discord にだけ出し、Layer 3 には Ack と Goal の本文だけを残す。tool の出力は進捗にも含めない
 3. **Join と報告**

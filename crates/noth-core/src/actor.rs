@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -10,7 +9,7 @@ use serde_json::json;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::command::{CommandEnv, CommandHost, ContextSnapshot};
-use crate::config::{CompactorSettings, Config};
+use crate::config::{CompactorSettings, Config, HostInfo};
 use crate::error::ErrorKind;
 use crate::judge::{
     self, Action, ActionInput, DeliveryStyle, JudgeAnswers, JudgeBatch, PendingMessage,
@@ -24,7 +23,9 @@ use crate::traits::{
     WorkerOutcome, WorkerTask,
 };
 use crate::types::*;
-use crate::{Error, Result, bus, heartbeat, ingest, memory, progress, restore, supplement};
+use crate::{
+    Error, Result, bus, heartbeat, ingest, memory, progress, restore, supplement, workdir,
+};
 
 /// typing インジケータは Discord 側で約 10 秒で消えるので、それより短い間隔で再送する
 const TYPING_INTERVAL: Duration = Duration::from_secs(8);
@@ -35,6 +36,7 @@ const ACK_REACTION: &str = "👀";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// アイドル判定の周期。idle_minutes は分単位なので、この程度の遅れは問題にならない
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const WORK_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 /// `[compactor]` を読めないときの keep_recent_turns。cli.md の既定値と同じ
 const FALLBACK_KEEP_RECENT_TURNS: usize = 6;
@@ -132,6 +134,9 @@ pub async fn run(
     let mut actor_task = tokio::spawn(async move {
         let mut idle_check = tokio::time::interval(IDLE_CHECK_INTERVAL);
         idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 最初の tick はすぐ来るので、起動時の片付けも兼ねる
+        let mut work_sweep = tokio::time::interval(WORK_SWEEP_INTERVAL);
+        work_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut stopping = false;
         loop {
             tokio::select! {
@@ -144,6 +149,9 @@ pub async fn run(
                     }
                 }
                 _ = &mut stop_rx, if !stopping => stopping = true,
+                _ = work_sweep.tick(), if !stopping => {
+                    actor.sweep_work_dirs();
+                }
                 _ = idle_check.tick(), if !stopping => {
                     if let Err(e) = actor.check_idle(Timestamp::now()).await {
                         tracing::warn!(error = %e, "アイドル判定に失敗しました");
@@ -211,6 +219,8 @@ struct WorkerPool {
     /// キュー待ちを含む。Ack は投稿済みなので、利用者が待たされる時間の上限として扱う
     timeout: Duration,
     show_progress: bool,
+    /// None なら期限では消さない
+    work_retention: Option<Duration>,
 }
 
 /// Layer 0〜1 は起動時に確定した固定値。Layer 2 は Compactor だけが更新し、Layer 3 は常に Store の active_log を正とする
@@ -231,6 +241,8 @@ pub struct Actor {
     jobs: mpsc::UnboundedSender<Job>,
     /// Fork してまだ Join を処理していない run の数。アイドル判定と終了待ちに使う
     in_flight: usize,
+    /// 片付けが消さないよう、fork から Join までの run を覚える
+    active_runs: HashSet<String>,
     /// 黙った Worker が finished になってから Join を処理するまでの間も、同じチャンネルで重ねて起動しないため。再起動では restore が全 run を中止するので持ち越さない
     silent_pending: HashSet<ChannelId>,
     /// キューに積んだ Compact が対象とするアイドル期間(その時点の人間の最終発言の行 ID)
@@ -321,6 +333,9 @@ impl Actor {
                     slots: Arc::new(Semaphore::new(settings.max_concurrent.max(1))),
                     timeout: Duration::from_secs(settings.timeout_secs),
                     show_progress: settings.show_progress,
+                    work_retention: (settings.work_retention_days > 0).then(|| {
+                        Duration::from_secs(settings.work_retention_days.saturating_mul(24 * 3600))
+                    }),
                 };
                 (Some(pool), tools)
             }
@@ -343,8 +358,12 @@ impl Actor {
                 &tools,
                 &config.memory,
                 &config.router.reactions,
+                worker
+                    .is_some()
+                    .then(|| HostInfo::detect(&config.paths))
+                    .as_ref(),
             ),
-            compactor_rules: layers::harness_rules(false, &[], &config.memory, &[]),
+            compactor_rules: layers::harness_rules(false, &[], &config.memory, &[], None),
             profile: layers::profile_layer(&config, members),
             memory: memory::layer_text(
                 &memory::read(&config.paths.memory_file()),
@@ -364,6 +383,7 @@ impl Actor {
             tools,
             jobs,
             in_flight: 0,
+            active_runs: HashSet::new(),
             silent_pending: HashSet::new(),
             compact_queued: None,
             compacted_for: None,
@@ -989,6 +1009,7 @@ impl Actor {
             return;
         };
         self.in_flight += 1;
+        self.active_runs.insert(run.run_id.clone());
         let worker = pool.worker.clone();
         let slots = pool.slots.clone();
         let timeout = pool.timeout;
@@ -1021,7 +1042,7 @@ impl Actor {
             (None, None)
         };
         let task = WorkerTask {
-            work_dir: self.config.paths.work_dir(&run.run_id),
+            work_dir: crate::config::absolute(&self.config.paths.work_dir(&run.run_id)),
             run_id: run.run_id,
             goal: run.goal,
             origin: run.origin,
@@ -1033,6 +1054,7 @@ impl Actor {
         };
         tokio::spawn(async move {
             let run_id = task.run_id.clone();
+            let work_dir = task.work_dir.clone();
             let tool_log = task.tool_log.clone();
             // キュー待ちも含めて timeout_secs で打ち切る
             let (status, text) =
@@ -1045,6 +1067,8 @@ impl Actor {
                     ),
                 };
             drop(typing);
+            // shell を使わなかった run は作業ディレクトリが無いか空のまま。残しても探す手間が増えるだけ
+            workdir::remove_if_empty(&work_dir);
             if let Some((done, _guard, handle)) = progress {
                 let _ = done.send(status == RunStatus::Finished);
                 // 結びの編集を報告より先に済ませる。Discord が詰まっていても Join を遅らせすぎないよう待ち時間を区切る
@@ -1062,9 +1086,29 @@ impl Actor {
         });
     }
 
+    /// run ごとの作業ディレクトリのうち、空のものと期限を過ぎたものを消す。workspace は対象外。
+    /// ファイルシステムの走査で actor のループを止めないよう別の task で行い、動いている run の集合は開始時に複製して渡す
+    pub fn sweep_work_dirs(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let pool = self.worker.as_ref()?;
+        let root = self.config.paths.work_root();
+        let retention = pool.work_retention;
+        let active = self.active_runs.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            let swept = workdir::sweep(&root, retention, &active, std::time::SystemTime::now());
+            if swept.empty + swept.expired > 0 {
+                tracing::info!(
+                    empty = swept.empty,
+                    expired = swept.expired,
+                    "run の作業ディレクトリを片付けました"
+                );
+            }
+        }))
+    }
+
     /// パターン C の Join と報告(§4.3)
     async fn handle_join(&mut self, run_id: &str) -> Result<()> {
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.active_runs.remove(run_id);
         let guild = self.guild;
         let Some(run) = self.store.worker_run(run_id).await? else {
             tracing::warn!(run_id, "Join の run が見つかりません");
@@ -1826,9 +1870,6 @@ async fn execute(
             tracing::warn!(error = %e, run_id = %task.run_id, "run を running にできませんでした。そのまま実行します");
         }
     }
-    if let Err(e) = create_work_dir(&task.work_dir) {
-        return WorkerOutcome::Failed(format!("作業ディレクトリを作れませんでした: {e}"));
-    }
     // Worker の panic で Join が積まれず in_flight が減らなくなるのを防ぐため、別 task で動かして JoinError を拾う
     let mut handle = tokio::spawn(async move { worker.run(task).await });
     // timeout でこの future ごと捨てられたときに Worker が裏で動き続けないよう、drop で止める
@@ -1845,24 +1886,6 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
-}
-
-/// tool-shell の cwd になる。他のユーザーに作業内容を読ませないよう 0700 にする
-fn create_work_dir(path: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
 
 /// 新しい crate を足さずに一意にするため、起動以来の連番を時刻に添える。作業ディレクトリ名にも使う

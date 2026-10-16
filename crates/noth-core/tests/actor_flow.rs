@@ -1271,13 +1271,15 @@ async fn spawn_task_posts_ack_and_records_goal_before_fork() {
     assert_eq!(task.base.harness_rules, main.harness_rules);
     assert!(task.work_dir.starts_with(h.home.join("work")));
     assert!(task.work_dir.ends_with(&task.run_id));
+    // 作業ディレクトリは shell が初めて使うときに作る。使われない run に空のディレクトリを残さない
+    assert!(!task.work_dir.exists());
+    // 残す成果物の置き場所は、Worker が動く前に 0700 で用意される
+    let workspace = h.home.join("workspace");
+    assert!(workspace.is_dir());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&task.work_dir)
-            .unwrap()
-            .permissions()
-            .mode();
+        let mode = std::fs::metadata(&workspace).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
     }
 
@@ -3195,4 +3197,123 @@ async fn follow_up_pushed_out_of_the_router_window_is_still_counted() {
     }
     h.process_next_job().await;
     assert_eq!(h.router_calls(), before + 1);
+}
+
+const STALE_RUN: &str = "1792170173263-9";
+
+/// 片付けの期限判定は最終更新を見るので、中身も含めて 30 日前にする
+fn make_old(path: &std::path::Path) {
+    let old = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            for e in std::fs::read_dir(&p).unwrap() {
+                stack.push(e.unwrap().path());
+            }
+        }
+        std::fs::File::open(&p).unwrap().set_modified(old).unwrap();
+    }
+}
+
+fn seed(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    make_old(dir);
+}
+
+#[tokio::test]
+async fn sweep_keeps_active_run_and_workspace_but_removes_stale_ones() {
+    let mut h = Harness::setup(Setup {
+        worker: true,
+        worker_permits: 0,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(spawn_answers());
+    h.provider
+        .script_text("ちょっと調べるね\n[Goal]\n東京の明日の天気を調べる");
+    h.say(GENERAL, "明日の東京の天気わかる?").await;
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    let task = h.worker.tasks.lock().unwrap()[0].clone();
+
+    // shell が作った下書きが、期限を過ぎていても動いている run のものなら消さない
+    seed(&task.work_dir);
+    let stale = h.home.join("work").join(STALE_RUN);
+    seed(&stale);
+    let ws_file = h.home.join("workspace").join("tool").join("old.txt");
+    std::fs::create_dir_all(ws_file.parent().unwrap()).unwrap();
+    std::fs::write(&ws_file, "x").unwrap();
+    make_old(ws_file.parent().unwrap());
+
+    h.actor.sweep_work_dirs().unwrap().await.unwrap();
+    assert!(task.work_dir.join("a.txt").exists());
+    assert!(!stale.exists());
+    assert!(ws_file.exists());
+
+    // 終わった run は、Join の前でも次の片付けで対象になる
+    h.worker.release.add_permits(1);
+    assert_eq!(h.process_next_job().await, "join");
+    h.actor.sweep_work_dirs().unwrap().await.unwrap();
+    assert!(!task.work_dir.exists());
+    assert!(ws_file.exists());
+}
+
+#[tokio::test]
+async fn empty_work_dir_is_removed_when_the_run_ends() {
+    let mut h = Harness::setup(Setup {
+        worker: true,
+        worker_permits: 0,
+        ..Setup::default()
+    })
+    .await;
+    h.router.set(spawn_answers());
+    h.provider
+        .script_text("ちょっと調べるね\n[Goal]\n東京の明日の天気を調べる");
+    h.say(GENERAL, "明日の東京の天気わかる?").await;
+    let worker = h.worker.clone();
+    wait_until(|| worker.started() == 1).await;
+    let task = h.worker.tasks.lock().unwrap()[0].clone();
+    // shell が cwd を作っただけで何も置かなかった run
+    std::fs::create_dir_all(&task.work_dir).unwrap();
+    h.worker.release.add_permits(1);
+    wait_until(|| !task.work_dir.exists()).await;
+}
+
+#[tokio::test]
+async fn startup_sweep_runs_in_the_actor_loop() {
+    let store = Store::open_memory().await.unwrap();
+    let channel = Arc::new(MockChannel::default());
+    let (meter, meter_rx) = tokio::sync::mpsc::unbounded_channel();
+    let modules = Modules {
+        channel: channel.clone(),
+        router: Arc::new(MockRouter::default()),
+        provider: Arc::new(MeteredProvider::new(
+            Arc::new(MockProvider::new()),
+            "provider-mock",
+            meter.clone(),
+        )),
+        worker: Some(Arc::new(MockWorker::new(1)) as Arc<dyn Worker>),
+        compactor: None,
+        tools: Vec::new(),
+        commands: Vec::new(),
+        meter: meter.clone(),
+        meter_rx,
+    };
+    let cfg = config(80_000, toml::Table::new());
+    let home = cfg.paths.home.clone();
+    let stale = home.join("work").join(STALE_RUN);
+    seed(&stale);
+    let fresh = home.join("work").join("1792170173263-10");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::write(fresh.join("a.txt"), "x").unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(noth_core::actor::run(cfg, modules, store, async move {
+        let _ = stop_rx.await;
+    }));
+    wait_until(|| !stale.exists()).await;
+    assert!(fresh.join("a.txt").exists());
+    assert!(home.join("workspace").is_dir());
+    stop_tx.send(()).unwrap();
+    handle.await.unwrap().unwrap();
 }

@@ -156,7 +156,9 @@ $NOTH_HOME/
 ├── data/
 │   └── noth.sqlite       # 全 guild 共通。各テーブルが guild_id を持つ
 ├── work/
-│   └── <run_id>/         # tool-shell の作業ディレクトリ(run ごと)
+│   └── <run_id>/         # tool-shell の作業ディレクトリ(run ごとの下書き。使うときに作る。空なら run の終了時に、中身があっても work_retention_days を過ぎたら消す)
+├── workspace/
+│   └── <作業名>/         # Worker が残す成果物の置き場所(起動時に 0700 で作る。片付けの対象外。環境変数 NOTH_WORKSPACE でも渡す)
 └── logs/
 ```
 
@@ -320,6 +322,7 @@ max_iterations        = 25       # tool 呼び出しの反復上限
 tool_output_max_chars = 20000    # 各 tool の出力の文字数上限。超えた分は切り詰める。tool-discord は約 12000 文字で項目単位に収めるので、12000 以上を推奨
 approval              = "auto"   # MVP では auto のみ。有効な tool はどの run でも承認なしで呼べる(security.md §3)
 show_progress         = true     # Ack を編集して、Worker が使った tool(検索語や URL)を表示する
+work_retention_days   = 7        # work/<run_id>/ を最終更新からこの日数で消す。0 なら期限では消さない(空のものは消す)。workspace は消さない。アップグレード後の最初の起動で、この日数より古い下書きと空のディレクトリが消える(消した run_id とパスは info ログに出る)
 
 [compactor]
 idle_minutes      = 10           # 人間の最終発言からの経過。Noth 自身の投稿では解除しない
@@ -347,7 +350,7 @@ max_duration_secs  = 300         # TinyFish 側で run を打ち切る秒数。A
 [tool.discord]
 # actions = ["fetch_messages", "search_messages", "list_channels"]   # 使える action を絞る。省略か空なら全部
 [tool.shell]
-# cwd は run ごとの $NOTH_HOME/work/<run_id>/ に固定。設定項目なし
+# cwd は run ごとの $NOTH_HOME/work/<run_id>/ に固定。設定項目なし。残す成果物は $NOTH_HOME/workspace/ に置く
 
 [backend.tinyfish]
 api_key = "${TINYFISH_API_KEY}"

@@ -23,11 +23,21 @@ pub fn register(reg: &mut Registry) {
     reg.register_tool("tool-shell", factory);
 }
 
-fn factory(_ctx: &ModuleCtx) -> Result<Arc<dyn Tool>> {
-    Ok(Arc::new(ShellTool))
+fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Tool>> {
+    Ok(Arc::new(ShellTool {
+        // 作れなかったときは、存在しない場所を環境変数で案内しない
+        workspace: ctx
+            .config
+            .paths
+            .ensure_workspace()
+            .ok()
+            .map(|()| noth_core::config::absolute(&ctx.config.paths.workspace())),
+    }))
 }
 
-struct ShellTool;
+struct ShellTool {
+    workspace: Option<std::path::PathBuf>,
+}
 
 #[async_trait]
 impl Tool for ShellTool {
@@ -78,6 +88,12 @@ impl Tool for ShellTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // cwd は run ごとの下書き用なので、残す成果物の置き場所は環境変数で渡す。
+        // 無いときは、親プロセスから引き継いだ同名の変数を残さない
+        match &self.workspace {
+            Some(w) => cmd.env("NOTH_WORKSPACE", w),
+            None => cmd.env_remove("NOTH_WORKSPACE"),
+        };
         // 孫プロセスまでまとめて止めるため、専用のプロセスグループで動かす
         #[cfg(unix)]
         cmd.process_group(0);

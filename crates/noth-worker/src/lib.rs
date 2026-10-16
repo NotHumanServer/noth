@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use noth_core::approval::ApprovalPolicy;
-use noth_core::config::WorkerSettings;
+use noth_core::config::{HostInfo, WorkerSettings};
 use noth_core::registry::{ModuleCtx, Registry, WorkerDeps};
 use noth_core::traits::{Provider, Tool, Worker, WorkerOutcome, WorkerProgress, WorkerTask};
 use noth_core::types::*;
@@ -21,11 +21,10 @@ fn factory(ctx: &ModuleCtx, deps: WorkerDeps) -> Result<Arc<dyn Worker>> {
             settings.approval
         )));
     }
-    Ok(Arc::new(AgentWorker::new(
-        deps,
-        settings,
-        ctx.config.context.max_tokens,
-    )))
+    Ok(Arc::new(
+        AgentWorker::new(deps, settings, ctx.config.context.max_tokens)
+            .with_host(HostInfo::detect(&ctx.config.paths)),
+    ))
 }
 
 pub struct AgentWorker {
@@ -36,9 +35,16 @@ pub struct AgentWorker {
     settings: WorkerSettings,
     max_tokens: u32,
     meter: MeterSink,
+    /// 起動時に取った実行環境。None なら環境の説明を省く
+    host: Option<HostInfo>,
 }
 
 impl AgentWorker {
+    pub fn with_host(mut self, host: HostInfo) -> Self {
+        self.host = Some(host);
+        self
+    }
+
     pub fn new(deps: WorkerDeps, settings: WorkerSettings, max_tokens: u32) -> Self {
         let specs = deps.tools.iter().map(|t| t.spec()).collect();
         Self {
@@ -47,6 +53,7 @@ impl AgentWorker {
             specs,
             settings,
             max_tokens,
+            host: None,
             meter: deps.meter,
         }
     }
@@ -356,9 +363,51 @@ fn strip_main_markers(memo: &str) -> String {
         .to_string()
 }
 
+/// 作業場所全体を「一時」と呼ぶと、残っている前の成果物を無いものとして扱ってしまう。
+/// 一方で下書きは消えるので、残すものを workspace に置かせる。前の run の成果物を探せるよう、場所は具体的なパスで伝える
+fn workspace_guidance(
+    work_dir: &std::path::Path,
+    host: Option<&HostInfo>,
+    retention_days: u64,
+) -> String {
+    let expiry = if retention_days > 0 {
+        format!("中身があっても {retention_days} 日で消えます")
+    } else {
+        "中身があっても、古くなると消えることがあります".to_string()
+    };
+    let Some(host) = host else {
+        return format!(
+            "cwd は run ごとの下書き用ディレクトリ({})で、空なら run の終わりに、{expiry}。残したいものは消えるので注意してください。",
+            work_dir.display()
+        );
+    };
+    let mut s = format!(
+        "実行環境: OS {}、ホスト名 {}、NOTH_HOME {}。cwd は run ごとの下書き用ディレクトリ({})で、空なら run の終わりに、{expiry}。残すものは必ず workspace に置いてください。",
+        host.os,
+        host.hostname,
+        host.home.display(),
+        work_dir.display(),
+    );
+    if let Some(workspace) = &host.workspace {
+        s.push_str(&format!(
+            "workspace は `{}` で、残すべき成果物(作ったツール、スクリプト、文書など)は `{}/<作業ごとの分かりやすい名前>/` に置いてください(環境変数 NOTH_WORKSPACE でも参照できます)。並行する別の Worker と衝突しないよう、必ず作業ごとのサブディレクトリを作ってください。前に作ったものは workspace にあります。古い run の下書きは `{}/work/` の下に run ごとに残っている(まだ消えていなければ)ので、前の成果物を探すときは両方を ls で確かめてください。workspace は残るので、作業場所を「一時環境」「一時ディレクトリ」と呼ばないでください。",
+            workspace.display(),
+            workspace.display(),
+            host.home.display()
+        ));
+    }
+    s
+}
+
 /// 指示は Layer 4 にだけ置く。system に足すと main とのキャッシュ共有が崩れる(caching.md §3)。
 /// effort が低いと tool を呼ばずに結論しがちなので、手順を必須として書く
-fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Turn {
+fn instruction(
+    task: &WorkerTask,
+    specs: &[ToolSpec],
+    max_iterations: u32,
+    host: Option<&HostInfo>,
+    retention_days: u64,
+) -> Turn {
     let has = |name: &str| specs.iter().any(|s| s.name == name);
     let names = specs
         .iter()
@@ -428,9 +477,10 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
         }
         if has("shell") {
             steps.push(
-                "shell はホスト上で実行されます。実行したら終了コードと出力を確認し、期待どおりに動いたか確かめてください。ファイルの削除や上書きなど破壊的な操作は、Goal が明示的に求めた場合だけにしてください。作業ディレクトリは run ごとに分かれています。"
+                "shell は Noth を動かしているマシン上で実行されます。実行したら終了コードと出力を確認し、期待どおりに動いたか確かめてください。ファイルの削除や上書きなど破壊的な操作は、Goal が明示的に求めた場合だけにしてください。"
                     .to_string(),
             );
+            steps.push(workspace_guidance(&task.work_dir, host, retention_days));
         }
         if has("discord") {
             steps.push(
@@ -481,6 +531,8 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
          作業が終わったら、結論メモだけを最終回答として書いてください。このとき tool は呼ばないでください。\n\
          結論メモは数百トークンの構造化メモで、次を含めます。\n\
          - 分かったこと・やったこと\n\
+         - 作ったもの(ファイル・ツール・スクリプトなど。何も作っていなければ「なし」)\n\
+         - 置き場所(作ったものの絶対パス。何も作っていなければ「なし」)\n\
          - 出典(URL。Web を使った場合)\n\
          - 不確かな点(確認できなかったことは必ずここに書く)\n\
          tool の生の出力はメモに含めないでください。\n\
@@ -509,6 +561,8 @@ impl Worker for AgentWorker {
             &task,
             &self.specs,
             self.settings.max_iterations,
+            self.host.as_ref(),
+            self.settings.work_retention_days,
         ));
         prompt.cache_to_end = true;
         let params = CompletionParams {
@@ -657,6 +711,7 @@ mod tests {
             tool_output_max_chars: max_chars,
             approval: "auto".into(),
             show_progress: true,
+            work_retention_days: 7,
         }
     }
 
@@ -810,6 +865,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn instruction_names_workspace_and_previous_runs() {
+        let p = MockProvider::new(vec![text("メモ")]);
+        let w = worker(
+            p.clone(),
+            vec![tool("shell", Ok(String::new()))],
+            settings(3, 100),
+        )
+        .with_host(HostInfo {
+            os: "macos".into(),
+            hostname: "mac-mini".into(),
+            home: "/h/.noth".into(),
+            workspace: Some("/h/.noth/workspace".into()),
+        });
+        w.run(task(Origin::Request)).await;
+        let text = p.prompts.lock().unwrap()[0].ephemeral_tail[0].text.clone();
+        for want in [
+            "OS macos、ホスト名 mac-mini、NOTH_HOME /h/.noth",
+            "`/h/.noth/workspace/<作業ごとの分かりやすい名前>/`",
+            "NOTH_WORKSPACE",
+            "`/h/.noth/work/` の下に run ごとに残っている",
+            "「一時環境」「一時ディレクトリ」と呼ばないでください",
+            "空なら run の終わりに、中身があっても 7 日で消えます。残すものは必ず workspace に置いてください",
+            "作ったもの(",
+            "置き場所(作ったものの絶対パス",
+        ] {
+            assert!(text.contains(want), "{want}\n{text}");
+        }
+    }
+
+    #[tokio::test]
     async fn instruction_mentions_only_existing_tools() {
         let both = instruction_text(&["web_search", "web_fetch"]).await;
         assert!(both.contains("web_fetch"));
@@ -828,7 +913,8 @@ mod tests {
         assert!(!both.contains("discord は"));
 
         let with_local = instruction_text(&["shell", "discord"]).await;
-        assert!(with_local.contains("shell はホスト上で実行"));
+        assert!(with_local.contains("shell は Noth を動かしているマシン上で実行"));
+        assert!(with_local.contains("空なら run の終わりに、中身があっても 7 日で消えます"));
         assert!(with_local.contains("discord は読み取り専用"));
         assert!(!with_local.contains("2〜4 回検索"));
 

@@ -57,8 +57,48 @@ impl Paths {
     pub fn run_lock(&self) -> PathBuf {
         self.home.join("data").join("noth.lock")
     }
+    pub fn work_root(&self) -> PathBuf {
+        self.home.join("work")
+    }
+    /// 作るのは shell などが初めて使うとき。ここでは作らない
     pub fn work_dir(&self, run_id: &str) -> PathBuf {
-        self.home.join("work").join(run_id)
+        self.work_root().join(run_id)
+    }
+    /// 残しておく成果物の置き場所。run ごとの `work/<run_id>/` は下書き用で、並行する Worker が衝突しないよう作業ごとのサブディレクトリを切る
+    pub fn workspace(&self) -> PathBuf {
+        self.home.join("workspace")
+    }
+    /// 他のユーザーに成果物を読ませないよう 0700 にする。起動のたびに権限も直すが、直せなくても起動は止めない。
+    /// 利用者が置いたシンボリックリンクの先の権限を勝手に変えないよう、リンクのときはたどって chmod しない
+    pub fn ensure_workspace(&self) -> std::io::Result<()> {
+        let path = self.workspace();
+        let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        if is_link {
+            return if path.is_dir() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    "シンボリックリンクの先がディレクトリではありません",
+                ))
+            };
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            {
+                tracing::warn!(path = %path.display(), error = %e, "workspace の権限を 0700 にできませんでした。そのまま続けます");
+            }
+        }
+        Ok(())
     }
     pub fn logs_dir(&self) -> PathBuf {
         self.home.join("logs")
@@ -76,6 +116,48 @@ impl Paths {
     /// Codex のトークンは更新のたびに書き換わるので、`.env` ではなくここに置く(security.md §5)
     pub fn codex_auth(&self) -> PathBuf {
         self.home.join("data").join("codex-auth.json")
+    }
+}
+
+/// 相対パスのままだと、プロセスの cwd が違う場所を指して見える。LLM に渡すパスは絶対パスにする
+pub fn absolute(path: &std::path::Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// shell が動くマシンの情報。起動時に1回だけ取り、Layer 0 に固定の文字列として入れる(実行中に変えるとキャッシュの先頭が揺れる)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostInfo {
+    pub os: String,
+    pub hostname: String,
+    pub home: PathBuf,
+    /// 作れなかったときは None。存在しない場所を成果物の置き場所として案内しないため
+    pub workspace: Option<PathBuf>,
+}
+
+impl HostInfo {
+    /// workspace もここで用意する。main と Worker がそれぞれ呼ぶが、どちらが先でも同じ結果になる
+    pub fn detect(paths: &Paths) -> Self {
+        // NOTH_HOME 以外の環境変数は読まない方針なので、OS に聞く
+        let hostname = std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "不明".to_string());
+        let workspace = match paths.ensure_workspace() {
+            Ok(()) => Some(absolute(&paths.workspace())),
+            Err(e) => {
+                tracing::warn!(path = %paths.workspace().display(), error = %e, "workspace を用意できません。Worker には置き場所を案内しません");
+                None
+            }
+        };
+        Self {
+            os: std::env::consts::OS.to_string(),
+            hostname,
+            home: absolute(&paths.home),
+            workspace,
+        }
     }
 }
 
@@ -240,6 +322,9 @@ pub struct WorkerSettings {
     /// Ack を編集して tool の使用状況を見せるか
     #[serde(default = "default_show_progress")]
     pub show_progress: bool,
+    /// run ごとの作業ディレクトリを、最終更新からこの日数で消す。0 なら期限では消さない(空のものは消す)
+    #[serde(default = "default_work_retention_days")]
+    pub work_retention_days: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -313,6 +398,9 @@ fn default_max_iterations() -> u32 {
 }
 fn default_tool_output_max_chars() -> usize {
     20_000
+}
+fn default_work_retention_days() -> u64 {
+    7
 }
 fn default_show_progress() -> bool {
     true
@@ -965,6 +1053,108 @@ impl Default for Thresholds {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn work_retention_days_defaults_to_a_week_and_can_be_changed() {
+        assert_eq!(
+            load(BASE, ENV)
+                .unwrap()
+                .worker_settings()
+                .unwrap()
+                .work_retention_days,
+            7
+        );
+        let custom = format!("{BASE}\n[worker]\nwork_retention_days = 30\n");
+        assert_eq!(
+            load(&custom, ENV)
+                .unwrap()
+                .worker_settings()
+                .unwrap()
+                .work_retention_days,
+            30
+        );
+        let off = format!("{BASE}\n[worker]\nwork_retention_days = 0\n");
+        assert_eq!(
+            load(&off, ENV)
+                .unwrap()
+                .worker_settings()
+                .unwrap()
+                .work_retention_days,
+            0
+        );
+    }
+
+    #[test]
+    fn relative_home_gives_absolute_paths_to_the_llm() {
+        let rel = format!("noth-rel-home-{}", std::process::id());
+        let paths = Paths {
+            config: PathBuf::from(&rel).join("config.toml"),
+            env: PathBuf::from(&rel).join(".env"),
+            home: PathBuf::from(&rel),
+        };
+        let host = HostInfo::detect(&paths);
+        assert!(host.home.is_absolute());
+        assert!(host.workspace.as_ref().is_some_and(|w| w.is_absolute()));
+        assert!(absolute(&paths.work_dir("1792170173263-1")).is_absolute());
+        std::fs::remove_dir_all(&rel).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_symlink_is_followed_without_chmod_and_failures_are_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("noth-ws-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&target, home.join("workspace")).unwrap();
+        let paths = Paths {
+            config: home.join("config.toml"),
+            env: home.join(".env"),
+            home: home.clone(),
+        };
+        paths.ensure_workspace().unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        // 先が無いリンクは作れないので、Worker には置き場所を案内しない
+        std::fs::remove_dir_all(&target).unwrap();
+        assert!(paths.ensure_workspace().is_err());
+        assert_eq!(HostInfo::detect(&paths).workspace, None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn workspace_is_created_with_0700_and_fixed_in_host_info() {
+        let home = std::env::temp_dir().join(format!("noth-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let paths = Paths {
+            config: home.join("config.toml"),
+            env: home.join(".env"),
+            home: home.clone(),
+        };
+        paths.ensure_workspace().unwrap();
+        paths.ensure_workspace().unwrap();
+        assert_eq!(paths.workspace(), home.join("workspace"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(paths.workspace())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        let host = HostInfo::detect(&paths);
+        assert_eq!(host, HostInfo::detect(&paths));
+        assert_eq!(
+            host.workspace,
+            Some(std::path::absolute(home.join("workspace")).unwrap())
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     fn load(config: &str, env: &str) -> Result<Config> {
         static N: AtomicUsize = AtomicUsize::new(0);

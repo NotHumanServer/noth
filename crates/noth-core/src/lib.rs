@@ -20,6 +20,7 @@ pub mod supplement;
 pub mod text;
 pub mod traits;
 pub mod types;
+pub mod workdir;
 
 pub use async_trait::async_trait;
 pub use error::{Error, Result};

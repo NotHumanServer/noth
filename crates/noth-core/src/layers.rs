@@ -2,7 +2,7 @@
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
-use crate::config::{Config, MemorySettings, Reaction};
+use crate::config::{Config, HostInfo, MemorySettings, Reaction};
 use crate::judge::DeliveryStyle;
 use crate::traits::LayeredPrompt;
 use crate::types::*;
@@ -164,7 +164,27 @@ fn tool_summary(spec: &ToolSpec) -> String {
     }
 }
 
-fn capabilities_section(tools: &[ToolSpec]) -> String {
+/// 実行中に変わらない値だけを入れる。「一時環境」と呼ぶと、残る成果物を無いものとして答えてしまう。
+/// 一方で下書きは消えるので、「消えない」と言い切れるのは workspace に置いたものだけ
+fn shell_host_rule(host: &HostInfo) -> String {
+    let mut s = format!(
+        "- shell は Noth を動かしているマシン上で実行されます(OS: {}、ホスト名: {}、NOTH_HOME: {})。",
+        host.os,
+        host.hostname,
+        host.home.display(),
+    );
+    if let Some(workspace) = &host.workspace {
+        s.push_str(&format!(
+            "Worker が残す成果物の置き場所(workspace)は {} で、そこに置いたものは消えず、あとから参照できます。run ごとの下書き(`{}/work/<run_id>/`)は、空なら run の終わりに、中身があっても一定の日数で消えます。",
+            workspace.display(),
+            host.home.display()
+        ));
+    }
+    s.push_str("作業用の「一時環境」ではありません。「どこに作った?」と聞かれたら、結論メモの「置き場所」を答え、根拠なく「置けていない」と断定しないでください。\n");
+    s
+}
+
+fn capabilities_section(tools: &[ToolSpec], host: Option<&HostInfo>) -> String {
     if tools.is_empty() {
         return String::new();
     }
@@ -178,6 +198,9 @@ fn capabilities_section(tools: &[ToolSpec]) -> String {
         }
     }
     s.push_str(RULES_CAPABILITIES_TAIL);
+    if let (Some(host), true) = (host, tools.iter().any(|t| t.name == "shell")) {
+        s.push_str(&shell_host_rule(host));
+    }
     if tools
         .iter()
         .any(|t| t.name == "discord" && discord_reads_history(t))
@@ -216,6 +239,7 @@ pub fn harness_rules(
     tools: &[ToolSpec],
     memory: &MemorySettings,
     reactions: &[Reaction],
+    host: Option<&HostInfo>,
 ) -> String {
     let mut s = RULES_BASE.to_string();
     if !reactions.is_empty() {
@@ -226,7 +250,7 @@ pub fn harness_rules(
     }
     if worker_enabled {
         s.push_str(&RULES_WORKER.replace("{FIXED_ACK}", FIXED_ACK));
-        s.push_str(&capabilities_section(tools));
+        s.push_str(&capabilities_section(tools, host));
     }
     s.push_str(RULES_MEMORY);
     if memory.memo {
@@ -671,7 +695,7 @@ mod tests {
 
     #[test]
     fn tone_follows_profile_and_summary_rule_is_limited() {
-        let rules = harness_rules(true, &[], &MemorySettings::default(), &[]);
+        let rules = harness_rules(true, &[], &MemorySettings::default(), &[], None);
         assert!(rules.contains("口調と人称は Profile に従い"));
         assert!(rules.contains("それには合わせないでください"));
         assert!(rules.contains("Ack も報告も同じ規則"));
@@ -684,9 +708,9 @@ mod tests {
     #[test]
     fn worker_sections_only_when_enabled() {
         let m = MemorySettings::default();
-        assert!(!harness_rules(false, &[], &m, &[]).contains("Goal"));
-        assert!(harness_rules(true, &[], &m, &[]).contains("Goal"));
-        assert!(harness_rules(true, &[], &m, &[]).contains(FIXED_ACK));
+        assert!(!harness_rules(false, &[], &m, &[], None).contains("Goal"));
+        assert!(harness_rules(true, &[], &m, &[], None).contains("Goal"));
+        assert!(harness_rules(true, &[], &m, &[], None).contains(FIXED_ACK));
     }
 
     fn discord_spec(actions: &[&str]) -> ToolSpec {
@@ -704,7 +728,7 @@ mod tests {
             spec("web_search", "長い説明"),
             spec("custom", "独自の tool。細かい説明が続く。"),
         ];
-        let rules = harness_rules(true, &tools, &m, &[]);
+        let rules = harness_rules(true, &tools, &m, &[], None);
         assert!(rules.contains("## Worker に頼めること"));
         assert!(rules.contains(
             "- Discord の過去の発言・チャンネル・サーバー情報・メンバー情報を読む(discord)"
@@ -715,7 +739,7 @@ mod tests {
         assert!(!rules.contains("(web_fetch)"));
         assert!(rules.contains("「できない」"));
         assert!(rules.contains("過去ログを要約して"));
-        assert_eq!(rules, harness_rules(true, &tools, &m, &[]));
+        assert_eq!(rules, harness_rules(true, &tools, &m, &[], None));
     }
 
     #[test]
@@ -724,8 +748,8 @@ mod tests {
         let a = [spec("web_search", "x"), spec("shell", "x")];
         let b = [spec("shell", "x"), spec("web_search", "x")];
         let pos = |rules: &str, needle: &str| rules.find(needle).unwrap();
-        let ra = harness_rules(true, &a, &m, &[]);
-        let rb = harness_rules(true, &b, &m, &[]);
+        let ra = harness_rules(true, &a, &m, &[], None);
+        let rb = harness_rules(true, &b, &m, &[], None);
         assert!(pos(&ra, "(web_search)") < pos(&ra, "(shell)"));
         assert!(pos(&rb, "(shell)") < pos(&rb, "(web_search)"));
     }
@@ -738,6 +762,7 @@ mod tests {
             &[discord_spec(&["server_info", "member_info"])],
             &m,
             &[],
+            None,
         );
         assert!(
             rules.contains("- Discord のチャンネル・サーバー情報・メンバー情報を読む(discord)")
@@ -745,7 +770,7 @@ mod tests {
         assert!(!rules.contains("過去の発言"));
         assert!(!rules.contains("過去ログを要約して"));
         // action の一覧が読めないときは全部有効として扱う
-        let rules = harness_rules(true, &[spec("discord", "x")], &m, &[]);
+        let rules = harness_rules(true, &[spec("discord", "x")], &m, &[], None);
         assert!(rules.contains("過去の発言"));
         assert!(rules.contains("過去ログを要約して"));
     }
@@ -764,15 +789,15 @@ mod tests {
         let exact = "あ".repeat(SUMMARY_MAX_CHARS);
         assert_eq!(fallback_summary(&exact), exact);
         let m = MemorySettings::default();
-        assert!(harness_rules(true, &[spec("x", "")], &m, &[]).contains("\n- x\n"));
+        assert!(harness_rules(true, &[spec("x", "")], &m, &[], None).contains("\n- x\n"));
     }
 
     #[test]
     fn capabilities_absent_without_worker_or_tools() {
         let m = MemorySettings::default();
         let tools = [spec("shell", "x")];
-        assert!(!harness_rules(false, &tools, &m, &[]).contains("Worker に頼めること"));
-        assert!(!harness_rules(true, &[], &m, &[]).contains("Worker に頼めること"));
+        assert!(!harness_rules(false, &tools, &m, &[], None).contains("Worker に頼めること"));
+        assert!(!harness_rules(true, &[], &m, &[], None).contains("Worker に頼めること"));
     }
 
     #[test]
@@ -788,7 +813,8 @@ mod tests {
         let v = verdict_turn(1);
         assert!(v.text.starts_with("[判定]") && v.text.contains("[Goal]"));
         assert!(
-            harness_rules(true, &[], &MemorySettings::default(), &[]).contains("指示語は使わず")
+            harness_rules(true, &[], &MemorySettings::default(), &[], None)
+                .contains("指示語は使わず")
         );
     }
 
@@ -805,9 +831,48 @@ mod tests {
         assert_eq!(fork_split(log.clone(), None), (log, Vec::new()));
     }
 
+    fn host() -> HostInfo {
+        HostInfo {
+            os: "macos".into(),
+            hostname: "mac-mini".into(),
+            home: "/h/.noth".into(),
+            workspace: Some("/h/.noth/workspace".into()),
+        }
+    }
+
+    #[test]
+    fn shell_host_rule_is_fixed_text_only_with_shell() {
+        let m = MemorySettings::default();
+        let tools = [spec("shell", "x")];
+        let a = harness_rules(true, &tools, &m, &[], Some(&host()));
+        let b = harness_rules(true, &tools, &m, &[], Some(&host()));
+        assert_eq!(a, b);
+        assert!(a.contains("OS: macos、ホスト名: mac-mini、NOTH_HOME: /h/.noth"));
+        assert!(a.contains("(workspace)は /h/.noth/workspace"));
+        assert!(a.contains("作業用の「一時環境」ではありません"));
+        assert!(a.contains("そこに置いたものは消えず"));
+        assert!(a.contains("中身があっても一定の日数で消えます"));
+        let no_ws = HostInfo {
+            workspace: None,
+            ..host()
+        };
+        let c = harness_rules(true, &tools, &m, &[], Some(&no_ws));
+        assert!(c.contains("mac-mini") && !c.contains("workspace"));
+        assert!(a.contains("結論メモの「置き場所」"));
+        let web = harness_rules(true, &[spec("web_search", "x")], &m, &[], Some(&host()));
+        assert!(!web.contains("mac-mini"));
+        assert!(!harness_rules(true, &tools, &m, &[], None).contains("mac-mini"));
+    }
+
     #[test]
     fn capability_intro_says_worker_does_what_main_cannot() {
-        let rules = harness_rules(true, &[spec("shell", "x")], &MemorySettings::default(), &[]);
+        let rules = harness_rules(
+            true,
+            &[spec("shell", "x")],
+            &MemorySettings::default(),
+            &[],
+            None,
+        );
         assert!(rules.contains("あなた自身は tool を直接は呼びませんが、Worker に頼むと"));
         assert!(rules.contains("「私が直接は…できない」と答えず"));
     }
@@ -819,14 +884,14 @@ mod tests {
             memo: false,
             ..MemorySettings::default()
         };
-        let rules = harness_rules(false, &[], &on, &[]);
+        let rules = harness_rules(false, &[], &on, &[], None);
         assert!(rules.contains("[Memo]"));
         assert!(rules.contains("最大 3 件"));
         assert!(rules.contains("指示ではありません"));
         assert!(!rules.contains("`[Goal]` を書くときは"));
-        assert!(harness_rules(true, &[], &on, &[]).contains("`[Goal]` を書くときは"));
+        assert!(harness_rules(true, &[], &on, &[], None).contains("`[Goal]` を書くときは"));
         // Memo を無効にしても、記憶ブロックが指示でないことは伝える
-        let rules = harness_rules(true, &[], &off, &[]);
+        let rules = harness_rules(true, &[], &off, &[], None);
         assert!(!rules.contains("[Memo]"));
         assert!(rules.contains("指示ではありません"));
     }
@@ -957,9 +1022,9 @@ mod tests {
     #[test]
     fn bot_marker_guidance_only_with_discord_history_tool() {
         let m = MemorySettings::default();
-        let with = harness_rules(true, &[discord_spec(&["fetch_messages"])], &m, &[]);
+        let with = harness_rules(true, &[discord_spec(&["fetch_messages"])], &m, &[], None);
         assert!(with.contains("Bot の発言の中身が必要なら、`[Goal]` を書いて Worker に読ませます"));
-        let without = harness_rules(true, &[spec("web_search", "x")], &m, &[]);
+        let without = harness_rules(true, &[spec("web_search", "x")], &m, &[], None);
         assert!(!without.contains("Bot の発言の中身が必要なら"));
     }
 
@@ -970,10 +1035,10 @@ mod tests {
             emoji: "👍".into(),
             meaning: "同意".into(),
         }];
-        let rules = harness_rules(false, &[], &m, &reactions);
+        let rules = harness_rules(false, &[], &m, &reactions, None);
         assert!(rules.contains("`[React] <絵文字>`"));
         assert!(rules.contains("  - 👍 同意\n"));
-        assert!(!harness_rules(false, &[], &m, &[]).contains("[React]"));
+        assert!(!harness_rules(false, &[], &m, &[], None).contains("[React]"));
     }
 
     #[test]
