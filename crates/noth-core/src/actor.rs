@@ -428,6 +428,10 @@ impl Actor {
 
     /// 判定 → TopicChunk 割り当て → (介入するなら)応答と昇格を 1 ユニットとして行う
     pub async fn handle_judge(&mut self, batch: JudgeBatch) -> Result<()> {
+        let batch = match self.channel.exclusions() {
+            Some(ex) => ex.filter_batch(batch).await,
+            None => batch,
+        };
         let (Some(first), Some(last)) = (batch.messages.first(), batch.messages.last()) else {
             return Ok(());
         };
@@ -1706,6 +1710,10 @@ impl Actor {
             .into_iter()
             .filter(|r| !exclude.contains(&r.id))
             .collect();
+        let rows = match self.channel.exclusions() {
+            Some(ex) => ex.filter_rows(rows).await,
+            None => rows,
+        };
 
         let mut groups: Vec<(i64, Vec<MessageRow>)> = Vec::new();
         for row in rows {

@@ -461,7 +461,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<MessageRow>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND id < ? ORDER BY id DESC LIMIT ?"
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND hidden = 0 AND id < ? ORDER BY id DESC LIMIT ?"
         )))
         .bind(guild as i64)
         .bind(before_id)
@@ -479,7 +479,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<MessageRow>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND id > ? ORDER BY id ASC LIMIT ?"
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND hidden = 0 AND id > ? ORDER BY id ASC LIMIT ?"
         )))
         .bind(guild as i64)
         .bind(after_id)
@@ -597,7 +597,7 @@ impl Store {
     /// Noth 自身の発言は判定対象にしない
     pub async fn unjudged_messages(&self, guild: GuildId) -> Result<Vec<MessageRow>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND decision_id IS NULL AND is_self = 0 AND is_bot_marker = 0 ORDER BY id ASC"
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND hidden = 0 AND decision_id IS NULL AND is_self = 0 AND is_bot_marker = 0 ORDER BY id ASC"
         )))
         .bind(guild as i64)
         .fetch_all(&self.pool)
@@ -607,7 +607,7 @@ impl Store {
     pub async fn buffered_messages(&self, guild: GuildId) -> Result<Vec<MessageRow>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages
-             WHERE guild_id = ? AND decision_id IS NOT NULL AND is_noise = 0 AND promoted_turn_id IS NULL AND is_self = 0
+             WHERE guild_id = ? AND hidden = 0 AND decision_id IS NOT NULL AND is_noise = 0 AND promoted_turn_id IS NULL AND is_self = 0
              ORDER BY id ASC"
         )))
         .bind(guild as i64)

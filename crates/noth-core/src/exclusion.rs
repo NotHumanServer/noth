@@ -1,10 +1,12 @@
 //! チャンネルの除外。除外したチャンネルは Noth にとって存在しないものとして扱い、受信・判定・Layer 3・tool の参照・検索のどれにも出さない。
 //! 受信する Channel と参照する tool が同じ状態を見るために、ここで 1 つの共有状態を持つ。
-//! 実効の除外は config(`ignored_channels`)とコマンド(DB に保存)の和集合で、変更はプロセスを再起動せずに次の発言から効く
+//! 実効の除外は config(`ignored_channels`)とコマンド(DB に保存)の和集合で、変更はプロセスを再起動せずに次の発言から効く。
+//! 指定はカテゴリでもよいので、Channel が配下のチャンネルとスレッドを展開した ID の集合(`set_expanded`)も持ち、Core と tool は ID だけで判定できる
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use crate::store::Store;
+use crate::judge::JudgeBatch;
+use crate::store::{MessageRow, Store};
 use crate::types::{ChannelId, GuildId, UserId};
 use crate::{Error, Result};
 
@@ -20,12 +22,21 @@ struct Inner {
     state: RwLock<State>,
     /// DB への書き込みとメモリへの反映を 1 組にして、同時の変更で食い違わないようにする
     writes: tokio::sync::Mutex<()>,
+    /// config とコマンドで指定した集合が変わるたびに増える。Channel が展開を作り直す合図で、展開の更新では増えない
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Default)]
 struct State {
     config: BTreeSet<ChannelId>,
     commanded: BTreeSet<ChannelId>,
+    expanded: BTreeSet<ChannelId>,
+}
+
+impl State {
+    fn contains(&self, id: &ChannelId) -> bool {
+        self.config.contains(id) || self.commanded.contains(id) || self.expanded.contains(id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +70,7 @@ impl ChannelExclusions {
                 store: OnceLock::new(),
                 state: RwLock::default(),
                 writes: tokio::sync::Mutex::new(()),
+                changes: tokio::sync::watch::channel(0).0,
             }),
         }
     }
@@ -70,23 +82,95 @@ impl ChannelExclusions {
             .store
             .set(store)
             .map_err(|_| Error::Other("チャンネルの除外には保存先が設定済みです".into()))?;
-        let mut state = self.write_state();
-        state.commanded = rows.into_iter().map(|r| r.channel_id).collect();
+        self.write_state().commanded = rows.into_iter().map(|r| r.channel_id).collect();
+        self.notify_changed();
+        self.purge().await;
         Ok(())
     }
 
     /// config の `ignored_channels`。起動時に Channel が設定する
     pub fn set_config(&self, ids: impl IntoIterator<Item = ChannelId>) {
         self.write_state().config = ids.into_iter().collect();
+        self.notify_changed();
+    }
+
+    /// 指定(config とコマンド)の配下を展開した、実際に除外するチャンネルとスレッドの ID。Channel が作り直すたびに丸ごと置き換える。
+    /// 展開に入っていない新しいチャンネルやスレッドは、Channel が受信時に親をたどって判定する
+    pub async fn set_expanded(&self, ids: impl IntoIterator<Item = ChannelId>) {
+        self.write_state().expanded = ids.into_iter().collect();
+        self.purge().await;
+    }
+
+    /// 指定が変わったときに通知が届く。受け取った Channel は展開を作り直す
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.changes.subscribe()
+    }
+
+    fn notify_changed(&self) {
+        self.inner.changes.send_modify(|n| *n += 1);
+    }
+
+    /// 除外したチャンネルに残る、Layer 3 に入る前の発言を、二度と判定・昇格されない状態にする
+    async fn purge(&self) {
+        let Some(store) = self.inner.store.get() else {
+            return;
+        };
+        let ids = self.effective();
+        if ids.is_empty() {
+            return;
+        }
+        match store.hide_channel_messages(self.inner.guild, &ids).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "除外したチャンネルの未処理の発言を外しました"),
+            Err(e) => {
+                tracing::warn!(error = %e, "除外したチャンネルの未処理の発言を外せませんでした")
+            }
+        }
+    }
+
+    /// 展開を含め、ID だけで除外対象と分かるか
+    pub fn is_channel_excluded(&self, channel: ChannelId) -> bool {
+        self.read_state().contains(&channel)
+    }
+
+    /// 判定に回す前の発言群から、除外したチャンネルのものを外す。キューに残っていた分が、除外の確定後に届いたときのため。
+    /// 外した行は DB でも外し、除外を後で解いても拾われないようにする
+    pub async fn filter_batch(&self, mut batch: JudgeBatch) -> JudgeBatch {
+        if !self.is_channel_excluded(batch.channel_id) {
+            return batch;
+        }
+        let ids: Vec<i64> = batch.messages.iter().map(|m| m.row_id).collect();
+        self.hide_rows(&ids).await;
+        batch.messages.clear();
+        batch
+    }
+
+    /// 昇格の前の未昇格バッファから、除外したチャンネルの行を外す。理由は `filter_batch` と同じ
+    pub async fn filter_rows(&self, rows: Vec<MessageRow>) -> Vec<MessageRow> {
+        let (dropped, kept): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|r| self.is_channel_excluded(r.channel_id));
+        if !dropped.is_empty() {
+            let ids: Vec<i64> = dropped.iter().map(|r| r.id).collect();
+            self.hide_rows(&ids).await;
+        }
+        kept
+    }
+
+    async fn hide_rows(&self, ids: &[i64]) {
+        let Some(store) = self.inner.store.get() else {
+            return;
+        };
+        if let Err(e) = store.hide_messages(ids).await {
+            tracing::warn!(error = %e, "除外したチャンネルの発言を外せませんでした");
+        }
     }
 
     /// `chain` は発言のあるチャンネル、その親(カテゴリやスレッドの親チャンネル)、さらにその親の ID。
     /// どれか 1 つでも除外に入っていれば true
     pub fn is_excluded(&self, chain: &[ChannelId]) -> bool {
         let state = self.read_state();
-        chain
-            .iter()
-            .any(|id| state.config.contains(id) || state.commanded.contains(id))
+        chain.iter().any(|id| state.contains(id))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -94,10 +178,12 @@ impl ChannelExclusions {
         state.config.is_empty() && state.commanded.is_empty()
     }
 
-    /// 実効の除外(config とコマンドの和集合)。昇順
+    /// 実際に除外するチャンネルの ID(config とコマンドの指定と、その展開の和集合)。昇順
     pub fn effective(&self) -> Vec<ChannelId> {
         let state = self.read_state();
-        state.config.union(&state.commanded).copied().collect()
+        let mut all: BTreeSet<ChannelId> = state.config.union(&state.commanded).copied().collect();
+        all.extend(state.expanded.iter().copied());
+        all.into_iter().collect()
     }
 
     pub fn list(&self) -> ExclusionList {
@@ -126,6 +212,8 @@ impl ChannelExclusions {
                 .await?;
         }
         self.write_state().commanded.insert(channel);
+        self.notify_changed();
+        self.purge().await;
         Ok(AddOutcome::Added)
     }
 
@@ -151,6 +239,7 @@ impl ChannelExclusions {
                 .await?;
         }
         self.write_state().commanded.remove(&channel);
+        self.notify_changed();
         Ok(if in_config {
             RemoveOutcome::RemovedStillInConfig
         } else {
@@ -264,5 +353,118 @@ mod tests {
         store.drop_ignored_channels_for_test().await;
         assert!(ex.add(5, 9).await.is_err());
         assert!(!ex.is_excluded(&[5]));
+    }
+
+    fn incoming(message_id: u64, channel_id: u64) -> crate::types::IncomingMessage {
+        crate::types::IncomingMessage {
+            guild_id: G,
+            channel_id,
+            channel_name: "c".into(),
+            message_id,
+            user_id: 5,
+            author_name: "a".into(),
+            content: "x".into(),
+            timestamp: jiff::Timestamp::from_millisecond(1_700_000_000_000 + message_id as i64)
+                .unwrap(),
+            is_self: false,
+            mentions_self: false,
+            reply_to_self: false,
+            reply_to: None,
+            bot_marker: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn expansion_is_matched_by_channel_id_and_replaced_wholesale() {
+        let ex = ChannelExclusions::new(G);
+        ex.set_config([1]);
+        ex.set_expanded([1, 2, 3]).await;
+        assert!(ex.is_channel_excluded(3));
+        assert!(ex.is_excluded(&[99, 2]));
+        assert_eq!(ex.effective(), vec![1, 2, 3]);
+        ex.set_expanded([1]).await;
+        assert!(!ex.is_channel_excluded(3));
+        assert_eq!(ex.effective(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn only_changes_to_the_specification_notify_the_channel() {
+        let ex = ChannelExclusions::new(G);
+        let mut rx = ex.changes();
+        rx.mark_unchanged();
+        ex.set_expanded([5]).await;
+        assert!(!rx.has_changed().unwrap());
+        ex.add(5, 9).await.unwrap();
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+        ex.remove(5).await.unwrap();
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn unprocessed_messages_in_excluded_channels_are_dropped_from_every_queue() {
+        let store = Store::open_memory().await.unwrap();
+        let ex = ChannelExclusions::new(G);
+        ex.attach(store.clone()).await.unwrap();
+        let kept = store.insert_message(&incoming(1, 20)).await.unwrap();
+        let in_category = store.insert_message(&incoming(2, 10)).await.unwrap();
+
+        // 展開で初めて分かる除外でも、再起動の復元や昇格の対象から外れる
+        ex.set_expanded([10]).await;
+        let unjudged: Vec<i64> = store
+            .unjudged_messages(G)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(unjudged, vec![kept]);
+
+        // 外す前にキューへ入っていた判定の束
+        let pending = |row_id| crate::judge::PendingMessage {
+            row_id,
+            message_id: 7,
+            author_name: "a".into(),
+            content: "x".into(),
+            at: jiff::Timestamp::UNIX_EPOCH,
+            mentions_self: false,
+            reply_to_self: false,
+            reply_to: None,
+        };
+        let batch = |channel_id, row_id| crate::judge::JudgeBatch {
+            channel_id,
+            channel_name: "c".into(),
+            messages: vec![pending(row_id)],
+        };
+        assert!(
+            ex.filter_batch(batch(10, in_category))
+                .await
+                .messages
+                .is_empty()
+        );
+        assert_eq!(ex.filter_batch(batch(20, kept)).await.messages.len(), 1);
+
+        // 判定済みで未昇格だった行
+        let late = store.insert_message(&incoming(3, 30)).await.unwrap();
+        let decision = store
+            .insert_decision(G, "judge", "m", &serde_json::json!({}), 1)
+            .await
+            .unwrap();
+        let chunk = store
+            .create_chunk(G, 30, jiff::Timestamp::UNIX_EPOCH)
+            .await
+            .unwrap();
+        store
+            .mark_judged(&[late], decision, chunk, false)
+            .await
+            .unwrap();
+        assert_eq!(store.buffered_messages(G).await.unwrap().len(), 1);
+        ex.set_expanded([10, 30]).await;
+        assert!(store.buffered_messages(G).await.unwrap().is_empty());
+
+        let rows = vec![store.message(kept).await.unwrap().unwrap()];
+        assert_eq!(ex.filter_rows(rows).await.len(), 1);
+        let rows = vec![store.message(late).await.unwrap().unwrap()];
+        assert!(ex.filter_rows(rows).await.is_empty());
     }
 }

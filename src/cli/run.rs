@@ -42,6 +42,7 @@ pub async fn run(cfg: Option<&Path>, verbose: bool) -> Result<ExitCode> {
     let store = Store::open(&config.paths.database()).await?;
     if let Some(exclusions) = modules.channel.exclusions() {
         exclusions.attach(store.clone()).await?;
+        modules.channel.load_exclusions().await;
         for (_, tool) in &modules.tools {
             tool.set_exclusions(exclusions.clone());
         }

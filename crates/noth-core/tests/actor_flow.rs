@@ -31,12 +31,16 @@ struct MockChannel {
     edits: Mutex<Vec<(ChannelId, MessageId, String, tokio::time::Instant)>>,
     edit_fail: AtomicBool,
     reactions: Mutex<Vec<(ChannelId, MessageId, String)>>,
+    exclusions: std::sync::OnceLock<noth_core::exclusion::ChannelExclusions>,
 }
 
 #[async_trait]
 impl Channel for MockChannel {
     fn guild_id(&self) -> GuildId {
         GUILD
+    }
+    fn exclusions(&self) -> Option<noth_core::exclusion::ChannelExclusions> {
+        self.exclusions.get().cloned()
     }
     async fn run(&self, bus: BusHandle) -> Result<()> {
         let msgs: Vec<_> = self.scripted.lock().unwrap().drain(..).collect();
@@ -3316,4 +3320,70 @@ async fn startup_sweep_runs_in_the_actor_loop() {
     assert!(home.join("workspace").is_dir());
     stop_tx.send(()).unwrap();
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn restore_skips_rows_of_excluded_channels() {
+    let store = Store::open_memory().await.unwrap();
+    for (c, n, id) in [(GENERAL, "general", 1), (RANDOM, "random", 2)] {
+        store
+            .insert_message(&incoming(c, n, "x", id))
+            .await
+            .unwrap();
+    }
+    let ex = noth_core::exclusion::ChannelExclusions::new(GUILD);
+    ex.attach(store.clone()).await.unwrap();
+    ex.set_expanded([RANDOM]).await;
+    let batches = noth_core::restore::restore(&store, GUILD).await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].channel_id, GENERAL);
+}
+
+#[tokio::test]
+async fn excluded_channel_never_reaches_judge_or_layer3() {
+    let mut h = Harness::new().await;
+    // 除外の前に判定まで済んでいた、未昇格の発言
+    let old = h
+        .store
+        .insert_message(&incoming(RANDOM, "random", "除外前の発言", 1))
+        .await
+        .unwrap();
+    let decision = h
+        .store
+        .insert_decision(GUILD, "judge", "m", &serde_json::json!({}), 1)
+        .await
+        .unwrap();
+    let chunk = h
+        .store
+        .create_chunk(GUILD, RANDOM, Timestamp::now())
+        .await
+        .unwrap();
+    h.store
+        .mark_judged(&[old], decision, chunk, false)
+        .await
+        .unwrap();
+    assert_eq!(h.store.buffered_messages(GUILD).await.unwrap().len(), 1);
+
+    // 保存先を付けない共有状態。展開が済んだ後でもキューに残っていた分を、actor 側が落とす経路を通す
+    let ex = noth_core::exclusion::ChannelExclusions::new(GUILD);
+    ex.set_expanded([RANDOM]).await;
+    h.channel.exclusions.set(ex).unwrap();
+
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    h.say(RANDOM, "Noth、秘密の話").await;
+    assert_eq!(h.router_calls(), 0);
+    assert!(h.sent().is_empty());
+
+    h.say(GENERAL, "Noth はどう思う?").await;
+    assert_eq!(h.router_calls(), 1);
+    assert_eq!(h.sent().len(), 1);
+    let turns = h.store.active_turns(GUILD).await.unwrap();
+    assert!(!turns.is_empty());
+    for t in &turns {
+        assert!(
+            !t.text.contains("除外前の発言") && !t.text.contains("秘密"),
+            "{}",
+            t.text
+        );
+    }
 }

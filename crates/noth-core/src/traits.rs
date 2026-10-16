@@ -70,6 +70,9 @@ pub trait Channel: Send + Sync {
     fn exclusions(&self) -> Option<crate::exclusion::ChannelExclusions> {
         None
     }
+    /// 除外の指定をチャンネルとスレッドの ID に展開して `exclusions()` に載せる。`noth run` が DB の読み込みの後、復元の前に呼ぶ。
+    /// 失敗しても起動は止めない(受信時に親をたどって判定する)ので、戻り値は無い
+    async fn load_exclusions(&self) {}
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
     /// `noth doctor` の疎通確認。結果の説明を返す
