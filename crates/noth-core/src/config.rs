@@ -415,7 +415,7 @@ impl Config {
 
     pub fn module_section(&self, module: &str) -> toml::Value {
         let found = match module.split_once('-') {
-            Some((kind @ ("channel" | "router" | "provider" | "tool"), name)) => {
+            Some((kind @ ("channel" | "router" | "provider" | "tool" | "command"), name)) => {
                 self.table.get(kind).and_then(|v| v.get(name))
             }
             _ => self.table.get(module),
@@ -752,6 +752,7 @@ enabled = [
   # 警告: tool-shell は Bot を動かすユーザーの権限で、サンドボックスなしにコマンドを実行する(security.md §4)
   "tool-shell",
   "tool-discord",              # 読み取り専用の Discord 参照。[channel.discord] のトークンと guild_id を使う
+  "command-context",           # /noth context(master だけ。使用量の表示)。[channel.discord] master が要る
 ]
 
 [profile]
@@ -766,6 +767,7 @@ max_tokens               = 2048  # main の 1 応答の max_tokens
 guild_id      = "000000000000000000"           # 参加している guild の ID に置き換える
 token         = "${DISCORD_BOT_TOKEN}"
 allowed_users = ["000000000000000000"]         # 応答対象にするユーザー ID
+# master      = "000000000000000000"           # 管理コマンド(/noth ...)を使える唯一のユーザー ID。省略するとコマンドは誰にも使えない
 debounce_secs = 2.0
 
 [router]

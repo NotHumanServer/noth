@@ -1,13 +1,15 @@
+mod command;
 mod config;
 mod handler;
 mod state;
 mod text;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use noth_core::async_trait;
 use noth_core::bus::BusHandle;
+use noth_core::command::CommandHost;
 use noth_core::registry::Registry;
 use noth_core::traits::{Channel, ConnectionState};
 use noth_core::types::{self, ChannelId, GuildId, MessageId};
@@ -16,6 +18,7 @@ use serenity::all as sn;
 use serenity::http::Http;
 use serenity::prelude::{Client, GatewayIntents};
 
+use crate::command::{Controller, RestInteractionApi};
 use crate::config::DiscordConfig;
 use crate::handler::Handler;
 use crate::state::{Names, SharedState};
@@ -35,6 +38,7 @@ pub struct DiscordChannel {
     http: Arc<Http>,
     names: Names,
     state: SharedState,
+    commands: OnceLock<Arc<CommandHost>>,
 }
 
 impl DiscordChannel {
@@ -45,11 +49,36 @@ impl DiscordChannel {
             http,
             names: Names::default(),
             state: SharedState::new(),
+            commands: OnceLock::new(),
         }
     }
 
     fn guild(&self) -> sn::GuildId {
         sn::GuildId::new(self.config.guild_id)
+    }
+
+    /// コマンドを持たない、またはアプリケーション情報を取れないときは None で、スラッシュコマンドなしで動く
+    async fn command_controller(&self) -> Option<Arc<Controller>> {
+        let host = self
+            .commands
+            .get()
+            .filter(|h| !h.commands().is_empty())?
+            .clone();
+        let app = match self.http.get_current_application_info().await {
+            Ok(app) => app,
+            Err(e) => {
+                tracing::warn!(error = %transport(e), "アプリケーション情報を取得できないため、スラッシュコマンドは使えません");
+                return None;
+            }
+        };
+        let api = Arc::new(RestInteractionApi::new(
+            self.config.token.clone(),
+            app.id.get(),
+            self.config.guild_id,
+        ));
+        let controller = Controller::new(api, host, self.config.master, self.config.guild_id);
+        controller.sync().await;
+        Some(Arc::new(controller))
     }
 }
 
@@ -89,8 +118,13 @@ impl Channel for DiscordChannel {
         self.config.guild_id
     }
 
+    fn set_commands(&self, host: Arc<CommandHost>) {
+        let _ = self.commands.set(host);
+    }
+
     async fn run(&self, bus: BusHandle) -> Result<()> {
         let me = self.http.get_current_user().await.map_err(transport)?;
+        let commands = self.command_controller().await;
         let handler = Handler {
             bus,
             guild_id: self.config.guild_id,
@@ -99,6 +133,7 @@ impl Channel for DiscordChannel {
             state: self.state.clone(),
             self_id: me.id.get(),
             self_name: me.display_name().to_string(),
+            commands,
         };
         // GUILD_MEMBERS は特権 intent なので要求しない。表示名は REST で取る
         let intents = GatewayIntents::GUILDS

@@ -1603,6 +1603,7 @@ dependencies = [
  "jiff",
  "libc",
  "noth-channel-discord",
+ "noth-command-context",
  "noth-compactor",
  "noth-core",
  "noth-provider-anthropic",
@@ -1649,12 +1650,22 @@ dependencies = [
  "async-trait",
  "jiff",
  "noth-core",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "serenity",
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "noth-command-context"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "noth-core",
+ "tokio",
 ]
 
 [[package]]

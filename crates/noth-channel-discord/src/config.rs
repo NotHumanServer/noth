@@ -5,6 +5,8 @@ pub(crate) struct DiscordConfig {
     pub(crate) token: String,
     pub(crate) guild_id: u64,
     pub(crate) allowed_users: Vec<u64>,
+    /// 管理コマンド(`/noth ...`)を使える唯一のユーザー。未設定なら誰も使えない
+    pub(crate) master: Option<u64>,
 }
 
 // token がログやパニック出力へ漏れないようにする
@@ -14,6 +16,7 @@ impl std::fmt::Debug for DiscordConfig {
             .field("token", &"<redacted>")
             .field("guild_id", &self.guild_id)
             .field("allowed_users", &self.allowed_users)
+            .field("master", &self.master)
             .finish()
     }
 }
@@ -44,10 +47,15 @@ impl DiscordConfig {
                 ));
             }
         };
+        let master = section
+            .get("master")
+            .map(|v| parse_id(v, "channel.discord.master"))
+            .transpose()?;
         Ok(Self {
             token,
             guild_id,
             allowed_users,
+            master,
         })
     }
 }
@@ -72,6 +80,7 @@ mod tests {
             token: "secret".into(),
             guild_id: 1,
             allowed_users: vec![],
+            master: None,
         };
         assert!(!format!("{c:?}").contains("secret"));
     }
@@ -93,9 +102,23 @@ allowed_users = ["1", "2"]"#,
             DiscordConfig {
                 token: "t".into(),
                 guild_id: 123,
-                allowed_users: vec![1, 2]
+                allowed_users: vec![1, 2],
+                master: None,
             }
         );
+    }
+
+    #[test]
+    fn master_is_optional_and_parsed() {
+        let with = DiscordConfig::parse(&section(
+            r#"token = "t"
+guild_id = "1"
+master = "42""#,
+        ))
+        .unwrap();
+        assert_eq!(with.master, Some(42));
+        let without = DiscordConfig::parse(&section("token = \"t\"\nguild_id = \"1\"")).unwrap();
+        assert_eq!(without.master, None);
     }
 
     #[test]
@@ -115,6 +138,15 @@ allowed_users = ["1", 2]"#,
             r#"token = "t"
 guild_id = "1"
 allowed_users = "1""#,
+            r#"token = "t"
+guild_id = "1"
+master = 5"#,
+            r#"token = "t"
+guild_id = "1"
+master = "x""#,
+            r#"token = "t"
+guild_id = "1"
+master = "0""#,
         ] {
             assert!(
                 matches!(DiscordConfig::parse(&section(bad)), Err(Error::Config(_))),

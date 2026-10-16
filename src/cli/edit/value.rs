@@ -97,7 +97,7 @@ pub fn typed_value(key: &str, raw: &str, force_string: bool) -> Result<Value> {
         return id_list(raw);
     }
     let value = plain_value(raw)?;
-    if last == "guild_id" || last.ends_with("_id") {
+    if last == "guild_id" || last == "master" || last.ends_with("_id") {
         return Ok(if value.is_str() {
             value
         } else {

@@ -10,7 +10,7 @@ use crate::types::*;
 const HEADER_MESSAGES: &str = "[発言群]";
 const HEADER_DELIVERY: &str = "[報告の仕方]";
 const HEADER_CHANNEL: &str = "[発言先]";
-const HEADER_EPISODE: &str = "[エピソード ";
+pub(crate) const HEADER_EPISODE: &str = "[エピソード ";
 /// main の応答のうち、この行から後ろが Worker への指示(Goal)。Discord には出さない
 pub const GOAL_MARKER: &str = "[Goal]";
 /// 本文が空の応答に添えるリアクション指定の行頭

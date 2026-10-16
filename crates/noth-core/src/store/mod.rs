@@ -13,6 +13,8 @@ use crate::traits::WorkerProgress;
 use crate::types::*;
 use crate::{Error, Result};
 
+mod usage;
+
 #[derive(Clone)]
 pub struct Store {
     pool: sqlx::SqlitePool,

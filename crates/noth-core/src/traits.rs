@@ -63,6 +63,8 @@ pub trait Channel: Send + Sync {
             "この Channel はリアクションに対応していません".into(),
         ))
     }
+    /// 管理コマンドを受け付ける Channel だけが実装する。`run` の前に 1 回呼ばれる。対応しない Channel は何もしない
+    fn set_commands(&self, _host: std::sync::Arc<crate::command::CommandHost>) {}
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
     /// `noth doctor` の疎通確認。結果の説明を返す

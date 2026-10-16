@@ -26,6 +26,7 @@ noth-tool-web-fetch = { path = "crates/noth-tool-web-fetch" }
 noth-tool-web-agent = { path = "crates/noth-tool-web-agent" }
 noth-tool-discord = { path = "crates/noth-tool-discord" }
 noth-backend-tinyfish = { path = "crates/noth-backend-tinyfish" }
+noth-command-context = { path = "crates/noth-command-context" }
 gcp_auth = "0.12"
 tokio = { version = "1.53", features = ["full"] }
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "http", "cache", "rustls_backend"] }
@@ -48,6 +49,7 @@ default = [
   "channel-discord", "router-systemone", "router-mention",
   "provider-anthropic", "worker", "compactor",
   "tool-web-search", "tool-web-fetch", "tool-shell", "tool-discord",
+  "command-context",
 ]
 channel-discord = ["dep:noth-channel-discord"]
 router-systemone = ["dep:noth-router-systemone"]
@@ -62,6 +64,7 @@ tool-web-fetch = ["dep:noth-tool-web-fetch"]
 tool-web-agent = ["dep:noth-tool-web-agent"]
 tool-shell = ["dep:noth-tool-shell"]
 tool-discord = ["dep:noth-tool-discord"]
+command-context = ["dep:noth-command-context"]
 
 [dependencies]
 noth-core.workspace = true
@@ -78,6 +81,7 @@ noth-tool-web-search = { workspace = true, optional = true }
 noth-tool-web-fetch = { workspace = true, optional = true }
 noth-tool-web-agent = { workspace = true, optional = true }
 noth-tool-discord = { workspace = true, optional = true }
+noth-command-context = { workspace = true, optional = true }
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

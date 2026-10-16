@@ -476,6 +476,7 @@ impl Harness {
                 .compactor
                 .then(|| compactor.clone() as Arc<dyn Compactor>),
             tools: Vec::new(),
+            commands: Vec::new(),
             meter,
             meter_rx: tokio::sync::mpsc::unbounded_channel().1,
         };
@@ -522,6 +523,7 @@ impl Harness {
             Job::Judge(_) => "judge",
             Job::Join { .. } => "join",
             Job::Compact => "compact",
+            Job::Snapshot(_) => "snapshot",
         };
         self.actor.handle(job).await.unwrap();
         label
@@ -689,6 +691,55 @@ async fn about_noth_with_reaction_none_stays_silent() {
 
     assert!(h.channel.reactions.lock().unwrap().is_empty());
     assert!(h.sent().is_empty());
+}
+
+async fn snapshot(h: &mut Harness) -> noth_core::command::ContextSnapshot {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    h.actor.handle(Job::Snapshot(tx)).await.unwrap();
+    rx.await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn snapshot_reports_layers_usage_and_counts_without_changing_state() {
+    let mut h = Harness::new().await;
+    let empty = snapshot(&mut h).await;
+    assert!(empty.last_request.is_none());
+    assert_eq!(
+        (empty.turns, empty.turn_channels, empty.episodes),
+        (0, 0, 0)
+    );
+
+    h.router.set(answers("reply_only", 0.0, 0.0));
+    *h.provider.input_tokens.lock().unwrap() = 1234;
+    h.say(GENERAL, "質問1").await;
+    h.say(RANDOM, "質問2").await;
+    let prompts_before = h.prompts().len();
+
+    let snap = snapshot(&mut h).await;
+    assert_eq!(snap.model, "mock-model");
+    let names: Vec<_> = snap.layers.iter().map(|l| l.name).collect();
+    assert_eq!(
+        names,
+        [
+            "tools",
+            "Layer 0",
+            "Layer 1",
+            "Layer 1.5",
+            "Layer 2",
+            "Layer 3"
+        ]
+    );
+    let layer3 = snap.layers.last().unwrap();
+    assert!(layer3.chars > 0 && layer3.est_tokens > 0);
+    assert_eq!(snap.turns, 4);
+    assert_eq!(snap.turn_channels, 2);
+    let req = snap.last_request.expect("実測が入る");
+    assert_eq!(req.input_tokens, 1234);
+    // 課金記録は run() が計測イベントから保存するので、この harness では空
+    assert_eq!(req.cache_write_tokens, None);
+    assert_eq!(snap.hard_limit_tokens, 80_000);
+    assert_eq!((snap.workers_running, snap.workers_queued), (0, 0));
+    assert_eq!(h.prompts().len(), prompts_before);
 }
 
 #[tokio::test]
@@ -999,6 +1050,7 @@ async fn run_replies_end_to_end_and_marks_disconnected() {
         worker: None,
         compactor: None,
         tools: Vec::new(),
+        commands: Vec::new(),
         meter: tokio::sync::mpsc::unbounded_channel().0,
         meter_rx: tokio::sync::mpsc::unbounded_channel().1,
     };
@@ -1735,6 +1787,7 @@ async fn run_waits_for_worker_join_on_shutdown() {
         worker: Some(worker.clone()),
         compactor: None,
         tools: Vec::new(),
+        commands: Vec::new(),
         meter: tokio::sync::mpsc::unbounded_channel().0,
         meter_rx: tokio::sync::mpsc::unbounded_channel().1,
     };
@@ -2032,6 +2085,7 @@ async fn run_saves_meter_events_before_exit() {
         worker: None,
         compactor: None,
         tools: Vec::new(),
+        commands: Vec::new(),
         meter: meter.clone(),
         meter_rx,
     };

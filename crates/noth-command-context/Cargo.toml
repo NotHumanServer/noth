@@ -1,0 +1,11 @@
+[package]
+name = "noth-command-context"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+noth-core.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

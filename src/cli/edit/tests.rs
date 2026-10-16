@@ -73,6 +73,10 @@ fn id_keys_are_strings() {
     let v = typed("channel.discord.guild_id", "123456789012345678");
     assert_eq!(v.as_str(), Some("123456789012345678"));
     assert_eq!(typed("x.channel_id", "\"42\"").as_str(), Some("42"));
+    assert_eq!(
+        typed("channel.discord.master", "123456789012345678").as_str(),
+        Some("123456789012345678")
+    );
     let users = typed("channel.discord.allowed_users", "111111111111111111");
     assert_eq!(users.to_string(), "[\"111111111111111111\"]");
     let users = typed("channel.discord.allowed_users", "[111, \"222\"]");

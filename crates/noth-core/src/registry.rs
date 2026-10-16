@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::command::Command;
 use crate::config::Config;
 use crate::traits::{Channel, Compactor, Provider, Router, Tool, Worker};
 use crate::{Error, Result};
@@ -16,6 +17,7 @@ pub type ChannelFactory = fn(&ModuleCtx) -> Result<Arc<dyn Channel>>;
 pub type RouterFactory = fn(&ModuleCtx) -> Result<Arc<dyn Router>>;
 pub type ProviderFactory = fn(&ModuleCtx) -> Result<Arc<dyn Provider>>;
 pub type ToolFactory = fn(&ModuleCtx) -> Result<Arc<dyn Tool>>;
+pub type CommandFactory = fn(&ModuleCtx) -> Result<Arc<dyn Command>>;
 /// main と同一 provider・同一 tool 定義で動かすため、Core が組み立てたものを受け取る(caching.md §2)
 pub type WorkerFactory = fn(&ModuleCtx, WorkerDeps) -> Result<Arc<dyn Worker>>;
 pub type CompactorFactory = fn(&ModuleCtx, Arc<dyn Provider>) -> Result<Arc<dyn Compactor>>;
@@ -37,6 +39,7 @@ pub enum ModuleKind {
     Worker,
     Compactor,
     Tool,
+    Command,
 }
 
 /// 設計書にある全 module 名。`noth module list` で built-in でないものも表示するため
@@ -54,6 +57,7 @@ pub const KNOWN_MODULES: &[(&str, ModuleKind)] = &[
     ("tool-web-agent", ModuleKind::Tool),
     ("tool-shell", ModuleKind::Tool),
     ("tool-discord", ModuleKind::Tool),
+    ("command-context", ModuleKind::Command),
 ];
 
 pub fn kind_of(name: &str) -> Option<ModuleKind> {
@@ -69,6 +73,7 @@ pub struct Registry {
     routers: BTreeMap<&'static str, RouterFactory>,
     providers: BTreeMap<&'static str, ProviderFactory>,
     tools: BTreeMap<&'static str, ToolFactory>,
+    commands: BTreeMap<&'static str, CommandFactory>,
     worker: Option<WorkerFactory>,
     compactor: Option<CompactorFactory>,
 }
@@ -83,6 +88,8 @@ pub struct Modules {
     pub compactor: Option<Arc<dyn Compactor>>,
     /// `noth doctor` の疎通確認用。worker が None でも有効な tool は入る
     pub tools: Vec<(&'static str, Arc<dyn Tool>)>,
+    /// 有効な管理コマンド。Channel が対応していれば `/noth <name>` で呼べる
+    pub commands: Vec<Arc<dyn Command>>,
     /// provider の呼び出しと tool の課金が届く。`noth run` が受け取って SQLite に保存する
     pub meter: crate::types::MeterSink,
     pub meter_rx: tokio::sync::mpsc::UnboundedReceiver<crate::types::MeterEvent>,
@@ -101,6 +108,9 @@ impl Registry {
     pub fn register_tool(&mut self, name: &'static str, f: ToolFactory) {
         self.tools.insert(name, f);
     }
+    pub fn register_command(&mut self, name: &'static str, f: CommandFactory) {
+        self.commands.insert(name, f);
+    }
     pub fn register_worker(&mut self, f: WorkerFactory) {
         self.worker = Some(f);
     }
@@ -113,6 +123,7 @@ impl Registry {
             || self.routers.contains_key(name)
             || self.providers.contains_key(name)
             || self.tools.contains_key(name)
+            || self.commands.contains_key(name)
             || (name == "worker" && self.worker.is_some())
             || (name == "compactor" && self.compactor.is_some())
     }
@@ -196,6 +207,13 @@ impl Registry {
                 tools.push((*n, f(&ctx(n))?));
             }
         }
+        let mut commands = Vec::new();
+        for (name, kind) in KNOWN_MODULES {
+            if *kind == ModuleKind::Command && config.is_enabled(name) {
+                let (n, f) = self.commands.get_key_value(name).expect("validated");
+                commands.push(f(&ctx(n))?);
+            }
+        }
         let worker = match self.worker {
             Some(f) if config.is_enabled("worker") => Some(f(
                 &ctx("worker"),
@@ -220,6 +238,7 @@ impl Registry {
             worker,
             compactor,
             tools,
+            commands,
             meter,
             meter_rx,
         })

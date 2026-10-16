@@ -1,0 +1,459 @@
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use noth_core::command::{Command, CommandEnv, ContextSnapshot, ContextSource, ReportSection};
+use noth_core::{Error, Result, async_trait};
+
+use super::api::ApiError;
+use super::render::FLAG_IS_COMPONENTS_V2;
+use super::*;
+
+const GUILD: u64 = 10;
+const MASTER: u64 = 1;
+
+type Rejects = fn(&Value) -> bool;
+
+#[derive(Debug, Clone, PartialEq)]
+enum Call {
+    Sync(Value),
+    Callback(u64, Value),
+    Edit(Value),
+    Followup(Value),
+}
+
+/// 呼び出しを記録し、`reject` に当たる本文を持つ編集・followup は 400 で断る
+#[derive(Default)]
+struct FakeApi {
+    calls: Mutex<Vec<Call>>,
+    reject: Mutex<Vec<Rejects>>,
+}
+
+impl FakeApi {
+    fn calls(&self) -> Vec<Call> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn rejecting(self, f: Rejects) -> Self {
+        self.reject.lock().unwrap().push(f);
+        self
+    }
+
+    fn check(&self, body: &Value) -> std::result::Result<(), ApiError> {
+        if self.reject.lock().unwrap().iter().any(|f| f(body)) {
+            Err(ApiError {
+                status: 400,
+                body: "rejected".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl InteractionApi for FakeApi {
+    async fn sync_commands(&self, body: &Value) -> std::result::Result<(), ApiError> {
+        self.calls.lock().unwrap().push(Call::Sync(body.clone()));
+        Ok(())
+    }
+    async fn callback(
+        &self,
+        id: u64,
+        _token: &str,
+        body: &Value,
+    ) -> std::result::Result<(), ApiError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::Callback(id, body.clone()));
+        Ok(())
+    }
+    async fn edit_original(&self, _token: &str, body: &Value) -> std::result::Result<(), ApiError> {
+        self.calls.lock().unwrap().push(Call::Edit(body.clone()));
+        self.check(body)
+    }
+    async fn followup(&self, _token: &str, body: &Value) -> std::result::Result<(), ApiError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::Followup(body.clone()));
+        self.check(body)
+    }
+}
+
+struct FakeCommand {
+    runs: Arc<AtomicUsize>,
+    fail: bool,
+}
+
+#[async_trait]
+impl Command for FakeCommand {
+    fn name(&self) -> &'static str {
+        "context"
+    }
+    fn description(&self) -> &'static str {
+        "使用量を見る"
+    }
+    async fn run(&self, _env: &CommandEnv) -> Result<Report> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            return Err(Error::Other("actor が停止しています".into()));
+        }
+        Ok(Report {
+            title: "文脈の使用量".into(),
+            sections: vec![ReportSection {
+                heading: "全体".into(),
+                body: "42%".into(),
+            }],
+        })
+    }
+}
+
+struct NoSnapshot;
+
+#[async_trait]
+impl ContextSource for NoSnapshot {
+    async fn context_snapshot(&self) -> Result<ContextSnapshot> {
+        Err(Error::Other("unused".into()))
+    }
+}
+
+struct Fixture {
+    api: Arc<FakeApi>,
+    runs: Arc<AtomicUsize>,
+    controller: Controller,
+}
+
+fn fixture(api: FakeApi, master: Option<u64>, fail: bool) -> Fixture {
+    let api = Arc::new(api);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let host = Arc::new(CommandHost::new(
+        vec![Arc::new(FakeCommand {
+            runs: runs.clone(),
+            fail,
+        })],
+        CommandEnv::new(Arc::new(NoSnapshot)),
+    ));
+    Fixture {
+        controller: Controller::new(api.clone(), host, master, GUILD),
+        api,
+        runs,
+    }
+}
+
+fn slash(user_id: u64, guild_id: Option<u64>, sub: Option<&str>) -> Incoming {
+    Incoming {
+        id: 77,
+        token: "tok".into(),
+        user_id,
+        guild_id,
+        kind: Kind::Slash {
+            name: "noth".into(),
+            sub: sub.map(Into::into),
+        },
+    }
+}
+
+fn button(user_id: u64, custom_id: &str) -> Incoming {
+    Incoming {
+        id: 77,
+        token: "tok".into(),
+        user_id,
+        guild_id: Some(GUILD),
+        kind: Kind::Button {
+            custom_id: custom_id.into(),
+        },
+    }
+}
+
+fn is_v2(body: &Value) -> bool {
+    body["flags"]
+        .as_u64()
+        .is_some_and(|f| f & FLAG_IS_COMPONENTS_V2 != 0)
+}
+
+fn is_embed(body: &Value) -> bool {
+    body.get("embeds").is_some()
+}
+
+fn assert_denied(calls: &[Call]) {
+    assert_eq!(
+        calls,
+        [Call::Callback(
+            77,
+            json!({"type": 4, "data": {
+                "content": "権限がありません",
+                "allowed_mentions": {"parse": []},
+                "flags": 64,
+            }})
+        )]
+    );
+}
+
+#[tokio::test]
+async fn non_master_is_denied_without_running_the_command() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller
+        .handle(slash(2, Some(GUILD), Some("context")))
+        .await;
+    assert_denied(&f.api.calls());
+    assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn nobody_can_run_it_when_master_is_unset() {
+    let f = fixture(FakeApi::default(), None, false);
+    f.controller
+        .handle(slash(MASTER, Some(GUILD), Some("context")))
+        .await;
+    assert_denied(&f.api.calls());
+    assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn other_guild_and_dm_are_denied() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller
+        .handle(slash(MASTER, Some(GUILD + 1), Some("context")))
+        .await;
+    f.controller
+        .handle(slash(MASTER, None, Some("context")))
+        .await;
+    assert_eq!(f.api.calls().len(), 2);
+    assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn non_master_cannot_press_refresh() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller.handle(button(2, "noth:refresh:context")).await;
+    assert_denied(&f.api.calls());
+    assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn master_gets_deferred_ephemeral_then_v2_edit() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller
+        .handle(slash(MASTER, Some(GUILD), Some("context")))
+        .await;
+    let calls = f.api.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(
+        calls[0],
+        Call::Callback(77, json!({"type": 5, "data": {"flags": 64}}))
+    );
+    let Call::Edit(body) = &calls[1] else {
+        panic!("{calls:?}")
+    };
+    assert!(is_v2(body));
+    assert_eq!(
+        body["components"][0]["components"][2]["content"],
+        "**全体**\n42%"
+    );
+    assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn falls_back_from_v2_to_embed() {
+    let api = FakeApi::default().rejecting(is_v2);
+    let f = fixture(api, Some(MASTER), false);
+    f.controller
+        .handle(slash(MASTER, Some(GUILD), Some("context")))
+        .await;
+    let calls = f.api.calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    let (Call::Edit(v2), Call::Edit(embed)) = (&calls[1], &calls[2]) else {
+        panic!("{calls:?}")
+    };
+    assert!(is_v2(v2) && is_embed(embed));
+    assert_eq!(embed["embeds"][0]["fields"][0]["name"], "全体");
+}
+
+#[tokio::test]
+async fn falls_back_from_embed_to_text() {
+    let api = FakeApi::default().rejecting(is_v2).rejecting(is_embed);
+    let f = fixture(api, Some(MASTER), false);
+    f.controller
+        .handle(slash(MASTER, Some(GUILD), Some("context")))
+        .await;
+    let calls = f.api.calls();
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    let Call::Edit(text) = &calls[3] else {
+        panic!("{calls:?}")
+    };
+    assert!(text["content"].as_str().unwrap().contains("42%"));
+}
+
+#[tokio::test]
+async fn command_failure_is_shown_in_the_deferred_reply() {
+    let f = fixture(FakeApi::default(), Some(MASTER), true);
+    f.controller
+        .handle(slash(MASTER, Some(GUILD), Some("context")))
+        .await;
+    let calls = f.api.calls();
+    let Call::Edit(body) = &calls[1] else {
+        panic!("{calls:?}")
+    };
+    assert!(
+        body["content"]
+            .as_str()
+            .unwrap()
+            .contains("取得に失敗しました")
+    );
+}
+
+#[tokio::test]
+async fn unknown_subcommand_is_rejected_ephemerally() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller
+        .handle(slash(MASTER, Some(GUILD), Some("nope")))
+        .await;
+    f.controller.handle(slash(MASTER, Some(GUILD), None)).await;
+    f.controller
+        .handle(button(MASTER, "noth:refresh:nope"))
+        .await;
+    assert_eq!(f.api.calls().len(), 3);
+    assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn refresh_defers_update_then_edits_the_pressed_message() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller
+        .handle(button(MASTER, "noth:refresh:context"))
+        .await;
+    let calls = f.api.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0], Call::Callback(77, json!({"type": 6})));
+    let Call::Edit(body) = &calls[1] else {
+        panic!("{calls:?}")
+    };
+    assert!(is_v2(body));
+}
+
+#[tokio::test]
+async fn refresh_falls_back_to_a_new_ephemeral_message() {
+    let api = FakeApi::default().rejecting(is_v2);
+    let f = fixture(api, Some(MASTER), false);
+    f.controller
+        .handle(button(MASTER, "noth:refresh:context"))
+        .await;
+    let calls = f.api.calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    let Call::Followup(body) = &calls[2] else {
+        panic!("{calls:?}")
+    };
+    assert!(is_embed(body));
+    assert_eq!(body["flags"], 64);
+}
+
+#[tokio::test]
+async fn sync_registers_noth_with_one_subcommand_per_command() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller.sync().await;
+    let calls = f.api.calls();
+    let [Call::Sync(body)] = calls.as_slice() else {
+        panic!()
+    };
+    assert_eq!(body[0]["name"], "noth");
+    assert_eq!(body[0]["type"], 1);
+    assert_eq!(
+        body[0]["options"],
+        json!([{"type": 1, "name": "context", "description": "使用量を見る"}])
+    );
+}
+
+#[tokio::test]
+async fn sync_clears_commands_when_master_is_unset() {
+    let f = fixture(FakeApi::default(), None, false);
+    f.controller.sync().await;
+    assert_eq!(f.api.calls(), [Call::Sync(json!([]))]);
+}
+
+mod rest {
+    use std::sync::Mutex;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::command::api::RestInteractionApi;
+
+    async fn serve(statuses: Vec<&'static str>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            for status in statuses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 16384];
+                let n = sock.read(&mut buf).await.unwrap();
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = if status.starts_with('4') {
+                    r#"{"message":"Invalid Form Body"}"#
+                } else {
+                    ""
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn endpoints_methods_and_auth() {
+        let (base, seen) = serve(vec![
+            "200 OK",
+            "204 No Content",
+            "200 OK",
+            "200 OK",
+            "400 Bad Request",
+        ])
+        .await;
+        let api = RestInteractionApi::with_base("bot-tok".into(), 5, 10, base);
+        api.sync_commands(&json!([])).await.unwrap();
+        api.callback(77, "itok", &json!({"type": 5})).await.unwrap();
+        api.edit_original("itok", &json!({"flags": 32768}))
+            .await
+            .unwrap();
+        api.followup("itok", &json!({"content": "x"}))
+            .await
+            .unwrap();
+        let e = api.edit_original("itok", &json!({})).await.unwrap_err();
+        assert_eq!(e.status, 400);
+        assert!(e.body.contains("Invalid Form Body"));
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen[0].starts_with("PUT /applications/5/guilds/10/commands "),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[0]
+                .to_lowercase()
+                .contains("authorization: bot bot-tok")
+        );
+        assert!(
+            seen[1].starts_with("POST /interactions/77/itok/callback "),
+            "{}",
+            seen[1]
+        );
+        assert!(!seen[1].to_lowercase().contains("authorization"));
+        assert!(
+            seen[2].starts_with("PATCH /webhooks/5/itok/messages/@original "),
+            "{}",
+            seen[2]
+        );
+        assert!(seen[2].contains(r#"{"flags":32768}"#));
+        assert!(seen[3].starts_with("POST /webhooks/5/itok "), "{}", seen[3]);
+    }
+}

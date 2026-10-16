@@ -34,6 +34,8 @@ fn registry() -> Registry {
     noth_tool_shell::register(&mut reg);
     #[cfg(feature = "tool-discord")]
     noth_tool_discord::register(&mut reg);
+    #[cfg(feature = "command-context")]
+    noth_command_context::register(&mut reg);
     reg
 }
 

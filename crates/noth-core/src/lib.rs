@@ -1,6 +1,7 @@
 pub mod actor;
 pub mod approval;
 pub mod bus;
+pub mod command;
 pub mod config;
 pub mod error;
 pub mod heartbeat;

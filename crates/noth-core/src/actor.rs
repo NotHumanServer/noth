@@ -9,6 +9,7 @@ use jiff::Timestamp;
 use serde_json::json;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+use crate::command::{CommandEnv, CommandHost, ContextSnapshot};
 use crate::config::{CompactorSettings, Config};
 use crate::error::ErrorKind;
 use crate::judge::{
@@ -43,6 +44,8 @@ const ERROR_POST_INTERVAL: Duration = Duration::from_secs(60);
 
 const PROGRESS_FINAL_WAIT: Duration = Duration::from_secs(10);
 
+mod snapshot;
+
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// main actor が 1 つずつ処理する仕事(§2.1)
@@ -55,6 +58,8 @@ pub enum Job {
     },
     /// アイドル時コンパクション。範囲は処理する時点の Layer 3 から決める
     Compact,
+    /// 管理コマンドからの問い合わせ。読むだけで Layer は変えない
+    Snapshot(oneshot::Sender<Result<ContextSnapshot>>),
 }
 
 impl Job {
@@ -63,6 +68,7 @@ impl Job {
             Job::Judge(_) => "Judge",
             Job::Join { .. } => "Join",
             Job::Compact => "Compact",
+            Job::Snapshot(_) => "Snapshot",
         }
     }
 }
@@ -78,6 +84,7 @@ pub async fn run(
 ) -> Result<()> {
     let (_, closed_rx) = mpsc::unbounded_channel();
     let meter_rx = std::mem::replace(&mut modules.meter_rx, closed_rx);
+    let commands = std::mem::take(&mut modules.commands);
     let channel = modules.channel.clone();
     let guild = channel.guild_id();
 
@@ -93,6 +100,10 @@ pub async fn run(
 
     let (jobs_tx, mut jobs_rx) = mpsc::unbounded_channel::<Job>();
     let mut actor = Actor::new(config, modules, store.clone(), &members, jobs_tx.clone()).await?;
+    channel.set_commands(Arc::new(CommandHost::new(
+        commands,
+        CommandEnv::new(Arc::new(snapshot::JobQueue(jobs_tx.clone()))),
+    )));
     let drain_limit = SHUTDOWN_GRACE + actor.worker_timeout();
     let batches = restore::restore(&store, guild).await?;
     for batch in batches {
@@ -368,6 +379,10 @@ impl Actor {
         match job {
             Job::Judge(batch) => self.handle_judge(batch).await,
             Job::Join { run_id } => self.handle_join(&run_id).await,
+            Job::Snapshot(reply) => {
+                let _ = reply.send(self.context_snapshot().await);
+                Ok(())
+            }
             Job::Compact => self.handle_compact().await,
         }
     }

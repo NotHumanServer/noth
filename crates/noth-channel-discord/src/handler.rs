@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use noth_core::async_trait;
 use noth_core::bus::{BusEvent, BusHandle};
@@ -7,6 +8,7 @@ use noth_core::types::{BotMarker, IncomingMessage, ReplyTo, UserId};
 use serenity::all as sn;
 use serenity::prelude::{Context, EventHandler};
 
+use crate::command::{Controller, Incoming, Kind};
 use crate::state::{Names, SharedState, from_stage};
 use crate::text::{
     AuthorKind, bot_display_name, classify_author, is_aside, message_chars, replace_mentions,
@@ -20,6 +22,8 @@ pub(crate) struct Handler {
     pub(crate) state: SharedState,
     pub(crate) self_id: UserId,
     pub(crate) self_name: String,
+    /// スラッシュコマンドを受け付けないときは None
+    pub(crate) commands: Option<Arc<Controller>>,
 }
 
 #[async_trait]
@@ -34,6 +38,15 @@ impl EventHandler for Handler {
 
     async fn shard_stage_update(&self, _ctx: Context, event: sn::ShardStageUpdateEvent) {
         self.state.set(from_stage(event.new));
+    }
+
+    async fn interaction_create(&self, _ctx: Context, interaction: sn::Interaction) {
+        let Some(controller) = &self.commands else {
+            return;
+        };
+        if let Some(incoming) = incoming(interaction) {
+            controller.handle(incoming).await;
+        }
     }
 
     async fn message(&self, ctx: Context, msg: sn::Message) {
@@ -176,5 +189,31 @@ impl EventHandler for Handler {
         if let Err(e) = self.bus.publish(BusEvent::MessageReceived(incoming)).await {
             tracing::error!(error = %e, "failed to publish message");
         }
+    }
+}
+
+fn incoming(interaction: sn::Interaction) -> Option<Incoming> {
+    match interaction {
+        sn::Interaction::Command(c) => Some(Incoming {
+            id: c.id.get(),
+            user_id: c.user.id.get(),
+            guild_id: c.guild_id.map(|g| g.get()),
+            kind: Kind::Slash {
+                name: c.data.name.clone(),
+                // サブコマンドは先頭の option として届く
+                sub: c.data.options.first().map(|o| o.name.clone()),
+            },
+            token: c.token,
+        }),
+        sn::Interaction::Component(c) => Some(Incoming {
+            id: c.id.get(),
+            user_id: c.user.id.get(),
+            guild_id: c.guild_id.map(|g| g.get()),
+            kind: Kind::Button {
+                custom_id: c.data.custom_id.clone(),
+            },
+            token: c.token,
+        }),
+        _ => None,
     }
 }
