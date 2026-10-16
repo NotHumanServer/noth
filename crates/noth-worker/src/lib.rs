@@ -395,6 +395,10 @@ fn workspace_guidance(
             workspace.display(),
             host.home.display()
         ));
+        s.push_str(&format!(
+            "cwd・作業ディレクトリ・`pwd` の結果を報告するときは、必ず workspace(`{}`)のパスも並べてください。cwd は run ごとの下書きで消え、workspace は残る成果物の置き場所です。",
+            workspace.display()
+        ));
     }
     s
 }
@@ -886,12 +890,33 @@ mod tests {
             "NOTH_WORKSPACE",
             "`/h/.noth/work/` の下に run ごとに残っている",
             "「一時環境」「一時ディレクトリ」と呼ばないでください",
+            "cwd・作業ディレクトリ・`pwd` の結果を報告するときは、必ず workspace(`/h/.noth/workspace`)のパスも並べてください。cwd は run ごとの下書きで消え、workspace は残る成果物の置き場所です。",
             "空なら run の終わりに、中身があっても 7 日で消えます。残すものは必ず workspace に置いてください",
             "作ったもの(",
             "置き場所(作ったものの絶対パス",
         ] {
             assert!(text.contains(want), "{want}\n{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn instruction_omits_workspace_report_rule_without_workspace() {
+        let p = MockProvider::new(vec![text("メモ")]);
+        let w = worker(
+            p.clone(),
+            vec![tool("shell", Ok(String::new()))],
+            settings(3, 100),
+        )
+        .with_host(HostInfo {
+            os: "macos".into(),
+            hostname: "mac-mini".into(),
+            home: "/h/.noth".into(),
+            workspace: None,
+        });
+        w.run(task(Origin::Request)).await;
+        let text = p.prompts.lock().unwrap()[0].ephemeral_tail[0].text.clone();
+        assert!(text.contains("mac-mini"));
+        assert!(!text.contains("パスも並べてください"), "{text}");
     }
 
     #[tokio::test]
