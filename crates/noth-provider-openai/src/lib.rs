@@ -1,6 +1,9 @@
 //! OpenAI の Chat Completions / Responses API の provider。リクエスト構築・応答解析は `wire` の純粋関数に分けてある
 pub mod codex_auth;
+#[cfg(test)]
+mod prefix_tests;
 mod pricing;
+mod reuse;
 mod wire;
 
 use std::sync::Arc;
@@ -152,6 +155,7 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Provider>> {
         streaming: codex,
         idle_timeout: Duration::from_secs(idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS)),
         compat: s.preset.is_some() || s.base_url.is_some(),
+        reuse: reuse::ReuseTracker::default(),
     }))
 }
 
@@ -169,6 +173,7 @@ struct OpenAiProvider {
     idle_timeout: Duration,
     /// preset / base_url 指定時。互換サーバー向けの挙動に切り替える
     compat: bool,
+    reuse: reuse::ReuseTracker,
 }
 
 enum Auth {
@@ -375,6 +380,15 @@ fn error_body(status: u16, raw: &str) -> String {
     }
 }
 
+/// ChatGPT は session-id ヘッダからキャッシュの親和性を決める。公式 Codex は x-client-request-id に
+/// リクエストごとの ID ではなくスレッド ID を入れるので、同じく prompt_cache_key と同じ固定値にそろえる
+fn cache_headers(prompt: &LayeredPrompt) -> Vec<(&'static str, String)> {
+    match wire::codex_cache_key(prompt) {
+        Some(key) => vec![("session-id", key.clone()), ("x-client-request-id", key)],
+        None => Vec::new(),
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn complete(
@@ -397,11 +411,8 @@ impl Provider for OpenAiProvider {
                 wire::build_responses_request(&self.model, prompt, params, self.effort)?,
             ),
         };
-        // Codex はキャッシュのルーティングに session_id と x-client-request-id を使う。body の
-        // prompt_cache_key と同じ値にそろえ、プロセスをまたいでも同じプレフィックスが同じ値になるようにする
-        let extra_headers: Vec<(&str, String)> = if codex {
-            let key = wire::codex_cache_key(&body);
-            vec![("session_id", key.clone()), ("x-client-request-id", key)]
+        let extra_headers = if codex {
+            cache_headers(prompt)
         } else {
             Vec::new()
         };
@@ -446,12 +457,24 @@ impl Provider for OpenAiProvider {
             };
             match outcome {
                 Ok(completion) => {
+                    let usage = completion.usage;
+                    let reuse = self.reuse.observe(
+                        params.purpose,
+                        params.run_id.as_deref(),
+                        usage.input_tokens,
+                        usage.cached_tokens,
+                    );
                     tracing::info!(
                         provider = "openai",
                         model = %self.model,
                         purpose = params.purpose.as_str(),
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         attempts = attempt + 1,
+                        input_tokens = usage.input_tokens,
+                        cached_tokens = usage.cached_tokens,
+                        reuse_flow = reuse.map(|r| r.flow),
+                        reuse_prev_input_tokens = reuse.map(|r| r.prev_input_tokens),
+                        reuse_ratio = reuse.map(|r| (r.ratio * 1000.0).round() / 1000.0),
                         "provider の応答を受け取りました"
                     );
                     return Ok(completion);
@@ -572,6 +595,43 @@ mod tests {
     }
 
     #[test]
+    fn codex_headers_and_body_share_the_fixed_session_key() {
+        let mut prompt = LayeredPrompt {
+            harness_rules: "rules".into(),
+            active_log: vec![noth_core::types::Turn {
+                id: None,
+                role: noth_core::types::Role::User,
+                kind: noth_core::types::TurnKind::Buffer,
+                text: "a".into(),
+                chunk_id: None,
+            }],
+            cache_session: Some("42".into()),
+            ..Default::default()
+        };
+        let params = CompletionParams {
+            max_tokens: 10,
+            ..Default::default()
+        };
+        let headers = cache_headers(&prompt);
+        assert_eq!(
+            headers,
+            vec![
+                ("session-id", "noth-openai-42".to_string()),
+                ("x-client-request-id", "noth-openai-42".to_string()),
+            ]
+        );
+        let body = wire::build_codex_request("m", &prompt, &params, None).unwrap();
+        assert_eq!(body["prompt_cache_key"], "noth-openai-42");
+        // リクエストが変わっても(instructions の変更、Compactor のキー)、値は session だけで決まる
+        prompt.harness_rules = "changed".into();
+        assert_eq!(cache_headers(&prompt), headers);
+        prompt.cache_session = Some("compactor-42".into());
+        assert_eq!(cache_headers(&prompt)[0].1, "noth-openai-compactor-42");
+        prompt.cache_session = None;
+        assert!(cache_headers(&prompt).is_empty());
+    }
+
+    #[test]
     fn error_body_formats() {
         assert_eq!(error_body(401, "401: Unauthorized"), "Unauthorized");
         assert_eq!(
@@ -660,6 +720,7 @@ mod tests {
             streaming: true,
             idle_timeout: Duration::from_millis(200),
             compat: true,
+            reuse: reuse::ReuseTracker::default(),
         };
         let prompt = LayeredPrompt {
             active_log: vec![noth_core::types::Turn {
@@ -739,6 +800,7 @@ mod tests {
             streaming: true,
             idle_timeout: Duration::from_millis(300),
             compat: true,
+            reuse: reuse::ReuseTracker::default(),
         };
         let prompt = LayeredPrompt {
             active_log: vec![noth_core::types::Turn {

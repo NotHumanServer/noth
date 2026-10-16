@@ -61,20 +61,27 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
-/// 連続する同 role のターンは 1 件にまとめる。空文字のターンは API が拒否することがあるので捨てる
+/// 空文字のターンは API が拒否することがあるので捨てる
+fn turns(prompt: &LayeredPrompt) -> impl Iterator<Item = (Role, &str)> {
+    prompt
+        .active_log
+        .iter()
+        .chain(&prompt.ephemeral_tail)
+        .filter(|t| !t.text.is_empty())
+        .map(|Turn { role, text, .. }| (*role, text.as_str()))
+}
+
+/// Chat Completions 用。連続する同 role のターンは 1 件にまとめる(同 role の連続を受け付けない互換サーバーがあるため)。
+/// Responses は同 role の連続を別の item として受け付けるので、こちらを通さない
 fn merged_turns(prompt: &LayeredPrompt) -> Vec<(Role, String)> {
     let mut out: Vec<(Role, String)> = Vec::new();
-    let turns = prompt.active_log.iter().chain(&prompt.ephemeral_tail);
-    for Turn { role, text, .. } in turns {
-        if text.is_empty() {
-            continue;
-        }
+    for (role, text) in turns(prompt) {
         match out.last_mut() {
-            Some((r, t)) if r == role => {
+            Some((r, t)) if *r == role => {
                 t.push_str("\n\n");
                 t.push_str(text);
             }
-            _ => out.push((*role, text.clone())),
+            _ => out.push((role, text.to_string())),
         }
     }
     out
@@ -170,8 +177,9 @@ pub fn build_responses_request(
     params: &CompletionParams,
     effort: Option<&str>,
 ) -> Result<Value> {
-    let mut input: Vec<Value> = merged_turns(prompt)
-        .into_iter()
+    // ターンを結合しない。Layer 4 の trigger は次のリクエストで Layer 3 に単独のメッセージとして入るので、
+    // 結合すると前回のメッセージの途中から内容が変わり、プレフィックスキャッシュがそこで外れる
+    let mut input: Vec<Value> = turns(prompt)
         .map(|(role, text)| json!({"type": "message", "role": role_str(role), "content": text}))
         .collect();
     for item in &prompt.tool_exchange {
@@ -502,14 +510,15 @@ pub fn build_codex_request(
     effort: Option<&str>,
 ) -> Result<Value> {
     let mut body = build_responses_request(model, prompt, params, effort)?;
-    let key = codex_cache_key(&body);
     let obj = body.as_object_mut().expect("リクエストは常にオブジェクト");
     obj.remove("max_output_tokens");
     obj.insert("stream".into(), true.into());
     if let Some(input) = obj.get_mut("input").and_then(Value::as_array_mut) {
         typed_message_parts(input);
     }
-    obj.insert("prompt_cache_key".into(), key.into());
+    if let Some(key) = codex_cache_key(prompt) {
+        obj.insert("prompt_cache_key".into(), key.into());
+    }
     // 要約を求めると、長く考える間も reasoning_summary のイベントが流れて idle timeout に掛からない
     // (hermes-agent の codex transport も Codex バックエンドへ summary: "auto" を送っている)
     let reasoning = obj.entry("reasoning").or_insert_with(|| json!({}));
@@ -517,21 +526,14 @@ pub fn build_codex_request(
     Ok(body)
 }
 
-/// instructions と tools が同じ間は同じ値になる。キャッシュのプレフィックスを決めるのがこの2つだから。
-/// 暗号用途ではないので FNV-1a で足りる
-pub fn codex_cache_key(body: &Value) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    let parts = [
-        body["instructions"].to_string(),
-        body.get("tools").map(Value::to_string).unwrap_or_default(),
-    ];
-    for part in &parts {
-        for b in part.bytes().chain(std::iter::once(0)) {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    format!("noth-{hash:016x}")
+/// セッション(guild)ごとに固定する。Codex も prompt_cache_key をセッション ID で固定している。
+/// instructions や tools の内容から作ると、それらが変わった瞬間に別の系統になる。
+/// Worker は main の base を複製するので同じ値になり、キャッシュを共有できる
+pub fn codex_cache_key(prompt: &LayeredPrompt) -> Option<String> {
+    prompt
+        .cache_session
+        .as_deref()
+        .map(|session| format!("noth-openai-{session}"))
 }
 
 /// ストリーム中のエラーを原因で分ける。上限到達は待っても直らず、サーバー側の一時的な失敗は再試行で直る
@@ -793,10 +795,10 @@ mod tests {
         assert_eq!(body["max_output_tokens"], 100);
         assert_eq!(body["reasoning"], json!({"effort": "low"}));
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 3);
+        assert_eq!(input.len(), 4);
         assert_eq!(
             input[0],
-            json!({"type": "message", "role": "user", "content": "a\n\nb"})
+            json!({"type": "message", "role": "user", "content": "a"})
         );
         assert_eq!(
             body["tools"][0],
@@ -820,13 +822,13 @@ mod tests {
         ];
         let body = build_responses_request("m", &p, &params(), None).unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input[3]["content"], "調べます");
+        assert_eq!(input[4]["content"], "調べます");
         assert_eq!(
-            input[4],
+            input[5],
             json!({"type": "function_call", "call_id": "call_1", "name": "web_search", "arguments": "{\"q\":\"x\"}"})
         );
         assert_eq!(
-            input[5],
+            input[6],
             json!({"type": "function_call_output", "call_id": "call_1", "output": "結果"})
         );
     }
@@ -851,10 +853,10 @@ mod tests {
         // reasoning の id だけは store: false で引けないため外れる。他は変えない
         let mut reasoning = raw[0].clone();
         reasoning.as_object_mut().unwrap().remove("id");
-        assert_eq!(input[3], reasoning);
-        assert_eq!(input[4], raw[1]);
-        assert_eq!(input[5]["type"], "function_call_output");
-        assert_eq!(input.len(), 6);
+        assert_eq!(input[4], reasoning);
+        assert_eq!(input[5], raw[1]);
+        assert_eq!(input[6]["type"], "function_call_output");
+        assert_eq!(input.len(), 7);
     }
 
     #[test]
@@ -980,12 +982,20 @@ data: [DONE]\n";
             json!({"effort": "low", "summary": "auto"})
         );
         assert!(body.get("tool_choice").is_none());
-        let key = body["prompt_cache_key"].as_str().unwrap();
-        assert_eq!(key, codex_cache_key(&body));
-        let mut other = prompt();
-        other.profile = "changed".into();
-        let body2 = build_codex_request("m", &other, &params(), Some("low")).unwrap();
-        assert_ne!(key, body2["prompt_cache_key"].as_str().unwrap());
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn codex_cache_key_is_fixed_per_session() {
+        let mut p = prompt();
+        p.cache_session = Some("42".into());
+        let body = build_codex_request("m", &p, &params(), None).unwrap();
+        assert_eq!(body["prompt_cache_key"], "noth-openai-42");
+        assert_eq!(codex_cache_key(&p).as_deref(), Some("noth-openai-42"));
+        p.profile = "changed".into();
+        p.tool_exchange.push(results());
+        let body2 = build_codex_request("m", &p, &params(), None).unwrap();
+        assert_eq!(body2["prompt_cache_key"], body["prompt_cache_key"]);
     }
 
     #[test]
@@ -1116,9 +1126,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\
         let input = body["input"].as_array().unwrap();
         assert_eq!(
             input[0]["content"],
-            json!([{"type": "input_text", "text": "a\n\nb"}])
+            json!([{"type": "input_text", "text": "a"}])
         );
-        assert_eq!(input[1]["content"][0]["type"], "output_text");
+        assert_eq!(input[2]["content"][0]["type"], "output_text");
         assert!(input.iter().all(|i| !i["content"].is_string()));
         let plain = build_responses_request("m", &p, &params(), None).unwrap();
         assert!(plain["input"][0]["content"].is_string());

@@ -141,6 +141,9 @@ pub struct LayeredPrompt {
     pub tool_exchange: Vec<ExchangeItem>,
     /// Worker の呼び出し。末尾のキャッシュ境界を Layer 3 末尾ではなくコンテキスト末尾に置く(caching.md §3)
     pub cache_to_end: bool,
+    /// プロンプトキャッシュのルーティングを固定する、セッションを表す値(guild)。Worker は fork 元の base を複製するので
+    /// main と同じ値を引き継ぎ、同じキャッシュを引ける。instructions の内容から作ると、Layer 0〜2 が変わるたびに別の系統になる
+    pub cache_session: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -235,6 +238,12 @@ pub trait Worker: Send + Sync {
 #[async_trait]
 pub trait Compactor: Send + Sync {
     /// Layer 3 の範囲を三人称のエピソード要約 1 つに変換する。Layer 2 への統合と上限の管理は Core が行う。
-    /// Profile は渡さない。キャラクターの口調が要約に混ざるのを防ぐため
-    async fn digest(&self, harness_rules: &str, turns: &[Turn]) -> Result<String>;
+    /// Profile は渡さない。キャラクターの口調が要約に混ざるのを防ぐため。
+    /// `cache_session` は main とは別の系統のキャッシュキーにする値(要約の入力は main と前置きが違い、同じキーで混ぜない)
+    async fn digest(
+        &self,
+        harness_rules: &str,
+        turns: &[Turn],
+        cache_session: &str,
+    ) -> Result<String>;
 }

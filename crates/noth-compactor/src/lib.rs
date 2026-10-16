@@ -64,11 +64,17 @@ fn instruction(turns: &[Turn]) -> Turn {
 
 #[async_trait]
 impl Compactor for LlmCompactor {
-    async fn digest(&self, harness_rules: &str, turns: &[Turn]) -> Result<String> {
+    async fn digest(
+        &self,
+        harness_rules: &str,
+        turns: &[Turn],
+        cache_session: &str,
+    ) -> Result<String> {
         // Profile を渡すとキャラクターの口調が要約に混ざる
         let prompt = LayeredPrompt {
             harness_rules: harness_rules.to_string(),
             ephemeral_tail: vec![instruction(turns)],
+            cache_session: Some(cache_session.to_string()),
             ..Default::default()
         };
         let completion = self
@@ -146,7 +152,7 @@ mod tests {
             turn(Role::Assistant, TurnKind::Response, "安全な言語です"),
             turn(Role::User, TurnKind::Conclusion, "1.90 が最新"),
         ];
-        let out = c.digest("rules", &turns).await.unwrap();
+        let out = c.digest("rules", &turns, "compactor-1").await.unwrap();
         assert_eq!(out, "要約");
         assert_eq!(*p.purposes.lock().unwrap(), [Purpose::Compaction]);
         let prompts = p.prompts.lock().unwrap();
@@ -167,8 +173,8 @@ mod tests {
     #[tokio::test]
     async fn empty_result_is_error() {
         let (c, _) = compactor(Some("  "));
-        assert!(c.digest("rules", &[]).await.is_err());
+        assert!(c.digest("rules", &[], "compactor-1").await.is_err());
         let (c, _) = compactor(None);
-        assert!(c.digest("rules", &[]).await.is_err());
+        assert!(c.digest("rules", &[], "compactor-1").await.is_err());
     }
 }

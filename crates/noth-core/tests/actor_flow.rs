@@ -281,7 +281,12 @@ struct MockCompactor {
 
 #[async_trait]
 impl Compactor for MockCompactor {
-    async fn digest(&self, harness_rules: &str, turns: &[Turn]) -> Result<String> {
+    async fn digest(
+        &self,
+        harness_rules: &str,
+        turns: &[Turn],
+        _cache_session: &str,
+    ) -> Result<String> {
         self.calls
             .lock()
             .unwrap()
@@ -647,14 +652,13 @@ async fn silent_buffers_then_reply_promotes_one_block() {
 
     let prompt = &h.prompts()[0];
     assert_eq!(prompt.active_log, vec![turns[0].clone()]);
-    let [trigger, channel] = &prompt.ephemeral_tail[..] else {
+    let [trigger] = &prompt.ephemeral_tail[..] else {
         panic!("tail: {:?}", prompt.ephemeral_tail);
     };
+    // 発言先はトリガーのブロックに含め、Layer 3 と同一の文字列で昇格する
     assert_eq!(trigger.text, turns[1].text);
-    // 発言先は Layer 4 にだけ置く。トリガーのブロックは Layer 3 と同一のまま
-    assert!(channel.text.contains("#general(channel_id: 100)"));
-    assert!(!channel.text.contains("[Goal]"));
-    assert!(!turns[1].text.contains("channel_id"));
+    assert!(trigger.text.contains("#general(channel_id: 100)"));
+    assert!(!trigger.text.contains("[Goal]"));
     assert!(prompt.tools.is_empty());
     assert!(!prompt.harness_rules.contains("Goal"));
     assert!(prompt.profile.contains("alice"));
@@ -1240,13 +1244,25 @@ async fn spawn_task_posts_ack_and_records_goal_before_fork() {
     assert_eq!(task.goal, "東京の明日の天気を調べる");
     assert_eq!(task.origin, Origin::Request);
     assert_eq!(task.audience.requesters, vec![1]);
-    assert_eq!(task.base.active_log, turns);
-    assert!(task.base.ephemeral_tail.is_empty());
+    // fork 時点の main のリクエスト(`[判定]` まで)が先頭に残り、昇格した Ack + Goal が続く
+    let sequence = |p: &LayeredPrompt| {
+        p.active_log
+            .iter()
+            .chain(&p.ephemeral_tail)
+            .map(|t| (t.role, t.kind, t.text.clone()))
+            .collect::<Vec<_>>()
+    };
+    let main_sequence = sequence(&h.prompts()[0]);
+    let worker_sequence = sequence(&task.base);
+    assert_eq!(worker_sequence[..main_sequence.len()], main_sequence[..]);
+    assert_eq!(
+        worker_sequence[main_sequence.len()..],
+        [(turns[1].role, turns[1].kind, turns[1].text.clone())]
+    );
     assert_eq!(task.audience.channel_id, Some(GENERAL));
     assert_eq!(task.audience.channel_name.as_deref(), Some("general"));
     // router が spawn_task と判定したときだけ、Layer 4 の末尾で Worker に回すよう促す
     let hint = main.ephemeral_tail.last().unwrap();
-    assert!(hint.text.contains("#general(channel_id: 100)"));
     assert!(hint.text.contains("[Goal]"));
     assert_eq!(
         serde_json::to_value(&task.base.tools).unwrap(),

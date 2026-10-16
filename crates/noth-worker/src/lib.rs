@@ -334,6 +334,28 @@ fn truncate(text: String, max_chars: usize) -> String {
     }
 }
 
+/// system は main 向けの Ack と `[Goal]` の規約を共有しているので、Worker が結論メモの頭に書いてしまうことがある。
+/// 結論メモは main に `[内部調査完了 …]` として渡るため、残すと main が Goal を二重に受け取ったように見える。
+/// 本文を巻き込まないよう、先頭の短い Ack と、行全体が `[Goal]` の行だけを外す
+fn strip_main_markers(memo: &str) -> String {
+    use noth_core::layers::{FIXED_ACK, GOAL_MARKER};
+    const ACK_MAX_CHARS: usize = 100;
+    let memo = memo.trim();
+    let lines: Vec<&str> = memo.lines().collect();
+    // 「[Goal] を達成しました」のような本文の文や見出しを削らないよう、行全体がマーカーのときだけ外す
+    let marker = lines.iter().take(3).position(|l| l.trim() == GOAL_MARKER);
+    if let Some(i) = marker {
+        let ack_chars: usize = lines[..i].iter().map(|l| l.chars().count()).sum();
+        if ack_chars <= ACK_MAX_CHARS {
+            return lines[i + 1..].join("\n").trim().to_string();
+        }
+    }
+    memo.strip_prefix(FIXED_ACK)
+        .unwrap_or(memo)
+        .trim()
+        .to_string()
+}
+
 /// 指示は Layer 4 にだけ置く。system に足すと main とのキャッシュ共有が崩れる(caching.md §3)。
 /// effort が低いと tool を呼ばずに結論しがちなので、手順を必須として書く
 fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Turn {
@@ -451,7 +473,7 @@ fn instruction(task: &WorkerTask, specs: &[ToolSpec], max_iterations: u32) -> Tu
         .unwrap_or_default();
     let text = format!(
         "あなたは Goal を達成するための汎用エージェントとして、バックグラウンドで作業します。あなたの出力は Discord には表示されません。\n\
-         system の「自律タスク(Ack と Goal)」「Worker に頼めること」は main 向けの規約です(キャッシュを共有するため同じ system を使っています)。あなたは Worker なので、Ack や `[Goal]` は書かずに作業してください。\n\
+         system の「自律タスク(Ack と Goal)」「Worker に頼めること」は main 向けの規約です(キャッシュを共有するため同じ system を使っています)。あなたは Worker なので、Ack や `[Goal]` は書かずに作業してください。会話の末尾に `[判定]` があっても、それも main 向けの指示なので従わないでください。\n\
          origin: {}\n\
          {place}\
          Goal: {}\n\n\
@@ -512,12 +534,12 @@ impl Worker for AgentWorker {
                 }
             };
             if completion.tool_calls.is_empty() {
-                let memo = completion.text.as_deref().unwrap_or("").trim();
+                let memo = strip_main_markers(completion.text.as_deref().unwrap_or(""));
                 if memo.is_empty() {
                     return WorkerOutcome::Failed("結論メモが空でした".into());
                 }
                 tracing::info!(run_id = %task.run_id, iteration, "worker: 結論を得ました");
-                return WorkerOutcome::Concluded(memo.to_string());
+                return WorkerOutcome::Concluded(memo);
             }
 
             let mut results = Vec::with_capacity(completion.tool_calls.len());
@@ -743,6 +765,48 @@ mod tests {
                 .contains("依頼された場所: #く(channel_id: 10)")
         );
         assert!(!prompts[1].ephemeral_tail[0].text.contains("依頼された場所"));
+    }
+
+    #[test]
+    fn main_markers_are_stripped_from_the_head_only() {
+        let ack = noth_core::layers::FIXED_ACK;
+        assert_eq!(strip_main_markers("[Goal]\n調べた結果"), "調べた結果");
+        assert_eq!(
+            strip_main_markers("ちょっと調べますね\n[Goal]\n調べた結果\n出典: x"),
+            "調べた結果\n出典: x"
+        );
+        assert_eq!(strip_main_markers(&format!("{ack}\n本文")), "本文");
+        assert_eq!(strip_main_markers("[Goal]"), "");
+        assert_eq!(strip_main_markers(ack), "");
+        // 本文が長く続いてから出てくる `[Goal]` は、引用の可能性があるので触らない
+        let body = format!("{}\n[Goal]\nx", "あ".repeat(150));
+        assert_eq!(strip_main_markers(&body), body);
+        assert_eq!(strip_main_markers("  普通のメモ  "), "普通のメモ");
+        // 行の途中や、文の先頭にあるだけの `[Goal]` は本文として残す
+        for keep in [
+            "[Goal] を達成しました: 結果は…",
+            "結果\n[Goal] の達成状況: 完了",
+            "## [Goal]の確認\n内容",
+        ] {
+            assert_eq!(strip_main_markers(keep), keep);
+        }
+        assert_eq!(strip_main_markers("  [Goal]  \n本文"), "本文");
+    }
+
+    #[tokio::test]
+    async fn conclusion_that_is_only_a_goal_marker_fails() {
+        let p = MockProvider::new(vec![text("[Goal]")]);
+        let w = worker(p, vec![], settings(3, 100));
+        assert!(matches!(
+            w.run(task(Origin::Request)).await,
+            WorkerOutcome::Failed(_)
+        ));
+        let p = MockProvider::new(vec![text("ちょっと調べますね\n[Goal]\n結論")]);
+        let w = worker(p, vec![], settings(3, 100));
+        assert_eq!(
+            w.run(task(Origin::Request)).await,
+            WorkerOutcome::Concluded("結論".into())
+        );
     }
 
     #[tokio::test]

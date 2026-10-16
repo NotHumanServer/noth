@@ -632,17 +632,17 @@ impl Actor {
         self.promote_buffer(&trigger_ids).await?;
 
         let trigger_lines = trigger_lines(batch);
-        let trigger = layers::trigger_turn(chunk_id, &trigger_lines);
+        let trigger = layers::trigger_turn(
+            chunk_id,
+            &trigger_lines,
+            &batch.channel_name,
+            batch.channel_id,
+        );
+        let verdict_turn = matches!(verdict, RouterVerdict::SpawnTask { .. })
+            .then(|| layers::verdict_turn(chunk_id));
 
-        let tail = vec![
-            trigger.clone(),
-            layers::channel_turn(
-                chunk_id,
-                &batch.channel_name,
-                batch.channel_id,
-                matches!(verdict, RouterVerdict::SpawnTask { .. }),
-            ),
-        ];
+        let mut tail = vec![trigger.clone()];
+        tail.extend(verdict_turn.clone());
 
         let active_log = self.store.active_turns(guild).await?;
         let prompt = self.prompt(active_log, tail);
@@ -668,7 +668,14 @@ impl Actor {
         );
         if let Some(plan) = self.task_plan(&completion) {
             return self
-                .start_task(batch, chunk_id, trigger, plan, &completion.usage)
+                .start_task(
+                    batch,
+                    chunk_id,
+                    trigger,
+                    verdict_turn,
+                    plan,
+                    &completion.usage,
+                )
                 .await;
         }
         if let RouterVerdict::SpawnTask { probability } = verdict {
@@ -693,7 +700,14 @@ impl Actor {
                 origin: Origin::Request,
             };
             return self
-                .start_task(batch, chunk_id, trigger, plan, &completion.usage)
+                .start_task(
+                    batch,
+                    chunk_id,
+                    trigger,
+                    verdict_turn,
+                    plan,
+                    &completion.usage,
+                )
                 .await;
         }
         let text = completion
@@ -834,6 +848,7 @@ impl Actor {
         batch: &JudgeBatch,
         chunk_id: i64,
         trigger: Turn,
+        verdict_turn: Option<Turn>,
         plan: TaskPlan,
         usage: &Usage,
     ) -> Result<()> {
@@ -895,7 +910,8 @@ impl Actor {
         // Worker の base も main と同じ上限に収めるため、Fork より前に緊急コンパクションを済ませる
         self.enforce_hard_limit(chunk_id).await?;
 
-        let base = self.prompt(self.store.active_turns(guild).await?, Vec::new());
+        let (head, tail) = layers::fork_split(self.store.active_turns(guild).await?, verdict_turn);
+        let base = self.prompt(head, tail);
         self.fork(run, base, progress_target, audience);
         Ok(())
     }
@@ -1485,7 +1501,14 @@ impl Actor {
             return Ok(());
         }
         let (range, kept) = turns.split_at(cut);
-        let episode = match compactor.digest(&self.compactor_rules, range).await {
+        let episode = match compactor
+            .digest(
+                &self.compactor_rules,
+                range,
+                &self.compactor_cache_session(),
+            )
+            .await
+        {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(error = %e, "Layer 3 の要約に失敗しました。ターンはそのまま残します");
@@ -1531,8 +1554,12 @@ impl Actor {
         Ok(())
     }
 
+    fn compactor_cache_session(&self) -> String {
+        format!("compactor-{}", self.guild)
+    }
+
     fn prompt(&self, active_log: Vec<Turn>, tail: Vec<Turn>) -> LayeredPrompt {
-        layers::assemble(
+        let mut prompt = layers::assemble(
             &self.harness_rules,
             &self.profile,
             &self.memory,
@@ -1540,7 +1567,9 @@ impl Actor {
             active_log,
             tail,
             &self.tools,
-        )
+        );
+        prompt.cache_session = Some(self.guild.to_string());
+        prompt
     }
 
     async fn complete_with_typing(
@@ -1699,7 +1728,14 @@ impl Actor {
         let ids: Vec<i64> = target.iter().filter_map(|t| t.id).collect();
 
         if let Some((compactor, settings)) = self.compaction.clone() {
-            match compactor.digest(&self.compactor_rules, &target).await {
+            match compactor
+                .digest(
+                    &self.compactor_rules,
+                    &target,
+                    &self.compactor_cache_session(),
+                )
+                .await
+            {
                 Ok(episode) => {
                     self.merge_episode(&episode, settings.digest_max_chars, &ids, &compacted)
                         .await?;
