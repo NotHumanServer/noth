@@ -2,6 +2,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use noth_core::command::{Command, CommandEnv, ContextSnapshot, ContextSource, ReportSection};
+use noth_core::exclusion::ChannelExclusions;
 use noth_core::{Error, Result, async_trait};
 
 use super::api::ApiError;
@@ -123,6 +124,7 @@ struct Fixture {
     api: Arc<FakeApi>,
     runs: Arc<AtomicUsize>,
     controller: Controller,
+    exclusions: ChannelExclusions,
 }
 
 fn fixture(api: FakeApi, master: Option<u64>, fail: bool) -> Fixture {
@@ -135,10 +137,12 @@ fn fixture(api: FakeApi, master: Option<u64>, fail: bool) -> Fixture {
         })],
         CommandEnv::new(Arc::new(NoSnapshot)),
     ));
+    let exclusions = ChannelExclusions::new(GUILD);
     Fixture {
-        controller: Controller::new(api.clone(), host, master, GUILD),
+        controller: Controller::new(api.clone(), host, master, GUILD, exclusions.clone()),
         api,
         runs,
+        exclusions,
     }
 }
 
@@ -393,10 +397,13 @@ async fn sync_registers_noth_with_one_subcommand_per_command() {
     };
     assert_eq!(body[0]["name"], "noth");
     assert_eq!(body[0]["type"], 1);
+    let options = body[0]["options"].as_array().unwrap();
     assert_eq!(
-        body[0]["options"],
-        json!([{"type": 1, "name": "context", "description": "使用量を見る"}])
+        options[0],
+        json!({"type": 1, "name": "context", "description": "使用量を見る"})
     );
+    assert_eq!(options[1]["name"], "ignore");
+    assert_eq!(options[1]["type"], 2);
 }
 
 #[tokio::test]
@@ -407,16 +414,197 @@ async fn sync_clears_commands_when_master_is_unset() {
 }
 
 #[tokio::test]
-async fn sync_clears_commands_when_no_command_is_enabled() {
+async fn sync_registers_only_ignore_when_no_command_is_enabled() {
     let api = Arc::new(FakeApi::default());
     let host = Arc::new(CommandHost::new(
         Vec::new(),
         CommandEnv::new(Arc::new(NoSnapshot)),
     ));
-    Controller::new(api.clone(), host, Some(MASTER), GUILD)
-        .sync()
+    Controller::new(
+        api.clone(),
+        host,
+        Some(MASTER),
+        GUILD,
+        ChannelExclusions::new(GUILD),
+    )
+    .sync()
+    .await;
+    let calls = api.calls();
+    let [Call::Sync(body)] = calls.as_slice() else {
+        panic!()
+    };
+    assert_eq!(body[0]["options"].as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["options"][0]["name"], "ignore");
+}
+
+fn ignore_cmd(user_id: u64, op: IgnoreOp, channel: Option<u64>) -> Incoming {
+    Incoming {
+        id: 77,
+        token: "tok".into(),
+        user_id,
+        guild_id: Some(GUILD),
+        kind: Kind::Ignore { op, channel },
+    }
+}
+
+fn reply_text(call: &Call) -> String {
+    let Call::Callback(_, body) = call else {
+        panic!("{call:?}")
+    };
+    assert_eq!(body["type"], 4);
+    assert_eq!(body["data"]["flags"], 64);
+    body["data"]["content"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn ignore_add_takes_effect_immediately_and_remove_undoes_it() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    assert!(!f.exclusions.is_excluded(&[500]));
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Add, Some(500)))
         .await;
-    assert_eq!(api.calls(), [Call::Sync(json!([]))]);
+    assert!(f.exclusions.is_excluded(&[500]));
+    assert!(reply_text(&f.api.calls()[0]).contains("<#500> を除外に追加しました"));
+
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Remove, Some(500)))
+        .await;
+    assert!(!f.exclusions.is_excluded(&[500]));
+    assert!(reply_text(&f.api.calls()[1]).contains("<#500> を除外から外しました"));
+}
+
+#[tokio::test]
+async fn ignore_add_twice_and_remove_unknown_are_reported() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    for _ in 0..2 {
+        f.controller
+            .handle(ignore_cmd(MASTER, IgnoreOp::Add, Some(500)))
+            .await;
+    }
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Remove, Some(501)))
+        .await;
+    let calls = f.api.calls();
+    assert!(reply_text(&calls[1]).contains("すでに除外されています"));
+    assert!(reply_text(&calls[2]).contains("除外されていません"));
+}
+
+#[tokio::test]
+async fn ignore_requires_a_channel_for_add_and_remove() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Add, None))
+        .await;
+    assert!(reply_text(&f.api.calls()[0]).contains("チャンネルを指定"));
+    assert!(f.exclusions.is_empty());
+}
+
+#[tokio::test]
+async fn config_entries_cannot_be_removed_by_command() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.exclusions.set_config([700]);
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Remove, Some(700)))
+        .await;
+    assert!(f.exclusions.is_excluded(&[700]));
+    let text = reply_text(&f.api.calls()[0]);
+    assert!(
+        text.contains("config") && text.contains("外せません"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn non_master_cannot_change_exclusions() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Add, Some(500)))
+        .await;
+    for op in [IgnoreOp::Add, IgnoreOp::Remove, IgnoreOp::List] {
+        f.controller
+            .handle(ignore_cmd(MASTER + 1, op, Some(500)))
+            .await;
+    }
+    f.controller
+        .handle(ignore_cmd(MASTER + 1, IgnoreOp::Add, Some(600)))
+        .await;
+    let calls = f.api.calls();
+    assert_eq!(calls.len(), 5, "{calls:?}");
+    for call in &calls[1..] {
+        assert_denied(std::slice::from_ref(call));
+    }
+    assert_eq!(f.exclusions.effective(), vec![500]);
+}
+
+#[tokio::test]
+async fn master_unset_or_other_guild_cannot_use_ignore() {
+    let f = fixture(FakeApi::default(), None, false);
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Add, Some(500)))
+        .await;
+    assert_denied(&f.api.calls());
+    assert!(f.exclusions.is_empty());
+
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    let mut other = ignore_cmd(MASTER, IgnoreOp::Add, Some(500));
+    other.guild_id = Some(GUILD + 1);
+    f.controller.handle(other).await;
+    assert_denied(&f.api.calls());
+    assert!(f.exclusions.is_empty());
+}
+
+#[tokio::test]
+async fn ignore_list_shows_origin_ephemerally() {
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.exclusions.set_config([700]);
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Add, Some(500)))
+        .await;
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::List, None))
+        .await;
+    let calls = f.api.calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    let Call::Callback(_, defer) = &calls[1] else {
+        panic!()
+    };
+    assert_eq!(defer["type"], 5);
+    assert_eq!(defer["data"]["flags"], 64);
+    let Call::Edit(body) = &calls[2] else {
+        panic!("{calls:?}")
+    };
+    assert!(is_v2(body));
+    let text = body.to_string();
+    let config_at = text.find("config 由来").unwrap();
+    let command_at = text.find("コマンド由来").unwrap();
+    assert!(text.find("<#700>").unwrap() > config_at);
+    assert!(text.find("<#500>").unwrap() > command_at);
+    // 一覧には更新ボタンを付けない
+    assert!(!text.contains("noth:refresh"));
+}
+
+#[tokio::test]
+async fn exclusions_added_by_command_survive_a_restart() {
+    let dir = std::env::temp_dir().join(format!("noth-discord-ignore-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("noth.db");
+
+    let f = fixture(FakeApi::default(), Some(MASTER), false);
+    f.exclusions
+        .attach(noth_core::store::Store::open(&path).await.unwrap())
+        .await
+        .unwrap();
+    f.controller
+        .handle(ignore_cmd(MASTER, IgnoreOp::Add, Some(500)))
+        .await;
+
+    let restarted = ChannelExclusions::new(GUILD);
+    restarted
+        .attach(noth_core::store::Store::open(&path).await.unwrap())
+        .await
+        .unwrap();
+    assert!(restarted.is_excluded(&[500]));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 mod rest {

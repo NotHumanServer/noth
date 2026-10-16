@@ -2,9 +2,11 @@
 use std::sync::Arc;
 
 use noth_core::command::{CommandHost, Report};
+use noth_core::exclusion::ChannelExclusions;
 use serde_json::{Value, json};
 
 mod api;
+mod ignore;
 mod render;
 
 #[cfg(test)]
@@ -13,11 +15,15 @@ pub(crate) use api::{InteractionApi, RestInteractionApi};
 use render::{FLAG_EPHEMERAL, embed_message, parse_refresh, plain, text_message, v2_message};
 
 /// Discord 側のコマンド名。サブコマンドが各 `Command::name()` になる
-const ROOT: &str = "noth";
+pub(crate) const ROOT: &str = "noth";
+/// `/noth ignore add|remove|list`。引数を取って状態を変えるので `Command` ではなく Channel が直接受け持つ
+pub(crate) const IGNORE_GROUP: &str = "ignore";
+pub(crate) const CHANNEL_OPTION: &str = "channel";
 const DENIED: &str = "権限がありません";
 const UNKNOWN_COMMAND: &str = "未知のコマンドです";
 /// 内部のエラー文は画面に出さず、ログにだけ残す
 const FAILED: &str = "取得に失敗しました。ログを確認してください";
+const SAVE_FAILED: &str = "保存に失敗しました。ログを確認してください(除外は変わっていません)";
 const REFRESH_FAILED: &str = "更新に失敗しました。ログを確認してください";
 
 const CALLBACK_MESSAGE: u8 = 4;
@@ -33,8 +39,36 @@ pub(crate) struct Incoming {
 }
 
 pub(crate) enum Kind {
-    Slash { name: String, sub: Option<String> },
-    Button { custom_id: String },
+    Slash {
+        name: String,
+        sub: Option<String>,
+    },
+    /// `/noth ignore <op> [channel]`。add / remove では channel が必須
+    Ignore {
+        op: IgnoreOp,
+        channel: Option<u64>,
+    },
+    Button {
+        custom_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IgnoreOp {
+    Add,
+    Remove,
+    List,
+}
+
+impl IgnoreOp {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "add" => Some(Self::Add),
+            "remove" => Some(Self::Remove),
+            "list" => Some(Self::List),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) struct Controller {
@@ -42,6 +76,7 @@ pub(crate) struct Controller {
     host: Arc<CommandHost>,
     master: Option<u64>,
     guild_id: u64,
+    exclusions: ChannelExclusions,
 }
 
 impl Controller {
@@ -50,26 +85,29 @@ impl Controller {
         host: Arc<CommandHost>,
         master: Option<u64>,
         guild_id: u64,
+        exclusions: ChannelExclusions,
     ) -> Self {
         Self {
             api,
             host,
             master,
             guild_id,
+            exclusions,
         }
     }
 
     /// master が未設定なら誰にも使えないので、コマンド自体を出さない
     fn definitions(&self) -> Value {
-        if self.master.is_none() || self.host.commands().is_empty() {
+        if self.master.is_none() {
             return json!([]);
         }
-        let subs: Vec<Value> = self
+        let mut subs: Vec<Value> = self
             .host
             .commands()
             .iter()
             .map(|c| json!({"type": 1, "name": c.name(), "description": c.description()}))
             .collect();
+        subs.push(ignore::definition());
         json!([{
             "type": 1,
             "name": ROOT,
@@ -83,7 +121,7 @@ impl Controller {
     /// command module を無効にしたり master を消したりしたときに、前回登録した `/noth` が残らない。
     /// 代わりに、Noth 以外が登録した guild コマンドも消える(今の Noth には他のコマンドが無い)
     pub(crate) async fn sync(&self) {
-        if self.master.is_none() && !self.host.commands().is_empty() {
+        if self.master.is_none() {
             tracing::info!(
                 "channel.discord.master が未設定のため、/noth コマンドは登録せず、誰にも使えません"
             );
@@ -125,6 +163,7 @@ impl Controller {
                 _ => self.reply_ephemeral(&ix, UNKNOWN_COMMAND).await,
             },
             Kind::Slash { .. } => self.reply_ephemeral(&ix, UNKNOWN_COMMAND).await,
+            Kind::Ignore { op, channel } => self.ignore(&ix, *op, *channel).await,
             Kind::Button { custom_id } => match parse_refresh(custom_id) {
                 Some(command) if self.has(command) => self.refresh(&ix, command).await,
                 _ => self.reply_ephemeral(&ix, "未知の操作です").await,
@@ -170,13 +209,52 @@ impl Controller {
                 return;
             }
         };
-        self.deliver_first(ix, &report, command).await;
+        self.deliver_first(ix, &report, Some(command)).await;
+    }
+
+    async fn ignore(&self, ix: &Incoming, op: IgnoreOp, channel: Option<u64>) {
+        match (op, channel) {
+            (IgnoreOp::List, _) => self.ignore_list(ix).await,
+            (_, None) => {
+                self.reply_ephemeral(ix, "チャンネルを指定してください")
+                    .await
+            }
+            (IgnoreOp::Add, Some(id)) => {
+                let text = match self.exclusions.add(id, ix.user_id).await {
+                    Ok(outcome) => ignore::added_message(id, &outcome),
+                    Err(e) => {
+                        tracing::warn!(error = %e, channel = id, "除外の追加を保存できませんでした");
+                        SAVE_FAILED.to_string()
+                    }
+                };
+                self.reply_ephemeral(ix, &text).await;
+            }
+            (IgnoreOp::Remove, Some(id)) => {
+                let text = match self.exclusions.remove(id).await {
+                    Ok(outcome) => ignore::removed_message(id, &outcome),
+                    Err(e) => {
+                        tracing::warn!(error = %e, channel = id, "除外の解除を保存できませんでした");
+                        SAVE_FAILED.to_string()
+                    }
+                };
+                self.reply_ephemeral(ix, &text).await;
+            }
+        }
+    }
+
+    async fn ignore_list(&self, ix: &Incoming) {
+        let defer = json!({"flags": FLAG_EPHEMERAL});
+        if !self.callback(ix, CALLBACK_DEFER_MESSAGE, Some(defer)).await {
+            return;
+        }
+        let report = ignore::list_report(&self.exclusions.list());
+        self.deliver_first(ix, &report, None).await;
     }
 
     /// defer 済みの応答はまだ V2 ではないので、V2 が拒否されても embed、さらに文字へ落とせる
-    async fn deliver_first(&self, ix: &Incoming, report: &Report, command: &str) {
+    async fn deliver_first(&self, ix: &Incoming, report: &Report, command: Option<&str>) {
         let attempts = [
-            ("Components V2", v2_message(report, Some(command))),
+            ("Components V2", v2_message(report, command)),
             ("embed", embed_message(report)),
             ("テキスト", text_message(report)),
         ];
@@ -186,7 +264,7 @@ impl Controller {
                 Err(e) => tracing::warn!(error = %e, label, "コマンドの結果を送れませんでした"),
             }
         }
-        tracing::error!(command, "コマンドの結果をどの形式でも送れませんでした");
+        tracing::error!(?command, "コマンドの結果をどの形式でも送れませんでした");
     }
 
     async fn edit_or_log(&self, ix: &Incoming, body: &Value) {

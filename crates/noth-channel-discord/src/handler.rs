@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use noth_core::async_trait;
 use noth_core::bus::{BusEvent, BusHandle};
+use noth_core::exclusion::ChannelExclusions;
 use noth_core::traits::ConnectionState;
 use noth_core::types::{BotMarker, IncomingMessage, ReplyTo, UserId};
 use serenity::all as sn;
 use serenity::prelude::{Context, EventHandler};
 
-use crate::command::{Controller, Incoming, Kind};
+use crate::command::{Controller, IgnoreOp, Incoming, Kind};
+use crate::exclusion;
 use crate::state::{Names, SharedState, from_stage};
 use crate::text::{
     AuthorKind, bot_display_name, classify_author, is_aside, message_chars, replace_mentions,
@@ -22,6 +24,7 @@ pub(crate) struct Handler {
     pub(crate) state: SharedState,
     pub(crate) self_id: UserId,
     pub(crate) self_name: String,
+    pub(crate) exclusions: ChannelExclusions,
     /// スラッシュコマンドを受け付けないときは None
     pub(crate) commands: Option<Arc<Controller>>,
 }
@@ -57,6 +60,14 @@ impl EventHandler for Handler {
             msg.kind,
             sn::MessageType::Regular | sn::MessageType::InlineReply
         ) {
+            return;
+        }
+        // 自分の発言や Bot の目印も含め、除外したチャンネルのものは何も取り込まない
+        if exclusion::is_excluded(&self.exclusions, msg.channel_id.get(), |id| {
+            exclusion::lookup(&ctx, self.guild_id, id)
+        })
+        .await
+        {
             return;
         }
         let author_id = msg.author.id.get();
@@ -198,11 +209,7 @@ fn incoming(interaction: sn::Interaction) -> Option<Incoming> {
             id: c.id.get(),
             user_id: c.user.id.get(),
             guild_id: c.guild_id.map(|g| g.get()),
-            kind: Kind::Slash {
-                name: c.data.name.clone(),
-                // サブコマンドは先頭の option として届く
-                sub: c.data.options.first().map(|o| o.name.clone()),
-            },
+            kind: slash_kind(&c.data.name, &c.data.options),
             token: c.token,
         }),
         sn::Interaction::Component(c) => Some(Incoming {
@@ -215,5 +222,92 @@ fn incoming(interaction: sn::Interaction) -> Option<Incoming> {
             token: c.token,
         }),
         _ => None,
+    }
+}
+
+/// サブコマンド(とそのグループ)は先頭の option として届く
+fn slash_kind(name: &str, options: &[sn::CommandDataOption]) -> Kind {
+    if name == crate::command::ROOT
+        && let Some(sn::CommandDataOption {
+            name: group,
+            value: sn::CommandDataOptionValue::SubCommandGroup(ops),
+            ..
+        }) = options.first()
+        && group == crate::command::IGNORE_GROUP
+        && let Some(op) = ops.first()
+        && let sn::CommandDataOptionValue::SubCommand(args) = &op.value
+        && let Some(parsed) = IgnoreOp::parse(&op.name)
+    {
+        let channel = args.iter().find_map(|a| match (&a.value, a.name.as_str()) {
+            (sn::CommandDataOptionValue::Channel(id), crate::command::CHANNEL_OPTION) => {
+                Some(id.get())
+            }
+            _ => None,
+        });
+        return Kind::Ignore {
+            op: parsed,
+            channel,
+        };
+    }
+    Kind::Slash {
+        name: name.to_string(),
+        sub: options.first().map(|o| o.name.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn options(value: Value) -> Vec<sn::CommandDataOption> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn plain_subcommand_stays_a_slash() {
+        let ops = options(json!([{"name": "context", "type": 1, "options": []}]));
+        match slash_kind("noth", &ops) {
+            Kind::Slash { name, sub } => {
+                assert_eq!(name, "noth");
+                assert_eq!(sub.as_deref(), Some("context"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn ignore_group_is_parsed_from_the_discord_payload() {
+        let add = options(json!([{"name": "ignore", "type": 2, "options": [
+            {"name": "add", "type": 1, "options": [
+                {"name": "channel", "type": 7, "value": "123456789012345678"}
+            ]}
+        ]}]));
+        assert!(matches!(
+            slash_kind("noth", &add),
+            Kind::Ignore {
+                op: IgnoreOp::Add,
+                channel: Some(123456789012345678)
+            }
+        ));
+        let list = options(json!([{"name": "ignore", "type": 2, "options": [
+            {"name": "list", "type": 1, "options": []}
+        ]}]));
+        assert!(matches!(
+            slash_kind("noth", &list),
+            Kind::Ignore {
+                op: IgnoreOp::List,
+                channel: None
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_ignore_operation_falls_back_to_slash() {
+        let ops = options(json!([{"name": "ignore", "type": 2, "options": [
+            {"name": "purge", "type": 1, "options": []}
+        ]}]));
+        assert!(matches!(slash_kind("noth", &ops), Kind::Slash { .. }));
     }
 }

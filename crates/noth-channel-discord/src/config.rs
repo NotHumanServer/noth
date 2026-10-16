@@ -7,6 +7,8 @@ pub(crate) struct DiscordConfig {
     pub(crate) allowed_users: Vec<u64>,
     /// 管理コマンド(`/noth ...`)を使える唯一のユーザー。未設定なら誰も使えない
     pub(crate) master: Option<u64>,
+    /// 除外するチャンネルまたはカテゴリの ID。`/noth ignore` で足したものはここに含まれない
+    pub(crate) ignored_channels: Vec<u64>,
 }
 
 // token がログやパニック出力へ漏れないようにする
@@ -17,6 +19,7 @@ impl std::fmt::Debug for DiscordConfig {
             .field("guild_id", &self.guild_id)
             .field("allowed_users", &self.allowed_users)
             .field("master", &self.master)
+            .field("ignored_channels", &self.ignored_channels)
             .finish()
     }
 }
@@ -35,18 +38,8 @@ impl DiscordConfig {
                 .ok_or_else(|| Error::Config("channel.discord.guild_id が必要です".into()))?,
             "channel.discord.guild_id",
         )?;
-        let allowed_users = match section.get("allowed_users") {
-            None => Vec::new(),
-            Some(toml::Value::Array(items)) => items
-                .iter()
-                .map(|v| parse_id(v, "channel.discord.allowed_users"))
-                .collect::<Result<_>>()?,
-            Some(_) => {
-                return Err(Error::Config(
-                    "channel.discord.allowed_users は文字列の配列で指定してください".into(),
-                ));
-            }
-        };
+        let allowed_users = parse_id_list(section, "allowed_users")?;
+        let ignored_channels = parse_id_list(section, "ignored_channels")?;
         let master = section
             .get("master")
             .map(|v| parse_id(v, "channel.discord.master"))
@@ -56,7 +49,19 @@ impl DiscordConfig {
             guild_id,
             allowed_users,
             master,
+            ignored_channels,
         })
+    }
+}
+
+fn parse_id_list(section: &toml::Value, key: &str) -> Result<Vec<u64>> {
+    let full = format!("channel.discord.{key}");
+    match section.get(key) {
+        None => Ok(Vec::new()),
+        Some(toml::Value::Array(items)) => items.iter().map(|v| parse_id(v, &full)).collect(),
+        Some(_) => Err(Error::Config(format!(
+            "{full} は文字列の配列で指定してください"
+        ))),
     }
 }
 
@@ -81,6 +86,7 @@ mod tests {
             guild_id: 1,
             allowed_users: vec![],
             master: None,
+            ignored_channels: vec![],
         };
         assert!(!format!("{c:?}").contains("secret"));
     }
@@ -104,8 +110,32 @@ allowed_users = ["1", "2"]"#,
                 guild_id: 123,
                 allowed_users: vec![1, 2],
                 master: None,
+                ignored_channels: vec![],
             }
         );
+    }
+
+    #[test]
+    fn ignored_channels_are_parsed_and_validated() {
+        let c = DiscordConfig::parse(&section(
+            r#"token = "t"
+guild_id = "1"
+ignored_channels = ["11", "22"]"#,
+        ))
+        .unwrap();
+        assert_eq!(c.ignored_channels, vec![11, 22]);
+        for bad in [
+            r#"ignored_channels = "11""#,
+            r#"ignored_channels = [11]"#,
+            r#"ignored_channels = ["x"]"#,
+            r#"ignored_channels = ["0"]"#,
+        ] {
+            let text = format!("token = \"t\"\nguild_id = \"1\"\n{bad}");
+            assert!(
+                matches!(DiscordConfig::parse(&section(&text)), Err(Error::Config(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

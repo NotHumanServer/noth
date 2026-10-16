@@ -1,5 +1,6 @@
 mod command;
 mod config;
+mod exclusion;
 mod handler;
 mod state;
 mod text;
@@ -10,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use noth_core::async_trait;
 use noth_core::bus::BusHandle;
 use noth_core::command::CommandHost;
+use noth_core::exclusion::ChannelExclusions;
 use noth_core::registry::Registry;
 use noth_core::traits::{Channel, ConnectionState};
 use noth_core::types::{self, ChannelId, GuildId, MessageId};
@@ -38,17 +40,21 @@ pub struct DiscordChannel {
     http: Arc<Http>,
     names: Names,
     state: SharedState,
+    exclusions: ChannelExclusions,
     commands: OnceLock<Arc<CommandHost>>,
 }
 
 impl DiscordChannel {
     fn new(config: DiscordConfig) -> Self {
         let http = Arc::new(Http::new(&config.token));
+        let exclusions = ChannelExclusions::new(config.guild_id);
+        exclusions.set_config(config.ignored_channels.iter().copied());
         Self {
             config,
             http,
             names: Names::default(),
             state: SharedState::new(),
+            exclusions,
             commands: OnceLock::new(),
         }
     }
@@ -72,7 +78,16 @@ impl DiscordChannel {
             app.id.get(),
             self.config.guild_id,
         ));
-        Some(synced_controller(api, host, self.config.master, self.config.guild_id).await)
+        Some(
+            synced_controller(
+                api,
+                host,
+                self.config.master,
+                self.config.guild_id,
+                self.exclusions.clone(),
+            )
+            .await,
+        )
     }
 }
 
@@ -82,8 +97,9 @@ async fn synced_controller(
     host: Arc<CommandHost>,
     master: Option<u64>,
     guild_id: u64,
+    exclusions: ChannelExclusions,
 ) -> Arc<Controller> {
-    let controller = Controller::new(api, host, master, guild_id);
+    let controller = Controller::new(api, host, master, guild_id, exclusions);
     controller.sync().await;
     Arc::new(controller)
 }
@@ -128,6 +144,10 @@ impl Channel for DiscordChannel {
         let _ = self.commands.set(host);
     }
 
+    fn exclusions(&self) -> Option<ChannelExclusions> {
+        Some(self.exclusions.clone())
+    }
+
     async fn run(&self, bus: BusHandle) -> Result<()> {
         let me = self.http.get_current_user().await.map_err(transport)?;
         let commands = self.command_controller().await;
@@ -139,6 +159,7 @@ impl Channel for DiscordChannel {
             state: self.state.clone(),
             self_id: me.id.get(),
             self_name: me.display_name().to_string(),
+            exclusions: self.exclusions.clone(),
             commands,
         };
         // GUILD_MEMBERS は特権 intent なので要求しない。表示名は REST で取る
@@ -304,7 +325,7 @@ mod tests {
     use crate::command::ApiError;
     use crate::command::{Incoming, Kind};
     use noth_core::command::{CommandEnv, ContextSnapshot, ContextSource};
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
     #[derive(Default)]
     struct RecordingApi {
@@ -345,14 +366,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_is_built_and_clears_commands_when_none_is_enabled() {
+    async fn controller_is_built_and_registers_only_ignore_when_no_command_is_enabled() {
         let api = Arc::new(RecordingApi::default());
         let host = Arc::new(CommandHost::new(
             Vec::new(),
             CommandEnv::new(Arc::new(NoSnapshot)),
         ));
-        let controller = synced_controller(api.clone(), host, Some(1), 10).await;
-        assert_eq!(*api.syncs.lock().unwrap(), [json!([])]);
+        let controller =
+            synced_controller(api.clone(), host, Some(1), 10, ChannelExclusions::new(10)).await;
+        {
+            let syncs = api.syncs.lock().unwrap();
+            let options = syncs[0][0]["options"].as_array().unwrap();
+            assert_eq!(options.len(), 1);
+            assert_eq!(options[0]["name"], "ignore");
+        }
 
         controller
             .handle(Incoming {
