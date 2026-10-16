@@ -398,12 +398,12 @@ async fn sync_registers_noth_with_one_subcommand_per_command() {
     assert_eq!(body[0]["name"], "noth");
     assert_eq!(body[0]["type"], 1);
     let options = body[0]["options"].as_array().unwrap();
+    assert_eq!(options[0]["name"], "ignore");
+    assert_eq!(options[0]["type"], 2);
     assert_eq!(
-        options[0],
+        options[1],
         json!({"type": 1, "name": "context", "description": "使用量を見る"})
     );
-    assert_eq!(options[1]["name"], "ignore");
-    assert_eq!(options[1]["type"], 2);
 }
 
 #[tokio::test]
@@ -794,7 +794,8 @@ async fn duplicate_subcommand_names_are_registered_once() {
         .iter()
         .map(|o| o["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["context", "ignore"]);
-    // 後ろの組み込みの ignore グループ(type 2)ではなく、先の Command(type 1)が残る
+    assert_eq!(names, ["ignore", "context"]);
+    // command module の同名のものではなく、組み込みの ignore グループ(type 2)が残る
+    assert_eq!(body[0]["options"][0]["type"], 2);
     assert_eq!(body[0]["options"][1]["type"], 1);
 }

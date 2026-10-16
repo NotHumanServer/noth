@@ -27,7 +27,7 @@ pub(crate) struct Handler {
     pub(crate) self_id: UserId,
     pub(crate) self_name: String,
     pub(crate) exclusions: ChannelExclusions,
-    pub(crate) resolver: Resolver,
+    pub(crate) resolver: Arc<Resolver>,
     /// 展開を作り直す常駐タスクを 1 回だけ起こすため。`cache_ready` は再接続でも届く
     pub(crate) watching: AtomicBool,
     /// スラッシュコマンドを受け付けないときは None
@@ -46,16 +46,21 @@ impl EventHandler for Handler {
 
     async fn cache_ready(&self, ctx: Context, _guilds: Vec<sn::GuildId>) {
         if self.watching.swap(true, Ordering::SeqCst) {
-            self.rebuild_exclusions(&ctx).await;
+            self.layout_changed(&ctx, None).await;
             return;
         }
         let exclusions = self.exclusions.clone();
-        let cache = ctx.cache.clone();
+        let resolver = self.resolver.clone();
         let guild_id = self.guild_id;
         tokio::spawn(async move {
             let mut changes = exclusions.changes();
             loop {
-                exclusion::rebuild(&exclusions, &cache, guild_id).await;
+                resolver
+                    .rebuild(
+                        || async { exclusion::nodes_from_cache(&ctx.cache, guild_id) },
+                        |id| exclusion::lookup(&ctx, guild_id, id),
+                    )
+                    .await;
                 if changes.changed().await.is_err() {
                     break;
                 }
@@ -63,56 +68,56 @@ impl EventHandler for Handler {
         });
     }
 
-    async fn channel_create(&self, ctx: Context, _channel: sn::GuildChannel) {
-        self.rebuild_exclusions(&ctx).await;
+    async fn channel_create(&self, ctx: Context, channel: sn::GuildChannel) {
+        self.layout_changed(&ctx, Some(channel.id.get())).await;
     }
 
     async fn channel_update(
         &self,
         ctx: Context,
         _old: Option<sn::GuildChannel>,
-        _new: sn::GuildChannel,
+        new: sn::GuildChannel,
     ) {
-        self.rebuild_exclusions(&ctx).await;
+        self.layout_changed(&ctx, Some(new.id.get())).await;
     }
 
     async fn channel_delete(
         &self,
         ctx: Context,
-        _channel: sn::GuildChannel,
+        channel: sn::GuildChannel,
         _messages: Option<Vec<sn::Message>>,
     ) {
-        self.rebuild_exclusions(&ctx).await;
+        self.layout_changed(&ctx, Some(channel.id.get())).await;
     }
 
-    async fn category_delete(&self, ctx: Context, _category: sn::GuildChannel) {
-        self.rebuild_exclusions(&ctx).await;
+    async fn category_delete(&self, ctx: Context, category: sn::GuildChannel) {
+        self.layout_changed(&ctx, Some(category.id.get())).await;
     }
 
-    async fn thread_create(&self, ctx: Context, _thread: sn::GuildChannel) {
-        self.rebuild_exclusions(&ctx).await;
+    async fn thread_create(&self, ctx: Context, thread: sn::GuildChannel) {
+        self.layout_changed(&ctx, Some(thread.id.get())).await;
     }
 
     async fn thread_update(
         &self,
         ctx: Context,
         _old: Option<sn::GuildChannel>,
-        _new: sn::GuildChannel,
+        new: sn::GuildChannel,
     ) {
-        self.rebuild_exclusions(&ctx).await;
+        self.layout_changed(&ctx, Some(new.id.get())).await;
     }
 
     async fn thread_delete(
         &self,
         ctx: Context,
-        _thread: sn::PartialGuildChannel,
+        thread: sn::PartialGuildChannel,
         _full: Option<sn::GuildChannel>,
     ) {
-        self.rebuild_exclusions(&ctx).await;
+        self.layout_changed(&ctx, Some(thread.id.get())).await;
     }
 
     async fn thread_list_sync(&self, ctx: Context, _sync: sn::ThreadListSyncEvent) {
-        self.rebuild_exclusions(&ctx).await;
+        self.layout_changed(&ctx, None).await;
     }
 
     async fn shard_stage_update(&self, _ctx: Context, event: sn::ShardStageUpdateEvent) {
@@ -282,13 +287,23 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
-    /// 除外が無いときの発言ごとの更新を避けるため、指定が空なら何もしない。
+    /// チャンネルやスレッドの構成が変わったとき。親の記憶を捨て、展開を作り直す。
+    /// 除外が無いときの更新を避けるため、指定が空なら作り直さない。
     /// 指定が空になる変更の後始末は、`cache_ready` で起こした常駐タスクが行う
-    async fn rebuild_exclusions(&self, ctx: &Context) {
+    async fn layout_changed(&self, ctx: &Context, channel_id: Option<u64>) {
+        match channel_id {
+            Some(id) => self.resolver.forget(id),
+            None => self.resolver.forget_all(),
+        }
         if self.exclusions.is_empty() {
             return;
         }
-        exclusion::rebuild(&self.exclusions, &ctx.cache, self.guild_id).await;
+        self.resolver
+            .rebuild(
+                || async { exclusion::nodes_from_cache(&ctx.cache, self.guild_id) },
+                |id| exclusion::lookup(ctx, self.guild_id, id),
+            )
+            .await;
     }
 }
 

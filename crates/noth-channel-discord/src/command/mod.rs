@@ -71,7 +71,8 @@ impl IgnoreOp {
     }
 }
 
-/// 同じ名前のサブコマンドを送ると Discord が登録全体を拒否し、`/noth` がすべて使えなくなる。先に出てきた方を残す
+/// 同じ名前のサブコマンドを送ると Discord が登録全体を拒否し、`/noth` がすべて使えなくなる。先に出てきた方を残すので、
+/// 呼び出し側は残したいものを先に並べる(`/noth ignore` は除外の仕組みそのものなので組み込みを先にする)
 fn drop_duplicate_names(subs: Vec<Value>) -> Vec<Value> {
     let mut seen = std::collections::HashSet::new();
     subs.into_iter()
@@ -81,7 +82,7 @@ fn drop_duplicate_names(subs: Vec<Value>) -> Vec<Value> {
             if !fresh {
                 tracing::warn!(
                     name,
-                    "/noth のサブコマンド名が重複しているため、後のものは登録しません"
+                    "/noth のサブコマンド名が重複しているため、後のもの(組み込みの ignore があるときは command module の方)は登録しません"
                 );
             }
             fresh
@@ -119,13 +120,13 @@ impl Controller {
         if self.master.is_none() {
             return json!([]);
         }
-        let mut subs: Vec<Value> = self
-            .host
-            .commands()
-            .iter()
-            .map(|c| json!({"type": 1, "name": c.name(), "description": c.description()}))
-            .collect();
-        subs.push(ignore::definition());
+        let mut subs = vec![ignore::definition()];
+        subs.extend(
+            self.host
+                .commands()
+                .iter()
+                .map(|c| json!({"type": 1, "name": c.name(), "description": c.description()})),
+        );
         let subs = drop_duplicate_names(subs);
         json!([{
             "type": 1,

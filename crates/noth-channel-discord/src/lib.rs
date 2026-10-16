@@ -23,7 +23,9 @@ use serenity::prelude::{Client, GatewayIntents};
 
 use crate::command::{Controller, InteractionApi, RestInteractionApi};
 use crate::config::DiscordConfig;
-use crate::exclusion::{ChannelNode, Resolver, expand, node_of, unknown_ids};
+use crate::exclusion::{
+    ChannelNode, REST_RETRY_DELAYS, Resolver, lookup_rest, node_of, retry, unknown_ids,
+};
 use crate::handler::Handler;
 use crate::state::{Names, SharedState};
 use crate::text::{prepare_edit, split_message, wrap_urls};
@@ -43,6 +45,7 @@ pub struct DiscordChannel {
     names: Names,
     state: SharedState,
     exclusions: ChannelExclusions,
+    resolver: Arc<Resolver>,
     commands: OnceLock<Arc<CommandHost>>,
 }
 
@@ -56,6 +59,7 @@ impl DiscordChannel {
             http,
             names: Names::default(),
             state: SharedState::new(),
+            resolver: Arc::new(Resolver::new(exclusions.clone())),
             exclusions,
             commands: OnceLock::new(),
         }
@@ -171,23 +175,33 @@ impl Channel for DiscordChannel {
 
     async fn load_exclusions(&self) {
         let guild = self.guild();
-        let mut nodes: Vec<ChannelNode> = match self.http.get_channels(guild).await {
-            Ok(channels) => channels.iter().map(node_of).collect(),
+        let listed = async {
+            let channels = retry(&REST_RETRY_DELAYS, || self.http.get_channels(guild)).await?;
+            let threads = retry(&REST_RETRY_DELAYS, || {
+                self.http.get_guild_active_threads(guild)
+            })
+            .await?;
+            Ok::<_, serenity::Error>(
+                channels
+                    .iter()
+                    .chain(threads.threads.iter())
+                    .map(node_of)
+                    .collect::<Vec<_>>(),
+            )
+        }
+        .await;
+        let nodes = match listed {
+            Ok(nodes) => nodes,
             Err(e) => {
-                tracing::warn!(error = %transport(e), "チャンネルの一覧を取得できないため、除外の展開は接続後に行います");
+                tracing::warn!(error = %transport(e), "チャンネルとスレッドの一覧を取得できませんでした。接続後に展開できるまで、再起動前の発言の判定と Layer 3 への昇格を止めます");
+                self.exclusions.mark_expansion_pending();
                 return;
             }
         };
-        match self.http.get_guild_active_threads(guild).await {
-            Ok(data) => nodes.extend(data.threads.iter().map(node_of)),
-            Err(e) => {
-                tracing::warn!(error = %transport(e), "スレッドの一覧を取得できませんでした。スレッドは受信時に親をたどって判定します")
-            }
-        }
         self.warn_unknown_ignored_channels(&nodes).await;
-        let list = self.exclusions.list();
-        let direct: Vec<u64> = list.config.into_iter().chain(list.commanded).collect();
-        self.exclusions.set_expanded(expand(&direct, &nodes)).await;
+        self.resolver
+            .rebuild(|| async { Some(nodes) }, |id| lookup_rest(&self.http, id))
+            .await;
     }
 
     async fn run(&self, bus: BusHandle) -> Result<()> {
@@ -202,7 +216,7 @@ impl Channel for DiscordChannel {
             self_id: me.id.get(),
             self_name: me.display_name().to_string(),
             exclusions: self.exclusions.clone(),
-            resolver: Resolver::new(self.exclusions.clone()),
+            resolver: self.resolver.clone(),
             watching: AtomicBool::new(false),
             commands,
         };
