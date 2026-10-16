@@ -18,7 +18,7 @@ use serenity::all as sn;
 use serenity::http::Http;
 use serenity::prelude::{Client, GatewayIntents};
 
-use crate::command::{Controller, RestInteractionApi};
+use crate::command::{Controller, InteractionApi, RestInteractionApi};
 use crate::config::DiscordConfig;
 use crate::handler::Handler;
 use crate::state::{Names, SharedState};
@@ -57,13 +57,9 @@ impl DiscordChannel {
         sn::GuildId::new(self.config.guild_id)
     }
 
-    /// コマンドが 0 件でも作る(前回登録したコマンドを外すため)。`set_commands` が呼ばれていない、またはアプリケーション情報を取れないときは None で、スラッシュコマンドなしで動く
+    /// `set_commands` が呼ばれていない、またはアプリケーション情報を取れないときは None で、スラッシュコマンドなしで動く
     async fn command_controller(&self) -> Option<Arc<Controller>> {
-        let host = self
-            .commands
-            .get()
-            .filter(|h| !h.commands().is_empty())?
-            .clone();
+        let host = self.commands.get()?.clone();
         let app = match self.http.get_current_application_info().await {
             Ok(app) => app,
             Err(e) => {
@@ -76,10 +72,20 @@ impl DiscordChannel {
             app.id.get(),
             self.config.guild_id,
         ));
-        let controller = Controller::new(api, host, self.config.master, self.config.guild_id);
-        controller.sync().await;
-        Some(Arc::new(controller))
+        Some(synced_controller(api, host, self.config.master, self.config.guild_id).await)
     }
+}
+
+/// コマンドが 0 件でも sync する。前回登録した `/noth` を Discord 側から消すため
+async fn synced_controller(
+    api: Arc<dyn InteractionApi>,
+    host: Arc<CommandHost>,
+    master: Option<u64>,
+    guild_id: u64,
+) -> Arc<Controller> {
+    let controller = Controller::new(api, host, master, guild_id);
+    controller.sync().await;
+    Arc::new(controller)
 }
 
 fn transport(e: serenity::Error) -> Error {
@@ -291,5 +297,77 @@ mod tests {
         assert_eq!(clean_body(401, "401: Unauthorized"), "Unauthorized");
         assert_eq!(clean_body(404, "Unknown\nChannel"), "Unknown Channel");
         assert_eq!(clean_body(500, &"x".repeat(300)).chars().count(), 201);
+    }
+
+    use std::sync::Mutex;
+
+    use crate::command::ApiError;
+    use crate::command::{Incoming, Kind};
+    use noth_core::command::{CommandEnv, ContextSnapshot, ContextSource};
+    use serde_json::{Value, json};
+
+    #[derive(Default)]
+    struct RecordingApi {
+        syncs: Mutex<Vec<Value>>,
+        callbacks: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl InteractionApi for RecordingApi {
+        async fn sync_commands(&self, body: &Value) -> std::result::Result<(), ApiError> {
+            self.syncs.lock().unwrap().push(body.clone());
+            Ok(())
+        }
+        async fn callback(
+            &self,
+            _id: u64,
+            _token: &str,
+            body: &Value,
+        ) -> std::result::Result<(), ApiError> {
+            self.callbacks.lock().unwrap().push(body.clone());
+            Ok(())
+        }
+        async fn edit_original(&self, _: &str, _: &Value) -> std::result::Result<(), ApiError> {
+            Ok(())
+        }
+        async fn followup(&self, _: &str, _: &Value) -> std::result::Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    struct NoSnapshot;
+
+    #[async_trait]
+    impl ContextSource for NoSnapshot {
+        async fn context_snapshot(&self) -> Result<ContextSnapshot> {
+            Err(Error::Other("unused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_is_built_and_clears_commands_when_none_is_enabled() {
+        let api = Arc::new(RecordingApi::default());
+        let host = Arc::new(CommandHost::new(
+            Vec::new(),
+            CommandEnv::new(Arc::new(NoSnapshot)),
+        ));
+        let controller = synced_controller(api.clone(), host, Some(1), 10).await;
+        assert_eq!(*api.syncs.lock().unwrap(), [json!([])]);
+
+        controller
+            .handle(Incoming {
+                id: 5,
+                token: "t".into(),
+                user_id: 1,
+                guild_id: Some(10),
+                kind: Kind::Slash {
+                    name: "noth".into(),
+                    sub: Some("context".into()),
+                },
+            })
+            .await;
+        let callbacks = api.callbacks.lock().unwrap();
+        assert_eq!(callbacks.len(), 1);
+        assert!(callbacks[0].to_string().contains("未知のコマンドです"));
     }
 }

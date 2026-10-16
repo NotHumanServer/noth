@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 mod api;
 mod render;
 
+#[cfg(test)]
+pub(crate) use api::ApiError;
 pub(crate) use api::{InteractionApi, RestInteractionApi};
 use render::{FLAG_EPHEMERAL, embed_message, parse_refresh, plain, text_message, v2_message};
 
@@ -86,10 +88,28 @@ impl Controller {
                 "channel.discord.master が未設定のため、/noth コマンドは登録せず、誰にも使えません"
             );
         }
-        if let Err(e) = self.api.sync_commands(&self.definitions()).await {
+        let definitions = self.definitions();
+        if let Err(e) = self.api.sync_commands(&definitions).await {
             tracing::warn!(
                 error = %e,
                 "スラッシュコマンドを登録できませんでした。Bot の招待に applications.commands スコープが含まれているか確認してください(docs/discord-setup.md)"
+            );
+            return;
+        }
+        let names: Vec<&str> = definitions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        if names.is_empty() {
+            tracing::info!(guild = self.guild_id, "スラッシュコマンドを消しました");
+        } else {
+            tracing::info!(
+                guild = self.guild_id,
+                count = names.len(),
+                ?names,
+                "スラッシュコマンドを登録しました"
             );
         }
     }
