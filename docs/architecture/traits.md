@@ -35,6 +35,8 @@ pub trait Channel: Send + Sync {
     fn set_commands(&self, host: Arc<CommandHost>) {}
     /// 除外するチャンネルを管理する Channel だけが返す。`noth run` が起動時に DB の保存分を読み込ませ、tool と共有する。既定は None
     fn exclusions(&self) -> Option<ChannelExclusions> { None }
+    /// 除外の指定をチャンネルとスレッドの ID に展開して `exclusions()` に載せる。`noth run` が復元の前に呼ぶ。既定は何もしない
+    async fn load_exclusions(&self) {}
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
     /// `noth doctor` の疎通確認。成功時は表示用の短い説明を返す

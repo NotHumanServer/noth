@@ -443,7 +443,7 @@ Noth の話をしているが返事を求められていない発言に、絵文
 
 | テーブル | 内容 |
 |---|---|
-| `messages` | `allowed_users` と Noth 自身の発言の生ログ、Bot の目印。チャンネル、投稿者、`is_self`、本文、時刻、所属 TopicChunk、`is_noise_or_meme`、自分宛てのメンション・リプライか、リプライ先の発言 ID・投稿者名・Noth の発言か、`decision_id`(NULL なら未判定)、`promoted_turn_id`(NULL なら未昇格) |
+| `messages` | `allowed_users` と Noth 自身の発言の生ログ、Bot の目印。チャンネル、投稿者、`is_self`、本文、時刻、所属 TopicChunk、`is_noise_or_meme`、自分宛てのメンション・リプライか、リプライ先の発言 ID・投稿者名・Noth の発言か、`decision_id`(NULL なら未判定)、`promoted_turn_id`(NULL なら未昇格)、`hidden`(1 なら除外したチャンネルのため判定・昇格の対象外) |
 | `topic_chunks` | TopicChunk の ID、チャンネル、開始・終了時刻、Compactor による要約が済んでいるか |
 | `decisions` | router の判定結果と各回答の確率・confidence、Core が決めた動き方、レイテンシ、判定したモデル(版を固定した名前。`jev/<固定名>` など) |
 | `active_log` | Layer 3 のターン列。各ターンの種別(バッファ / トリガー / 応答 / 結論メモ)、`chunk_id`、その時点の `usage` |
@@ -456,7 +456,7 @@ Noth の話をしているが返事を求められていない発言に、絵文
 
 `allowed_users` 以外のユーザーの発言は Channel で捨てるため、どのテーブルにも入りません。Noth 以外の Bot の発言は本文を保存せず、`messages` に目印だけを `is_bot_marker` 付きで入れます(§4.4)。`search_messages` の対象にはしません。
 
-除外したチャンネル(config の `ignored_channels` と `/noth ignore` の和集合。カテゴリを指定すると配下のチャンネルも、チャンネルを指定するとそのスレッドも含む)の発言は、Channel で捨てるため、`messages` にも Layer 3 にも入りません。除外する前に記録済みの発言は消さず(Layer 3 は追記だけ)、`search_messages` が結果から外します。再起動時の復元(§6.1)は DB の行から Judge を作るので、除外の前に記録された未判定の発言は復元で判定に回り得ます。
+除外したチャンネル(config の `ignored_channels` と `/noth ignore` の和集合。カテゴリを指定すると配下のチャンネルも、チャンネルを指定するとそのスレッドも含む)の発言は、Channel で捨てるため、`messages` にも Layer 3 にも入りません。除外する前に記録済みの発言は消さず(Layer 3 は追記だけ)、`search_messages` が結果から外します。ただし、まだ判定・昇格されていない行（未判定、判定済みで未昇格のバッファ、デバウンス中のキュー）は、`messages.hidden` を立てて外し、判定にも router の state にも Layer 3 にも回しません。再起動時の復元(§6.1)も拾いません（`noth run` が復元の前に除外を展開して印を付ける）。
 
 ### 6.1 再起動時の復元
 
