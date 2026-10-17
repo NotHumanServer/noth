@@ -523,6 +523,21 @@ impl Store {
         .await?
         .map(|u| u as UserId))
     }
+    /// Discord の message_id から発言を引く
+    pub async fn message_by_discord_id(
+        &self,
+        guild: GuildId,
+        message_id: MessageId,
+    ) -> Result<Option<MessageRow>> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE guild_id = ? AND message_id = ?"
+        )))
+        .bind(guild as i64)
+        .bind(message_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(message_row).transpose()
+    }
     pub async fn message(&self, id: i64) -> Result<Option<MessageRow>> {
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = ?"

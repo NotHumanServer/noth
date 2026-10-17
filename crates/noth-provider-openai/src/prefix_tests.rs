@@ -213,6 +213,11 @@ fn join_shares_the_fork_time_request_up_to_the_trigger() {
             vec![layers::delivery_instruction_turn(
                 3,
                 DeliveryStyle::NormalReport,
+                &layers::ReportTarget {
+                    channel_name: "general",
+                    channel_id: 1,
+                    request: None,
+                },
             )],
         ));
         // [判定] は Join の Layer 3 に無いので、判定ありのときは trigger の末尾までしか重ならない

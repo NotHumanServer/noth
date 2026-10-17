@@ -598,7 +598,43 @@ pub fn conclusion_turn(
 }
 
 /// Join の報告で Layer 4 にだけ置く指示。abort では main を起動しないので呼ばない
-pub fn delivery_instruction_turn(chunk_id: i64, style: DeliveryStyle) -> Turn {
+/// Join の報告先。Worker の実行中に別のチャンネルや別の人の発言が Layer 3 に入ると、main がそちらに答えて
+/// 報告が消えることがあった(fakecord の評価 y1)。どの依頼への報告で、どこに投稿されるかを伝える
+pub struct ReportTarget<'a> {
+    pub channel_name: &'a str,
+    pub channel_id: ChannelId,
+    /// 依頼した人の表示名と、依頼の本文
+    pub request: Option<(&'a str, &'a str)>,
+}
+
+const REQUEST_EXCERPT_CHARS: usize = 60;
+
+fn report_target_text(t: &ReportTarget) -> String {
+    let mut s = format!(
+        "{HEADER_CHANNEL}\n#{}(channel_id: {})",
+        t.channel_name, t.channel_id
+    );
+    if let Some((author, content)) = t.request {
+        let excerpt: String = content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(REQUEST_EXCERPT_CHARS)
+            .collect();
+        s.push_str(&format!("\nこの報告は、{author} の依頼「{excerpt}」への報告として、このチャンネルに投稿されます。"));
+    } else {
+        s.push_str("\nこの報告は、このチャンネルに投稿されます。");
+    }
+    s.push_str("今回の内部調査の結果だけを報告してください。調査中に届いた、ほかのチャンネルや別の人の発言には、ここでは答えないでください。");
+    s
+}
+
+pub fn delivery_instruction_turn(
+    chunk_id: i64,
+    style: DeliveryStyle,
+    target: &ReportTarget,
+) -> Turn {
     let body = match style {
         DeliveryStyle::NormalReport | DeliveryStyle::Abort => {
             "直前の内部調査の結果を、会話の流れに合わせて報告してください。"
@@ -614,7 +650,10 @@ pub fn delivery_instruction_turn(chunk_id: i64, style: DeliveryStyle) -> Turn {
         id: None,
         role: Role::User,
         kind: TurnKind::Instruction,
-        text: format!("{HEADER_DELIVERY}\n{body}"),
+        text: format!(
+            "{HEADER_DELIVERY}\n{body}\n\n{}",
+            report_target_text(target)
+        ),
         chunk_id: Some(chunk_id),
     }
 }

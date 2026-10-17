@@ -1249,9 +1249,25 @@ impl Actor {
         let conclusion = layers::conclusion_turn(chunk_id, run_id, outcome);
         let mut active_log = self.store.active_turns(guild).await?;
         active_log.push(conclusion.clone());
+        let trigger = match run.trigger_message_id {
+            Some(id) => self.store.message_by_discord_id(guild, id).await?,
+            None => None,
+        };
+        let channel_name = trigger
+            .as_ref()
+            .map(|t| t.channel_name.clone())
+            .or_else(|| self.channel_names.get(&run.channel_id).cloned())
+            .unwrap_or_else(|| run.channel_id.to_string());
+        let target = layers::ReportTarget {
+            channel_name: &channel_name,
+            channel_id: run.channel_id,
+            request: trigger
+                .as_ref()
+                .map(|t| (t.author_name.as_str(), t.content.as_str())),
+        };
         let prompt = self.prompt(
             active_log,
-            vec![layers::delivery_instruction_turn(chunk_id, style)],
+            vec![layers::delivery_instruction_turn(chunk_id, style, &target)],
         );
         let completion = self
             .complete_with_typing(run.channel_id, &prompt, Purpose::Join, Some(run_id))

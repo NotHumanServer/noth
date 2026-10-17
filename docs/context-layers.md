@@ -379,7 +379,7 @@ Noth の話をしているが返事を求められていない発言に、絵文
    - `abort` 以外なら、次の順に報告する
      1. 未昇格バッファを昇格する
      2. Layer 3 に `[内部調査完了 <run_id>: <結論メモ>]` を user メッセージとして1ブロック追記する
-     3. 上のとおり後続の人間の発言(と依頼者本人の発言)が無ければ router に聞かず `normal_report` とする。数えるのは Store への問い合わせで、router に渡す直近の窓には依存しない。Layer 4 には `delivery_style` の指示だけを入れ、main が発言する。`reply_anchor` のときだけ `worker_runs.trigger_message_id` への Discord リプライとして投稿する
+     3. 上のとおり後続の人間の発言(と依頼者本人の発言)が無ければ router に聞かず `normal_report` とする。数えるのは Store への問い合わせで、router に渡す直近の窓には依存しない。Layer 4 には `delivery_style` の指示と報告先(`[発言先]` の `#名前` と channel_id、依頼した人と依頼の本文の先頭 60 文字)を入れ、main が発言する。報告先には「今回の結果だけを報告し、調査中に届いたほかのチャンネルや別の人の発言には答えない」と添える(Worker の実行中に別チャンネルの依頼が届くと、main がそちらに答えて報告が消えたため。2026-10-17 の fakecord での評価)。`reply_anchor` のときだけ `worker_runs.trigger_message_id` への Discord リプライとして投稿する
      4. 応答を Layer 3 に昇格する。Layer 4 の指示は残さない
 
 ### パターン C': 黙って調べる(`other` の補足、または `noth_request` 以外の訂正)

@@ -1328,6 +1328,17 @@ async fn join_normal_report_appends_conclusion_and_posts() {
     assert_eq!(report.active_log.last().unwrap().text, turns[2].text);
     assert_eq!(report.ephemeral_tail.len(), 1);
     assert_eq!(report.ephemeral_tail[0].kind, TurnKind::Instruction);
+    // 調査中に別のチャンネルの発言が入っても、どの依頼への報告かを取り違えないよう、報告先と依頼を伝える
+    let instruction = &report.ephemeral_tail[0].text;
+    assert!(
+        instruction.contains(&format!("[発言先]\n#general(channel_id: {GENERAL})")),
+        "{instruction}"
+    );
+    assert!(
+        instruction.contains("の依頼「天気調べて」"),
+        "{instruction}"
+    );
+    assert!(instruction.contains("ほかのチャンネルや別の人の発言には、ここでは答えない"));
 }
 
 #[tokio::test]
