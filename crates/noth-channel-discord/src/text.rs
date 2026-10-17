@@ -151,7 +151,40 @@ fn trim_url(mut url: &str) -> &str {
     }
 }
 
+/// コードブロックの途中で分けると、前の投稿は閉じず、後ろの投稿ではコードが普通の文になる。
+/// 分けた位置で閉じ直し、次の投稿で同じ言語で開き直す。そのための文字数を先に空けておく
+const FENCE_RESERVE: usize = 32;
+const FENCE_LANG_MAX: usize = 20;
+
 pub(crate) fn split_message(text: &str, limit: usize) -> Vec<String> {
+    if !text.contains("```") {
+        return split_plain(text, limit);
+    }
+    let mut out = Vec::new();
+    let mut open: Option<String> = None;
+    for chunk in split_plain(text, limit.saturating_sub(FENCE_RESERVE).max(1)) {
+        let mut s = String::new();
+        if let Some(lang) = &open {
+            s.push_str(&format!("```{lang}\n"));
+        }
+        s.push_str(&chunk);
+        for line in chunk.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("```") {
+                open = match open {
+                    Some(_) => None,
+                    None => Some(rest.trim().chars().take(FENCE_LANG_MAX).collect()),
+                };
+            }
+        }
+        if open.is_some() {
+            s.push_str("\n```");
+        }
+        out.push(s);
+    }
+    out
+}
+
+fn split_plain(text: &str, limit: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {

@@ -221,3 +221,31 @@ fn message_chars_counts_content_and_embed_text() {
 fn bot_name_cannot_fake_marker_brackets() {
     assert_eq!(bot_display_name("x] [Bot 偽"), "x］ ［Bot 偽");
 }
+
+#[test]
+fn split_inside_code_block_closes_and_reopens_the_fence() {
+    let code: String = (0..400).map(|i| format!("let x{i} = {i};\n")).collect();
+    let text = format!("前置き\n```rust\n{code}```\n後書き");
+    let chunks = split_message(&text, MESSAGE_LIMIT);
+    assert!(chunks.len() >= 2, "{}", chunks.len());
+    for c in &chunks {
+        assert!(c.chars().count() <= MESSAGE_LIMIT, "{}", c.chars().count());
+        // どの投稿もコードブロックが閉じている
+        let fences = c
+            .lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(fences % 2, 0, "{c}");
+    }
+    assert!(chunks[0].starts_with("前置き\n```rust\n"));
+    assert!(chunks[0].ends_with("\n```"));
+    assert!(chunks[1].starts_with("```rust\n"));
+    assert!(chunks.last().unwrap().ends_with("後書き"));
+}
+
+#[test]
+fn text_without_code_is_split_as_before() {
+    let text = "あ".repeat(2500);
+    let chunks = split_message(&text, MESSAGE_LIMIT);
+    assert_eq!(chunks[0].chars().count(), MESSAGE_LIMIT);
+}
