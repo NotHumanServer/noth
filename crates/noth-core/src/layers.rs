@@ -553,10 +553,24 @@ pub fn split_ack_goal(text: &str) -> Option<(String, String)> {
     None
 }
 
-/// main が tool を直接呼んだときの Goal。tool_calls 自体は Layer 3 に残さないので、呼び出しの中身を文章として渡す
-pub fn goal_from_tool_calls(calls: &[ToolCall]) -> String {
-    let mut s =
-        "main が次の tool 呼び出しを求めました。これを手がかりに調べてください。".to_string();
+/// main が tool を直接呼んだときの Goal。tool_calls 自体は Layer 3 に残さないので、呼び出しの中身を文章として渡す。
+/// 呼び出しだけでは何を頼まれたか分からない(`shell true` のような中身の無い呼び出しもある)ので、発言先と本文も添える
+pub fn goal_from_tool_calls(
+    channel_name: &str,
+    channel_id: ChannelId,
+    lines: &[Line],
+    calls: &[ToolCall],
+) -> String {
+    let mut s = String::from(
+        "次の発言は Noth への依頼です。何を求められているかを読み取って、調べて答えてください。",
+    );
+    s.push_str(&format!(
+        "\n発言先: #{channel_name}(channel_id: {channel_id})"
+    ));
+    for l in lines {
+        s.push_str(&format!("\n- {}: {}", l.author, l.content));
+    }
+    s.push_str("\nmain は次の tool 呼び出しを求めました。手がかりにしてください。");
     for c in calls {
         s.push_str(&format!("\n- {}: {}", c.name, c.input));
     }

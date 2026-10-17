@@ -709,7 +709,7 @@ impl Actor {
             chunk_id,
             "main の応答"
         );
-        if let Some(plan) = self.task_plan(&completion) {
+        if let Some(plan) = self.task_plan(&completion, batch, &trigger_lines) {
             return self
                 .start_task(
                     batch,
@@ -856,14 +856,24 @@ impl Actor {
 
     /// main の応答が Worker への委譲かどうか。router が reply_only と判定していても、main が `[Goal]` を書いたか
     /// tool を呼んだなら委譲する。そのまま投稿すると Goal が Discord に漏れ、tool_calls は投稿できる本文が無いため
-    fn task_plan(&self, completion: &Completion) -> Option<TaskPlan> {
+    fn task_plan(
+        &self,
+        completion: &Completion,
+        batch: &JudgeBatch,
+        trigger_lines: &[Line],
+    ) -> Option<TaskPlan> {
         self.worker.as_ref()?;
         if !completion.tool_calls.is_empty() {
             return Some(TaskPlan {
                 ack: layers::FIXED_ACK.to_string(),
                 log_ack: layers::FIXED_ACK.to_string(),
                 memos: Vec::new(),
-                goal: layers::goal_from_tool_calls(&completion.tool_calls),
+                goal: layers::goal_from_tool_calls(
+                    &batch.channel_name,
+                    batch.channel_id,
+                    trigger_lines,
+                    &completion.tool_calls,
+                ),
                 origin: Origin::Request,
             });
         }

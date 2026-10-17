@@ -1546,6 +1546,9 @@ async fn tool_calls_become_fixed_ack_and_goal() {
     assert!(response.starts_with(&format!("{ack}\n[Goal]\n")));
     assert!(response.contains("web_search"));
     assert!(response.contains("東京 天気"));
+    // 呼び出しだけでは依頼が分からないことがあるので、依頼の本文と発言先も Goal に入れる
+    assert!(response.contains("天気は?"), "{response}");
+    assert!(response.contains("発言先: #"), "{response}");
     let run = &runs(&h.store, RunStatus::Queued)
         .await
         .into_iter()

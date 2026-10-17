@@ -359,7 +359,7 @@ Noth の話をしているが返事を求められていない発言に、絵文
    - トリガー発言と main の応答(Ack + Goal)を Layer 3 に昇格する。**Fork より前に昇格する**ことで、Worker の文脈にもトリガーと Goal が含まれる
    - main の応答がテキストの Ack ではなく `tool_calls` だった場合は、Core が次のように処理する
      - Layer 0 の定型文から Ack を作って投稿する
-     - tool 呼び出しの内容から Goal を組み立て、「定型 Ack + Goal」をテキストの assistant メッセージとして Layer 3 に記録する
+     - トリガーの発言と発言先(`#名前` と channel_id)、tool 呼び出しの内容から Goal を組み立て(呼び出しだけでは依頼が分からないことがある。`shell true` のような中身の無い呼び出しも観測した)、「定型 Ack + Goal」をテキストの assistant メッセージとして Layer 3 に記録する
      - 元の `tool_calls` は履歴に残さない。残すと `tool_result` が必須になり、消すと assistant が空になるため
      - run には起動の経緯 `origin`(`request` / `supplement` / `correction`)のラベルを付ける。記録とプロンプト用で、tool の可否には使わない。有効な tool はどの run でも呼べる([security.md §3](architecture/security.md#3-web-側の対策と承認ポリシー))。tool の種類を router に選ばせる `task_category` はなくした
    - Worker の同時実行数が `max_concurrent` に達していたら run をキューに入れ、先に入ったものから順に実行する(FIFO)。Ack は投稿済みなので、待ち時間も `timeout_secs` に含める
