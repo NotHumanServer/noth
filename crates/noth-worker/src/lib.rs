@@ -249,9 +249,12 @@ fn progress_summary(tool: &str, input: &Value) -> String {
                     .find(|s| !s.is_empty())
             };
             match action.as_str() {
-                "search_messages" => first(&["query", "author", "channel_id"])
-                    .map(|t| format!("{action}「{t}」"))
-                    .unwrap_or(action),
+                // 「」で囲むのは検索語だけ。検索語が空のときに投稿者やチャンネル ID を囲むと検索語に見える
+                "search_messages" => match (first(&["query"]), first(&["author", "channel_id"])) {
+                    (Some(q), _) => format!("{action}「{q}」"),
+                    (None, Some(t)) => format!("{action} {t}"),
+                    (None, None) => action,
+                },
                 _ => match first(&["channel_id", "user_id"]) {
                     Some(id) => format!("{action} {id}"),
                     None => action,
@@ -313,7 +316,9 @@ fn log_summary(tool: &str, input: &Value) -> String {
                     Value::Number(n) => Some(n.to_string()),
                     _ => None,
                 });
-            let query = str_field(input, "query").map(short);
+            let query = str_field(input, "query")
+                .map(short)
+                .filter(|q| !q.trim().is_empty());
             match (query, id) {
                 (Some(q), _) => format!("{action}「{q}」"),
                 (None, Some(id)) => format!("{action} {id}"),
@@ -1184,6 +1189,15 @@ mod tests {
             "fetch_messages 123"
         );
         assert_eq!(progress_summary("mystery", &json!({"query": "x"})), "");
+    }
+
+    #[test]
+    fn empty_search_query_is_not_shown_as_a_query() {
+        let input = json!({"action": "search_messages", "query": "", "channel_id": "123"});
+        assert_eq!(progress_summary("discord", &input), "search_messages 123");
+        assert_eq!(log_summary("discord", &input), "search_messages 123");
+        let input = json!({"action": "search_messages", "query": " ", "author": "mio"});
+        assert_eq!(progress_summary("discord", &input), "search_messages mio");
     }
 
     #[test]
