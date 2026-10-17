@@ -12,16 +12,18 @@ use std::sync::{Arc, OnceLock};
 use noth_core::async_trait;
 use noth_core::bus::BusHandle;
 use noth_core::command::CommandHost;
+use noth_core::config::url_endpoint;
 use noth_core::exclusion::ChannelExclusions;
 use noth_core::registry::Registry;
 use noth_core::traits::{Channel, ConnectionState};
 use noth_core::types::{self, ChannelId, GuildId, MessageId};
 use noth_core::{Error, Result};
 use serenity::all as sn;
-use serenity::http::Http;
-use serenity::prelude::{Client, GatewayIntents};
+use serenity::client::ClientBuilder;
+use serenity::http::{Http, HttpBuilder};
+use serenity::prelude::GatewayIntents;
 
-use crate::command::{Controller, InteractionApi, RestInteractionApi};
+use crate::command::{Controller, InteractionApi, RestInteractionApi, rest_base};
 use crate::config::DiscordConfig;
 use crate::exclusion::{
     ChannelNode, REST_RETRY_DELAYS, Resolver, lookup_rest, node_of, retry, unknown_ids,
@@ -49,9 +51,59 @@ pub struct DiscordChannel {
     commands: OnceLock<Arc<CommandHost>>,
 }
 
+/// REST と Gateway の両方で使う Http を作る。`api_base` があるときだけ proxy に向ける。
+/// ratelimiter_disabled(true) は必須で、外すと serenity は proxy を無視して本物の Discord に向かう。
+/// 環境変数の HTTP_PROXY 経由で loopback への通信が横取りされないよう、reqwest は no_proxy にする
+fn build_http(config: &DiscordConfig) -> Http {
+    let builder = HttpBuilder::new(&config.token);
+    match &config.api_base {
+        Some(api_base) => {
+            // serenity 0.12 が使う reqwest 0.12 の型で作る(workspace の 0.13 とは型が別)
+            let client = reqwest012::Client::builder()
+                .no_proxy()
+                .use_rustls_tls()
+                .build()
+                .expect("Cannot build reqwest::Client");
+            builder
+                .client(client)
+                .proxy(api_base.clone())
+                .ratelimiter_disabled(true)
+                .build()
+        }
+        None => builder.build(),
+    }
+}
+
+/// proxy は REST にしか効かず、Gateway の接続先は `get_gateway()` の応答で決まる。
+/// その取得に失敗すると serenity は黙って `wss://gateway.discord.gg` に切り替え、IDENTIFY でトークンが本物の Discord へ送られる。
+/// api_base があるときは、Gateway URL が api_base と同じ host と port の ws(s):// でなければ起動を止める
+fn ensure_gateway_is_local(api_base: Option<&str>, ws_url: &str) -> Result<()> {
+    let Some(api_base) = api_base else {
+        return Ok(());
+    };
+    let local = url_endpoint(api_base);
+    let is_ws = ws_url.starts_with("ws://") || ws_url.starts_with("wss://");
+    if is_ws && local.is_some() && url_endpoint(ws_url) == local {
+        return Ok(());
+    }
+    tracing::error!(
+        api_base,
+        ws_url,
+        "Gateway の接続先が api_base と一致しません。Bot トークンが別のホストへ送られるため起動を止めます(api_base 側の /api/v10/gateway が失敗している可能性があります)"
+    );
+    Err(Error::Config(format!(
+        "Gateway の接続先 {ws_url} が channel.discord.api_base {api_base} と一致しないため、起動を止めました"
+    )))
+}
+
 impl DiscordChannel {
     fn new(config: DiscordConfig) -> Self {
-        let http = Arc::new(Http::new(&config.token));
+        if let Some(api_base) = &config.api_base {
+            tracing::warn!(
+                "Discord の接続先を {api_base} に置き換えます。Bot トークンはこのホストに送られます"
+            );
+        }
+        let http = Arc::new(build_http(&config));
         let exclusions = ChannelExclusions::new(config.guild_id);
         exclusions.set_config(config.ignored_channels.iter().copied());
         Self {
@@ -98,11 +150,13 @@ impl DiscordChannel {
                 return None;
             }
         };
-        let api = Arc::new(RestInteractionApi::new(
+        let api = Arc::new(RestInteractionApi::with_base(
             self.config.token.clone(),
             app.id.get(),
             self.config.guild_id,
+            rest_base(self.config.api_base.as_deref()),
         ));
+
         Some(
             synced_controller(
                 api,
@@ -224,10 +278,13 @@ impl Channel for DiscordChannel {
         let intents = GatewayIntents::GUILDS
             | GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::MESSAGE_CONTENT;
-        let mut client = Client::builder(&self.config.token, intents)
+        // api_base が無いときは `Client::builder(token, intents)` と同じ Http になる
+        let mut client = ClientBuilder::new_with_http(build_http(&self.config), intents)
             .event_handler(handler)
             .await
             .map_err(transport)?;
+        let ws_url = client.ws_url.lock().await.clone();
+        ensure_gateway_is_local(self.config.api_base.as_deref(), &ws_url)?;
         client.start().await.map_err(transport)
     }
 
@@ -454,5 +511,120 @@ mod tests {
         let callbacks = api.callbacks.lock().unwrap();
         assert_eq!(callbacks.len(), 1);
         assert!(callbacks[0].to_string().contains("未知のコマンドです"));
+    }
+
+    fn config_with(api_base: Option<&str>) -> DiscordConfig {
+        DiscordConfig {
+            token: "secret-token".into(),
+            guild_id: 10,
+            allowed_users: vec![],
+            master: None,
+            ignored_channels: vec![],
+            api_base: api_base.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn build_http_keeps_the_production_setup_without_api_base() {
+        let http = build_http(&config_with(None));
+        assert_eq!(http.proxy, None);
+        assert!(http.ratelimiter.is_some());
+    }
+
+    #[test]
+    fn build_http_points_at_api_base_and_disables_the_ratelimiter() {
+        let http = build_http(&config_with(Some("http://127.0.0.1:3900")));
+        assert_eq!(http.proxy.as_deref(), Some("http://127.0.0.1:3900"));
+        assert!(http.ratelimiter.is_none());
+    }
+
+    #[test]
+    fn gateway_check_passes_without_api_base_or_for_the_same_host_and_port() {
+        assert!(ensure_gateway_is_local(None, "wss://gateway.discord.gg").is_ok());
+        let base = Some("http://127.0.0.1:3900");
+        assert!(ensure_gateway_is_local(base, "ws://127.0.0.1:3900").is_ok());
+        assert!(ensure_gateway_is_local(base, "ws://127.0.0.1:3900/gateway").is_ok());
+        assert!(
+            ensure_gateway_is_local(Some("http://localhost:3900"), "ws://localhost:3900").is_ok()
+        );
+    }
+
+    #[test]
+    fn gateway_check_rejects_any_other_destination() {
+        let base = Some("http://127.0.0.1:3900");
+        for ws in [
+            "wss://gateway.discord.gg",
+            "ws://127.0.0.1:3901",
+            "ws://localhost:3900",
+            "http://127.0.0.1:3900",
+            "gateway.discord.gg",
+            "",
+        ] {
+            let r = ensure_gateway_is_local(base, ws);
+            assert!(matches!(r, Err(Error::Config(_))), "{ws}");
+        }
+    }
+
+    /// `/api/v10/gateway` だけ 500 を返し、他は最小限の応答をする偽サーバー。(base, 受けたリクエスト行)
+    async fn serve_without_gateway() -> (String, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let line = req.lines().next().unwrap_or_default().to_string();
+                    log.lock().unwrap().push(line.clone());
+                    let (status, body) = if line.contains("/api/v10/gateway") {
+                        ("500 Internal Server Error", r#"{"message":"boom"}"#)
+                    } else if line.contains("/api/v10/users/@me") {
+                        (
+                            "200 OK",
+                            r#"{"id":"1","username":"bot","discriminator":"0","avatar":null,"bot":true}"#,
+                        )
+                    } else {
+                        ("404 Not Found", r#"{"message":"Unknown"}"#)
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn run_refuses_to_start_when_the_gateway_lookup_fails() {
+        let (base, seen) = serve_without_gateway().await;
+        let channel = DiscordChannel::new(config_with(Some(&base)));
+        let (bus, _rx) = noth_core::bus::channel(8);
+        // serenity はここで wss://gateway.discord.gg に切り替えるので、IDENTIFY の前に止まらなければならない
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), channel.run(bus))
+            .await
+            .expect("run() が止まらず、接続しに行った可能性がある");
+        let Err(Error::Config(message)) = result else {
+            panic!("起動が止まらなかった");
+        };
+        assert!(message.contains("gateway.discord.gg"), "{message}");
+        assert!(!message.contains("secret-token"));
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|l| l.contains("/api/v10/gateway")),
+            "{seen:?}"
+        );
     }
 }

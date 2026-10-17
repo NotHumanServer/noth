@@ -1049,6 +1049,73 @@ impl Default for Thresholds {
     }
 }
 
+/// `[channel.discord] api_base` を検証して返す。末尾の `/` は取り除く。
+/// fakecord 専用の設定で、Bot トークンがそのホストへ送られるため、loopback の http(s)://host[:port] だけを許す
+pub fn parse_api_base(section: &toml::Value) -> Result<Option<String>> {
+    let Some(v) = section.get("api_base") else {
+        return Ok(None);
+    };
+    let s = v.as_str().ok_or_else(|| {
+        Error::Config("channel.discord.api_base は文字列で指定してください".into())
+    })?;
+    let trimmed = s.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(Error::Config("channel.discord.api_base が空です".into()));
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err(Error::Config(
+            "channel.discord.api_base は http:// または https:// で始まる必要があります".into(),
+        ));
+    }
+    let url = url::Url::parse(trimmed).map_err(|e| {
+        Error::Config(format!(
+            "channel.discord.api_base が URL として不正です: {e}"
+        ))
+    })?;
+    if url.host().is_none() {
+        return Err(Error::Config(
+            "channel.discord.api_base にホストがありません".into(),
+        ));
+    }
+    if !is_loopback(&url) {
+        return Err(Error::Config(
+            "channel.discord.api_base のホストは 127.0.0.1、localhost、[::1] のどれかにしてください(fakecord 専用で、Bot トークンが送られます)".into(),
+        ));
+    }
+    if url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(Error::Config(
+            "channel.discord.api_base にはホストとポートまでを書いてください(/api/v10 は付けない)"
+                .into(),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+        None => false,
+    }
+}
+
+/// http / https / ws / wss の URL から (host, port) を取り出す。port が無ければ scheme の既定値。
+/// api_base と Gateway URL が同じ接続先かを比べるのに使う
+pub fn url_endpoint(raw: &str) -> Option<(String, u16)> {
+    let url = url::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return None;
+    }
+    let host = url.host_str()?.to_string();
+    Some((host, url.port_or_known_default()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,5 +1581,109 @@ api_key = "${{OTHER}}"
         );
         assert!(parse_env(template_env()).is_ok());
         assert!(template_profile().contains("口調"));
+    }
+}
+
+#[cfg(test)]
+mod api_base_tests {
+    use super::*;
+
+    fn parse(api_base: &str) -> Result<Option<String>> {
+        let mut section = toml::Table::new();
+        section.insert("api_base".into(), toml::Value::String(api_base.into()));
+        parse_api_base(&toml::Value::Table(section))
+    }
+
+    #[test]
+    fn missing_key_means_the_real_discord() {
+        let section = toml::Value::Table(toml::Table::new());
+        assert_eq!(parse_api_base(&section).unwrap(), None);
+    }
+
+    #[test]
+    fn non_string_value_is_rejected() {
+        let mut section = toml::Table::new();
+        section.insert("api_base".into(), toml::Value::Integer(123));
+        assert!(matches!(
+            parse_api_base(&toml::Value::Table(section)),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn loopback_hosts_are_accepted() {
+        for ok in [
+            "http://127.0.0.1:3900",
+            "http://localhost:3900",
+            "http://[::1]:3900",
+            "https://127.0.0.1",
+        ] {
+            assert_eq!(parse(ok).unwrap().as_deref(), Some(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn trailing_slashes_and_spaces_are_trimmed() {
+        assert_eq!(
+            parse("  http://127.0.0.1:3900/ ").unwrap().as_deref(),
+            Some("http://127.0.0.1:3900")
+        );
+        assert_eq!(
+            parse("http://127.0.0.1:3900//").unwrap().as_deref(),
+            Some("http://127.0.0.1:3900")
+        );
+    }
+
+    #[test]
+    fn invalid_values_are_rejected() {
+        for (bad, why) in [
+            ("", "空文字"),
+            ("   ", "空白だけ"),
+            ("127.0.0.1:3900", "scheme なし"),
+            ("localhost:3900", "scheme なし(localhost)"),
+            ("ftp://127.0.0.1:3900", "ftp"),
+            ("http://127.0.0.1:3900/api/v10", "パス付き"),
+            ("http://127.0.0.1:3900/api/v10/", "パス付き(末尾スラッシュ)"),
+            ("http://127.0.0.1:3900?x=1", "クエリ付き"),
+            ("http://user:pw@127.0.0.1:3900", "userinfo 付き"),
+            ("http://example.com:3900", "外部ホスト"),
+            ("http://192.168.0.5:3900", "private アドレス"),
+            ("http://127.0.0.2:3900", "127.0.0.1 以外の loopback"),
+            ("https://discord.com", "discord.com"),
+            ("http://", "host なし"),
+            ("http:///", "host なし(スラッシュ)"),
+            ("http://:3900", "host が空でポートだけ"),
+        ] {
+            assert!(
+                matches!(parse(bad), Err(Error::Config(_))),
+                "{why}: `{bad}` が通ってしまった"
+            );
+        }
+    }
+
+    #[test]
+    fn path_error_mentions_the_fix() {
+        let Err(Error::Config(m)) = parse("http://127.0.0.1:3900/api/v10") else {
+            panic!("通ってしまった");
+        };
+        assert!(m.contains("ホストとポートまで"), "{m}");
+    }
+
+    #[test]
+    fn url_endpoint_compares_host_and_port() {
+        assert_eq!(
+            url_endpoint("ws://127.0.0.1:3900/gateway"),
+            Some(("127.0.0.1".into(), 3900))
+        );
+        assert_eq!(
+            url_endpoint("wss://gateway.discord.gg"),
+            Some(("gateway.discord.gg".into(), 443))
+        );
+        assert_eq!(
+            url_endpoint("http://localhost"),
+            Some(("localhost".into(), 80))
+        );
+        assert_eq!(url_endpoint("ftp://127.0.0.1:21"), None);
+        assert_eq!(url_endpoint("not a url"), None);
     }
 }

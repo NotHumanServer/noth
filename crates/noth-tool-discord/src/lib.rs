@@ -55,7 +55,10 @@ fn factory(ctx: &ModuleCtx) -> Result<Arc<dyn Tool>> {
         ));
     }
     let settings = Settings::parse(&ctx.config.module_section("channel-discord"), &ctx.section)?;
-    let api = RestApi::new(settings.token.clone())?;
+    let api = RestApi::with_base(
+        settings.token.clone(),
+        api::rest_base(settings.api_base.as_deref()),
+    )?;
     Ok(Arc::new(DiscordTool::new(
         settings,
         Arc::new(api),

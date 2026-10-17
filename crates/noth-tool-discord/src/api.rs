@@ -5,6 +5,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 const API_BASE: &str = "https://discord.com/api/v10";
+
+/// REST のベース URL。`api_base`(ホストとポートまで)があればその `/api/v10` 配下、無ければ本物の Discord
+pub(crate) fn rest_base(api_base: Option<&str>) -> String {
+    api_base.map_or_else(|| API_BASE.to_string(), |b| format!("{b}/api/v10"))
+}
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// 異常に大きい応答でメモリを使い切らないための上限
 const BODY_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -41,10 +46,6 @@ pub(crate) struct RestApi {
 }
 
 impl RestApi {
-    pub(crate) fn new(token: String) -> Result<Self, noth_core::Error> {
-        Self::with_base(token, API_BASE.into())
-    }
-
     pub(crate) fn with_base(token: String, base: String) -> Result<Self, noth_core::Error> {
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)

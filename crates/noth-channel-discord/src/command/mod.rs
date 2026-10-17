@@ -11,7 +11,7 @@ mod render;
 
 #[cfg(test)]
 pub(crate) use api::ApiError;
-pub(crate) use api::{InteractionApi, RestInteractionApi};
+pub(crate) use api::{InteractionApi, RestInteractionApi, rest_base};
 use render::{FLAG_EPHEMERAL, embed_message, parse_refresh, plain, text_message, v2_message};
 
 /// Discord 側のコマンド名。サブコマンドが各 `Command::name()` になる

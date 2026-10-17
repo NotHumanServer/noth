@@ -11,6 +11,8 @@ pub(crate) struct Settings {
     pub(crate) allowed: HashSet<u64>,
     /// manifest の順。空にはならない
     pub(crate) actions: Vec<&'static str>,
+    /// channel.discord の api_base。未設定なら本物の Discord を使う
+    pub(crate) api_base: Option<String>,
 }
 
 // token がログやパニック出力へ漏れないようにする
@@ -20,6 +22,7 @@ impl std::fmt::Debug for Settings {
             .field("token", &"<redacted>")
             .field("guild_id", &self.guild_id)
             .field("actions", &self.actions)
+            .field("api_base", &self.api_base)
             .finish_non_exhaustive()
     }
 }
@@ -51,11 +54,13 @@ impl Settings {
                 ));
             }
         };
+        let api_base = noth_core::config::parse_api_base(channel)?;
         Ok(Self {
             token,
             guild_id,
             allowed,
             actions: parse_actions(tool)?,
+            api_base,
         })
     }
 }

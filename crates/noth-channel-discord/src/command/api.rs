@@ -6,6 +6,11 @@ use noth_core::async_trait;
 use serde_json::Value;
 
 const API_BASE: &str = "https://discord.com/api/v10";
+
+/// REST のベース URL。`api_base`(ホストとポートまで)があればその `/api/v10` 配下、無ければ本物の Discord
+pub(crate) fn rest_base(api_base: Option<&str>) -> String {
+    api_base.map_or_else(|| API_BASE.to_string(), |b| format!("{b}/api/v10"))
+}
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// 起動時の登録でだけ待つ。これを超える待ちは再試行せず、次の起動に任せる
 const SYNC_RETRY_WAIT_MAX_SECS: f64 = 30.0;
@@ -51,10 +56,6 @@ pub(crate) struct RestInteractionApi {
 }
 
 impl RestInteractionApi {
-    pub(crate) fn new(bot_token: String, application_id: u64, guild_id: u64) -> Self {
-        Self::with_base(bot_token, application_id, guild_id, API_BASE.into())
-    }
-
     pub(crate) fn with_base(
         bot_token: String,
         application_id: u64,

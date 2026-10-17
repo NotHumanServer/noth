@@ -150,6 +150,7 @@ fn tool_with(api: Arc<FakeApi>, actions: &[&'static str]) -> DiscordTool {
             .into_iter()
             .filter(|n| actions.is_empty() || actions.contains(n))
             .collect(),
+        api_base: None,
     };
     DiscordTool::new(settings, api, tz())
 }
@@ -1777,6 +1778,7 @@ mod permissions {
             guild_id: GUILD,
             allowed: allowed.iter().copied().collect(),
             actions: manifest::known_names(),
+            api_base: None,
         };
         DiscordTool::new(settings, FakeApi::with(routes), tz())
     }

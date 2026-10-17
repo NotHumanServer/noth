@@ -9,6 +9,8 @@ pub(crate) struct DiscordConfig {
     pub(crate) master: Option<u64>,
     /// 除外するチャンネルまたはカテゴリの ID。`/noth ignore` で足したものはここに含まれない
     pub(crate) ignored_channels: Vec<u64>,
+    /// Discord API のベース URL。未設定なら本物の Discord を使う。末尾の `/` は取り除く
+    pub(crate) api_base: Option<String>,
 }
 
 // token がログやパニック出力へ漏れないようにする
@@ -20,6 +22,7 @@ impl std::fmt::Debug for DiscordConfig {
             .field("allowed_users", &self.allowed_users)
             .field("master", &self.master)
             .field("ignored_channels", &self.ignored_channels)
+            .field("api_base", &self.api_base)
             .finish()
     }
 }
@@ -44,12 +47,14 @@ impl DiscordConfig {
             .get("master")
             .map(|v| parse_id(v, "channel.discord.master"))
             .transpose()?;
+        let api_base = noth_core::config::parse_api_base(section)?;
         Ok(Self {
             token,
             guild_id,
             allowed_users,
             master,
             ignored_channels,
+            api_base,
         })
     }
 }
@@ -87,6 +92,7 @@ mod tests {
             allowed_users: vec![],
             master: None,
             ignored_channels: vec![],
+            api_base: None,
         };
         assert!(!format!("{c:?}").contains("secret"));
     }
@@ -111,6 +117,7 @@ allowed_users = ["1", "2"]"#,
                 allowed_users: vec![1, 2],
                 master: None,
                 ignored_channels: vec![],
+                api_base: None,
             }
         );
     }
@@ -149,6 +156,25 @@ master = "42""#,
         assert_eq!(with.master, Some(42));
         let without = DiscordConfig::parse(&section("token = \"t\"\nguild_id = \"1\"")).unwrap();
         assert_eq!(without.master, None);
+    }
+
+    #[test]
+    fn api_base_is_optional_and_normalized() {
+        let with = DiscordConfig::parse(&section(
+            r#"token = "t"
+guild_id = "1"
+api_base = "http://127.0.0.1:3900/""#,
+        ))
+        .unwrap();
+        assert_eq!(with.api_base, Some("http://127.0.0.1:3900".into()));
+        let without = DiscordConfig::parse(&section("token = \"t\"\nguild_id = \"1\"")).unwrap();
+        assert_eq!(without.api_base, None);
+    }
+
+    #[test]
+    fn api_base_is_validated_by_core() {
+        let bad = section("token = \"t\"\nguild_id = \"1\"\napi_base = \"https://discord.com\"");
+        assert!(matches!(DiscordConfig::parse(&bad), Err(Error::Config(_))));
     }
 
     #[test]
