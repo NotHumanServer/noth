@@ -262,7 +262,10 @@ fn progress_summary(tool: &str, input: &Value) -> String {
             let line = str_field(input, "command")
                 .and_then(|c| c.lines().next())
                 .unwrap_or("");
-            format!("`{}`", mask_secrets(line))
+            // 後ろで切ると閉じの ` が消え、次の進捗行の ` と対になって表示が崩れるので、中身を先に切る。
+            // コマンドの中の ` もコード表示を途中で閉じるので、' に置き換える
+            let inner = ellipsize(&mask_secrets(line).replace('`', "'"), SUMMARY_MAX_CHARS - 2);
+            return format!("`{inner}`");
         }
         _ => String::new(),
     };
@@ -357,10 +360,23 @@ fn strip_main_markers(memo: &str) -> String {
             return lines[i + 1..].join("\n").trim().to_string();
         }
     }
-    memo.strip_prefix(FIXED_ACK)
-        .unwrap_or(memo)
-        .trim()
-        .to_string()
+    let memo = memo.strip_prefix(FIXED_ACK).unwrap_or(memo).trim();
+    strip_conclusion_wrapper(memo).to_string()
+}
+
+/// Layer 3 には前の run の結論が `[内部調査完了 <run_id>: …]` の形で並ぶので、Worker がその形を真似て書くことがある。
+/// そのまま渡すと Core がもう一度包み、二重の `[内部調査完了 …]` になる。メモ全体が 1 つの包みのときだけ外す
+fn strip_conclusion_wrapper(memo: &str) -> &str {
+    let Some(rest) = memo
+        .strip_prefix("[内部調査完了 ")
+        .and_then(|r| r.strip_suffix(']'))
+    else {
+        return memo;
+    };
+    match rest.split_once(':') {
+        Some((id, body)) if !id.is_empty() && !id.contains(char::is_whitespace) => body.trim(),
+        _ => memo,
+    }
 }
 
 /// 作業場所全体を「一時」と呼ぶと、残っている前の成果物を無いものとして扱ってしまう。
@@ -852,6 +868,22 @@ mod tests {
         assert_eq!(strip_main_markers("  [Goal]  \n本文"), "本文");
     }
 
+    #[test]
+    fn self_written_conclusion_wrapper_is_stripped() {
+        assert_eq!(
+            strip_main_markers("[内部調査完了 1792200772241-2: 補足の要否: 不要\n分かったこと: x]"),
+            "補足の要否: 不要\n分かったこと: x"
+        );
+        // 包みが全体でないもの、run_id が無いものは本文として残す
+        for keep in [
+            "[内部調査完了 1-2: 前の結論] を踏まえると、今回は y",
+            "[内部調査完了 : x]",
+            "前置き\n[内部調査完了 1-2: x]",
+        ] {
+            assert_eq!(strip_main_markers(keep), keep);
+        }
+    }
+
     #[tokio::test]
     async fn conclusion_that_is_only_a_goal_marker_fails() {
         let p = MockProvider::new(vec![text("[Goal]")]);
@@ -1159,6 +1191,18 @@ mod tests {
         let s = progress_summary("web_search", &json!({"query": "あ".repeat(200)}));
         assert_eq!(s.chars().count(), SUMMARY_MAX_CHARS);
         assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn long_shell_command_keeps_its_closing_backtick() {
+        let cmd = format!(
+            "curl -sS https://blog.rust-lang.org/{} | grep `date`",
+            "x".repeat(100)
+        );
+        let s = progress_summary("shell", &json!({"command": cmd}));
+        assert_eq!(s.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(s.starts_with('`') && s.ends_with("…`"), "{s}");
+        assert_eq!(s.matches('`').count(), 2, "{s}");
     }
 
     #[test]
