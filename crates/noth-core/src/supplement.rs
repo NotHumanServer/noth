@@ -101,7 +101,7 @@ fn field_rest<'a>(line: &'a str, labels: &[&str]) -> Option<&'a str> {
     Some(rest.trim_start_matches(['*', '`', '|', '｜', ' ', '\t', '　']))
 }
 
-fn strip_line_decoration(line: &str) -> &str {
+pub(crate) fn strip_line_decoration(line: &str) -> &str {
     const DECORATION: &[char] = &['-', '*', '`', '・', '>', '#', '|', '｜', ' ', '\t', '　'];
     let mut s = line.trim_start_matches(DECORATION);
     // 「1. 」「2) 」のような番号

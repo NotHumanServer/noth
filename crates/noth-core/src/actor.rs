@@ -10,6 +10,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::command::{CommandEnv, CommandHost, ContextSnapshot};
 use crate::config::{CompactorSettings, Config, HostInfo};
+use crate::deliverable;
 use crate::error::ErrorKind;
 use crate::judge::{
     self, Action, ActionInput, DeliveryStyle, JudgeAnswers, JudgeBatch, PendingMessage,
@@ -1265,9 +1266,15 @@ impl Actor {
                 .as_ref()
                 .map(|t| (t.author_name.as_str(), t.content.as_str())),
         };
+        let deliverable = outcome.ok().and_then(deliverable::extract);
         let prompt = self.prompt(
             active_log,
-            vec![layers::delivery_instruction_turn(chunk_id, style, &target)],
+            vec![layers::delivery_instruction_turn(
+                chunk_id,
+                style,
+                &target,
+                deliverable.is_some(),
+            )],
         );
         let completion = self
             .complete_with_typing(run.channel_id, &prompt, Purpose::Join, Some(run_id))
@@ -1315,6 +1322,13 @@ impl Actor {
                 None
             }
         };
+        // 成果物は main に要約させず、報告のあとにそのまま投稿する(main は置き場所だけを伝えることがあった)。
+        // 頼まれたものの本体なので、報告を書けなかったときも届ける。Layer 3 には結論メモとして入っている
+        if let Some(body) = &deliverable
+            && let Err(e) = self.channel.send(run.channel_id, body, None).await
+        {
+            tracing::warn!(error = %e, run_id, "成果物を投稿できませんでした");
+        }
         match (posted, completion) {
             (Some(text), Ok(c)) => {
                 self.store

@@ -3,6 +3,7 @@ pub mod approval;
 pub mod bus;
 pub mod command;
 pub mod config;
+pub mod deliverable;
 pub mod error;
 pub mod exclusion;
 pub mod heartbeat;

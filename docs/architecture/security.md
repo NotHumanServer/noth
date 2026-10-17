@@ -44,7 +44,7 @@ Worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolC
 - サンドボックスはない。`tool-shell` は Bot を動かすユーザーの権限でコマンドを実行する
 - Web(`web_search` / `web_fetch` / `web_agent`)や `discord` から読み込んだ文章に紛れた指示(間接プロンプトインジェクション)で、shell が動き得る。`discord` が返す Noth 自身の過去の発言には Web ページの要約が、`allowed_users` の発言には貼り付けられた外部の文章が、他 Bot の発言にはその Bot が取り込んだ外部の文章が含まれ得る
 - shell から `.env` や SQLite を読んだり Discord API を直接呼んだりできるので、§2 の閲覧権限の制限は迂回できる
-- Bot の本文は `fetch_messages` の全モードと `list_pins` で読める。Web ページと同じ外部の入力として扱う。補足・訂正の文面は main が書くので、Worker の出力がそのまま投稿されることはない
+- Bot の本文は `fetch_messages` の全モードと `list_pins` で読める。Web ページと同じ外部の入力として扱う。補足・訂正の文面は main が書くので、Worker の出力がそのまま投稿されることはない。例外は、人に頼まれた run の結論メモの「成果物」欄で、依頼された文章やコードそのものなので Core がそのまま投稿する([context-layers.md §5 パターン C](../context-layers.md))。`allowed_mentions` は空で、URL は `<>` で囲むので、通知やプレビューは出ない
 - そのため `allowed_users` は信頼できる人に限る前提になる(§4 と同じ)
 
 tool の出力は Worker のコンテキストにだけ入り、main には届きません。将来 Discord のボタン承認などを追加できるよう、承認を差し込むインターフェースは Core に置きます。tool のサンドボックスと対話的な承認は MVP に含めません([overview.md §5](overview.md#5-mvp-に含めないもの))。

@@ -1339,7 +1339,56 @@ async fn join_normal_report_appends_conclusion_and_posts() {
         "{instruction}"
     );
     assert!(instruction.contains("ほかのチャンネルや別の人の発言には、ここでは答えない"));
-    assert!(instruction.contains("「成果物」があれば、要約せずに全文を載せて"));
+    // 成果物の無い報告には、成果物の扱いを書かない
+    assert!(!instruction.contains("成果物"));
+}
+
+#[tokio::test]
+async fn join_posts_the_deliverable_verbatim_after_the_report() {
+    let mut h = Harness::with_worker().await;
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
+    let code = "```rust\nfn main() {\n    println!(\"hi\");\n}\n```";
+    *h.worker.conclusion.lock().unwrap() = Some(format!(
+        "分かったこと: CLI を書いた\n置き場所: なし\n成果物（src/main.rs）：\n{code}"
+    ));
+    h.provider.script_text("作るね\n[Goal]\nCLI を書く");
+    h.provider
+        .script_text("CLI を書いたよ。cargo run で動くよ。");
+    h.say(GENERAL, "CLI 書いて。コードは省略しないで").await;
+
+    assert_eq!(h.process_next_job().await, "join");
+    let sent = h.sent();
+    // Ack、main の報告、成果物の全文の順
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(sent[1].1, "CLI を書いたよ。cargo run で動くよ。");
+    assert_eq!(sent[2], (GENERAL, code.to_string()));
+    // main には成果物を本文に載せないよう伝える(二重にしない)
+    let report = h.prompts().last().unwrap().clone();
+    assert!(
+        report.ephemeral_tail[0]
+            .text
+            .contains("全文がそのまま投稿されます")
+    );
+}
+
+#[tokio::test]
+async fn deliverable_is_posted_even_if_the_report_fails() {
+    let mut h = Harness::with_worker().await;
+    h.router
+        .set(with_delivery(spawn_answers(), "normal_report"));
+    *h.worker.conclusion.lock().unwrap() = Some("成果物:\n訳文です".into());
+    h.provider.script_text("訳すね\n[Goal]\n訳す");
+    h.say(GENERAL, "これ訳して").await;
+    h.provider.fail.store(true, Ordering::SeqCst);
+
+    assert_eq!(h.process_next_job().await, "join");
+    let sent = h.sent();
+    assert_eq!(
+        sent.last().unwrap(),
+        &(GENERAL, "訳文です".to_string()),
+        "{sent:?}"
+    );
 }
 
 #[tokio::test]

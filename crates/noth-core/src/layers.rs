@@ -17,7 +17,6 @@ pub const GOAL_MARKER: &str = "[Goal]";
 pub const REACT_MARKER: &str = "[React]";
 /// main が tool を直接呼んだときに Core が代わりに投稿する Ack。Layer 0 の worker 節でも同じ文面を示す
 pub const FIXED_ACK: &str = "ちょっと調べてみますね。";
-
 const RULES_BASE: &str = "\
 # Noth Harness Rules
 
@@ -630,14 +629,18 @@ fn report_target_text(t: &ReportTarget) -> String {
     s
 }
 
+/// 「成果物」は Core が報告のあとにそのまま投稿する(`deliverable`)。main が同じ全文を書くと二重になる
+const DELIVERABLE_NOTE: &str = "結論メモの「成果物」は、この報告のあとに全文がそのまま投稿されます。報告には成果物の本文を載せず、何を作ったか、使い方や注意点を短く書いてください。";
+
 pub fn delivery_instruction_turn(
     chunk_id: i64,
     style: DeliveryStyle,
     target: &ReportTarget,
+    has_deliverable: bool,
 ) -> Turn {
     let body = match style {
         DeliveryStyle::NormalReport | DeliveryStyle::Abort => {
-            "直前の内部調査の結果を、会話の流れに合わせて報告してください。結論メモに「成果物」があれば、要約せずに全文を載せてください(長い発言は分割して投稿されます)。"
+            "直前の内部調査の結果を、会話の流れに合わせて報告してください。"
         }
         DeliveryStyle::BriefSupplement => {
             "調査中に、会話の中で答えがすでに出ているようです。すでに出た内容は繰り返さず、結論メモのうち補足になる点だけを短く伝えてください。"
@@ -651,7 +654,12 @@ pub fn delivery_instruction_turn(
         role: Role::User,
         kind: TurnKind::Instruction,
         text: format!(
-            "{HEADER_DELIVERY}\n{body}\n\n{}",
+            "{HEADER_DELIVERY}\n{body}{}\n\n{}",
+            if has_deliverable {
+                DELIVERABLE_NOTE
+            } else {
+                ""
+            },
             report_target_text(target)
         ),
         chunk_id: Some(chunk_id),
