@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# target/ を NOTH_TARGET_LIMIT_GB(既定 8)以下に保つ。
+# target/ を NOTH_TARGET_LIMIT_GB(既定 16)以下に保つ。
 # cargo は feature や profile の組み合わせごとに別ハッシュで成果物を作り、古いものを消さない。
 # cargo-sweep はアクセス時刻で判定するが、macOS ではビルドしても atime が更新されず使用中の成果物まで消すので使わない。
 #
@@ -12,7 +12,7 @@ fi
 
 root="${DEVENV_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 target="$root/target"
-limit_kb=$(( ${NOTH_TARGET_LIMIT_GB:-8} * 1024 * 1024 ))
+limit_kb=$(( ${NOTH_TARGET_LIMIT_GB:-16} * 1024 * 1024 ))
 keep=3
 
 [[ -d "$target/debug" ]] || exit 0
