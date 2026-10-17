@@ -304,18 +304,55 @@ async fn read_stream(
     idle: Duration,
 ) -> std::result::Result<Vec<u8>, Attempt> {
     let mut buf = Vec::new();
+    // 途中で切れたときに、何が流れていたかを残す。キープアライブだけが流れ続けて全体上限まで待つことがあった
+    let with_context = |attempt: Attempt, buf: &[u8]| match attempt {
+        Attempt::Retry {
+            err: Error::Transport(msg),
+            retry_after,
+        } => Attempt::Retry {
+            err: Error::Transport(format!("{msg}({})", stream_context(buf))),
+            retry_after,
+        },
+        other => other,
+    };
     loop {
-        let chunk = tokio::time::timeout(idle, resp.chunk())
-            .await
-            .map_err(|_| stall(idle))?
-            .map_err(|e| Attempt::Retry {
-                err: Error::Transport(e.to_string()),
-                retry_after: None,
-            })?;
+        let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
+            Err(_) => return Err(with_context(stall(idle), &buf)),
+            Ok(Err(e)) => {
+                let attempt = Attempt::Retry {
+                    err: Error::Transport(e.to_string()),
+                    retry_after: None,
+                };
+                return Err(with_context(attempt, &buf));
+            }
+            Ok(Ok(c)) => c,
+        };
         match chunk {
             Some(c) => buf.extend_from_slice(&c),
             None => return Ok(buf),
         }
+    }
+}
+
+/// 受信済みのバイト数と、最後に届いた SSE イベントの type(無ければキープアライブなどのコメントだけ)
+fn stream_context(buf: &[u8]) -> String {
+    let text = String::from_utf8_lossy(buf);
+    let last_type = text
+        .lines()
+        .rev()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .find_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+        .and_then(|v| v["type"].as_str().map(str::to_string));
+    let comments = text.lines().filter(|l| l.starts_with(':')).count();
+    match last_type {
+        Some(t) => format!(
+            "受信 {} バイト、最後のイベント {t}、コメント行 {comments}",
+            buf.len()
+        ),
+        None => format!(
+            "受信 {} バイト、イベントなし、コメント行 {comments}",
+            buf.len()
+        ),
     }
 }
 
@@ -755,6 +792,22 @@ mod tests {
         assert_eq!(
             positive_secs("idle_timeout_secs", Some(5)).unwrap(),
             Some(5)
+        );
+    }
+
+    #[test]
+    fn stream_context_names_the_last_event() {
+        let buf = b"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\"}\n\n: keepalive\n\n";
+        assert_eq!(
+            stream_context(buf),
+            format!(
+                "受信 {} バイト、最後のイベント response.reasoning_summary_text.delta、コメント行 1",
+                buf.len()
+            )
+        );
+        assert_eq!(
+            stream_context(b": keepalive\n\n: keepalive\n\n"),
+            "受信 26 バイト、イベントなし、コメント行 2"
         );
     }
 
