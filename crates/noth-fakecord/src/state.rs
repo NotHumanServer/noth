@@ -247,12 +247,17 @@ pub enum BotActionKind {
         message_id: Id,
         content: String,
         reply_to: Option<Id>,
+        /// 送られてきた `allowed_mentions` をそのまま残す。通知が飛ぶ設定で送っていないかを確かめるため
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_mentions: Option<Value>,
     },
     /// `PATCH /channels/{id}/messages/{mid}`
     Edit {
         channel_id: Id,
         message_id: Id,
         content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_mentions: Option<Value>,
     },
     /// `PUT .../reactions/{emoji}/@me`
     Reaction {

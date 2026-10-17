@@ -167,6 +167,7 @@ pub async fn create_message(
         message_id: msg_id,
         content: content.clone(),
         reply_to,
+        allowed_mentions: body.get("allowed_mentions").cloned(),
     });
 
     let rest_json = world.message_to_discord_json(world.messages.get(&msg_id).unwrap(), false);
@@ -251,6 +252,7 @@ pub async fn edit_message(
         channel_id,
         message_id,
         content: content_opt.clone(),
+        allowed_mentions: body.get("allowed_mentions").cloned(),
     });
 
     let rest_json = world.message_to_discord_json(world.messages.get(&message_id).unwrap(), false);
@@ -422,17 +424,19 @@ mod tests {
         let resp = create_message(
             State(state.clone()),
             Path(channel_id),
-            Json(json!({"content": "hello"})),
+            Json(json!({"content": "hello", "allowed_mentions": {"parse": []}})),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let world = state.world();
         assert_eq!(world.bot_actions.len(), 1);
-        assert!(matches!(
-            world.bot_actions[0].kind,
-            BotActionKind::Post { .. }
-        ));
+        match &world.bot_actions[0].kind {
+            BotActionKind::Post {
+                allowed_mentions, ..
+            } => assert_eq!(allowed_mentions, &Some(json!({"parse": []}))),
+            other => panic!("{other:?}"),
+        }
         drop(world);
 
         let ev = rx.try_recv().unwrap();

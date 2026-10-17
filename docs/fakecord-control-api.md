@@ -203,13 +203,13 @@ Discord 互換の REST(`/api/v10/...`)とは別物です。Bot(noth)はこの AP
 ```json
 {
   "messages": [ { "id": "...", "content": "...", "...": "..." } ],
-  "actions": [ { "seq": 3, "at": "2026-10-17T00:00:00Z", "action": "post", "channel_id": "...", "message_id": "...", "content": "...", "reply_to": null } ],
+  "actions": [ { "seq": 3, "at": "2026-10-17T00:00:00Z", "action": "post", "channel_id": "...", "message_id": "...", "content": "...", "reply_to": null, "allowed_mentions": { "parse": [] } } ],
   "cursor": 3
 }
 ```
 
 - `messages` は古い順で、`message_to_discord_json(msg, false)` の形です。
-- `actions` は `BotAction` をそのまま JSON にしたものです。`action` の値は `post`、`edit`、`reaction`、`typing`、`interaction_response`、`interaction_edit`、`interaction_followup` です。各フィールドは `state.rs` の `BotActionKind` を見てください。
+- `actions` は `BotAction` をそのまま JSON にしたものです。`action` の値は `post`、`edit`、`reaction`、`typing`、`interaction_response`、`interaction_edit`、`interaction_followup` です。各フィールドは `state.rs` の `BotActionKind` を見てください。`post` と `edit` の `allowed_mentions` は、Bot が送った値をそのまま残したものです(送らなかったときは項目ごと省きます)。通知が飛ぶ設定で投稿していないかを確かめるのに使います。
 - `channel` を指定したとき、チャンネルを持たない interaction 系の操作は、その interaction の `channel_id` で判定します。
 - `cursor` は返した時点の `bot_actions` の末尾 seq です。
 
