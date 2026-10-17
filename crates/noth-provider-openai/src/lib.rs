@@ -214,6 +214,7 @@ impl OpenAiProvider {
         path: &str,
         extra_headers: &[(&str, String)],
         body: &Value,
+        max_stream_bytes: usize,
     ) -> std::result::Result<Vec<u8>, Attempt> {
         let req = self
             .request(reqwest::Method::POST, path)
@@ -264,7 +265,7 @@ impl OpenAiProvider {
         if status.is_success() {
             // 本文を読み切れない通信断は再試行で直るが、200 で JSON が壊れているのは直らない
             return if self.streaming {
-                read_stream(resp, self.idle_timeout).await
+                read_stream(resp, self.idle_timeout, max_stream_bytes).await
             } else {
                 resp.bytes()
                     .await
@@ -299,9 +300,22 @@ fn stall(idle: Duration) -> Attempt {
 }
 
 /// 全体のタイムアウトだけだと、止まった接続に上限いっぱいまで付き合うことになる。chunk ごとに無通信を見て早く切る
+/// Codex の要求からは max_output_tokens を外すので、出力が止まらないと全体上限(300 秒)まで読み続けてしまう。
+/// fakecord での評価で、output_text.delta だけが 13MB 流れ続けた。max_tokens から見て明らかに多い量で切って再試行する。
+/// SSE は 1 トークンごとに 200 バイト前後のイベントになり、完了イベントに全文が重なり、reasoning の要約も流れるので、余裕を大きくとる
+const STREAM_BYTES_PER_TOKEN: usize = 1024;
+const STREAM_BYTES_MIN: usize = 4 * 1024 * 1024;
+
+fn stream_byte_limit(max_tokens: u32) -> usize {
+    (max_tokens as usize)
+        .saturating_mul(STREAM_BYTES_PER_TOKEN)
+        .max(STREAM_BYTES_MIN)
+}
+
 async fn read_stream(
     mut resp: reqwest::Response,
     idle: Duration,
+    max_bytes: usize,
 ) -> std::result::Result<Vec<u8>, Attempt> {
     let mut buf = Vec::new();
     // 途中で切れたときに、何が流れていたかを残す。キープアライブだけが流れ続けて全体上限まで待つことがあった
@@ -327,6 +341,16 @@ async fn read_stream(
             }
             Ok(Ok(c)) => c,
         };
+        if buf.len() > max_bytes {
+            let attempt = Attempt::Retry {
+                err: Error::Transport(format!(
+                    "出力が止まらないため、{} バイトで切りました",
+                    max_bytes
+                )),
+                retry_after: None,
+            };
+            return Err(with_context(attempt, &buf));
+        }
         match chunk {
             Some(c) => buf.extend_from_slice(&c),
             None => return Ok(buf),
@@ -456,7 +480,15 @@ impl Provider for OpenAiProvider {
         let started = Instant::now();
         let mut attempt = 0;
         loop {
-            let outcome = match self.post_once(path, &extra_headers, &body).await {
+            let outcome = match self
+                .post_once(
+                    path,
+                    &extra_headers,
+                    &body,
+                    stream_byte_limit(params.max_tokens),
+                )
+                .await
+            {
                 Ok(bytes) => {
                     let cost_ctx = wire::CostContext {
                         request_model: &self.model,
@@ -837,6 +869,72 @@ mod tests {
             sock.write_all(b"0\r\n\r\n").await.unwrap();
         });
         url
+    }
+
+    /// output_text.delta を止めずに流し続けるサーバー。クライアントが切るまで書き続ける
+    async fn runaway_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let event =
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"あ\"}\n\n".repeat(1000);
+            let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+            while sock.write_all(chunk.as_bytes()).await.is_ok() {}
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn runaway_stream_is_cut_by_size() {
+        let provider = OpenAiProvider {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: runaway_server().await,
+            auth: Auth::ApiKey("k".into()),
+            pricing: pricing::Overrides::default(),
+            model: "m".into(),
+            format: wire::Format::Responses,
+            effort: None,
+            retry_max: 0,
+            streaming: true,
+            idle_timeout: Duration::from_secs(5),
+            compat: true,
+            reuse: reuse::ReuseTracker::default(),
+        };
+        let prompt = LayeredPrompt {
+            active_log: vec![noth_core::types::Turn {
+                id: None,
+                role: noth_core::types::Role::User,
+                kind: noth_core::types::TurnKind::Buffer,
+                text: "hi".into(),
+                chunk_id: None,
+            }],
+            ..Default::default()
+        };
+        let err = provider
+            .complete(&prompt, &CompletionParams::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("出力が止まらない"), "{err}");
+        assert!(
+            err.contains("最後のイベント response.output_text.delta"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stream_byte_limit_has_a_floor() {
+        assert_eq!(stream_byte_limit(0), STREAM_BYTES_MIN);
+        assert_eq!(stream_byte_limit(8192), 8192 * STREAM_BYTES_PER_TOKEN);
     }
 
     #[tokio::test]

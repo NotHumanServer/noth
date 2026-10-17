@@ -117,7 +117,7 @@ pub trait Provider: Send + Sync {
 }
 ```
 
-provider のエラー(429 / 5xx・タイムアウト・止まったストリーム・本文の受信失敗)は `retry_max` 回(既定 2。初回と合わせて最大 3 回)まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。ストリーミング(Codex の SSE)は `idle_timeout_secs`(既定 45 秒)の間 SSE のバイトが何も届かなければその試行を捨てて再試行します。長い推論の間も流れるよう、Codex には `reasoning.summary = "auto"` を要求します(要約は本文に含めません)。`request_timeout_secs`(Codex 既定 300 秒、他は 120 秒)は試行全体の上限で、進んでいるが遅いストリームも切って再試行します。失敗の通知文は原因(通信・認証・利用上限・その他)で変わります。main と Join の報告はチャンネルに失敗を投稿してそのターンを終了し、トリガー発言をバッファに戻します(Layer 3 には入れません)。各 provider は完了ごとに INFO(provider・model・purpose・elapsed_ms・attempts)、再試行ごとに WARN を記録します。
+provider のエラー(429 / 5xx・タイムアウト・止まったストリーム・本文の受信失敗)は `retry_max` 回(既定 2。初回と合わせて最大 3 回)まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。ストリーミング(Codex の SSE)は `idle_timeout_secs`(既定 45 秒)の間 SSE のバイトが何も届かなければその試行を捨てて再試行します。長い推論の間も流れるよう、Codex には `reasoning.summary = "auto"` を要求します(要約は本文に含めません)。`request_timeout_secs`(Codex 既定 300 秒、他は 120 秒)は試行全体の上限で、進んでいるが遅いストリームも切って再試行します。Codex の要求には `max_output_tokens` を付けられないので、出力が止まらない(`output_text.delta` だけが流れ続ける)ときに備え、受信量が `max_tokens` × 1KB(下限 4MB)を超えた試行も捨てて再試行します。ストリームの途中で試行を捨てたときは、受信バイト数、最後のイベントの type、コメント行の数を WARN に含めます。失敗の通知文は原因(通信・認証・利用上限・その他)で変わります。main と Join の報告はチャンネルに失敗を投稿してそのターンを終了し、トリガー発言をバッファに戻します(Layer 3 には入れません)。各 provider は完了ごとに INFO(provider・model・purpose・elapsed_ms・attempts)、再試行ごとに WARN を記録します。
 
 ## 5. `Tool`
 
