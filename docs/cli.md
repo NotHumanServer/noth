@@ -225,8 +225,8 @@ supplement_max_per_day       = 50   # 同じ起動の 1 日の上限回数(guild
 is_noise_or_meme   = 0.5  # ノイズは記録だけして Layer 3 に昇格させない。noth_request(メンション・リプライを含む)ならノイズにしない
 is_topic_shift     = 0.6
 needs_outside_work = 0.5  # noth_request でこれ以上なら Worker に回す。取りこぼさない側に倒す
-corrects_noth      = 0.5  # Noth の誤りの指摘とみなす(訂正)
-worth_supplement   = 0.5  # 黙って補足の Worker を起動する
+corrects_noth      = 0.7  # Noth の誤りの指摘とみなす(訂正)。無関係な発言でも 0.5 前後が出る
+worth_supplement   = 0.7  # 黙って補足の Worker を起動する。雑談でも 0.6 近くが出る
 min_confidence     = 0.15 # 合流判定の abort だけに使う。効かなければ外す(評価で決める)
 
 # 問いの文言。省略した項目は評価で確定した既定値(v2_1)。choice の選択肢の並びは固定で、変えられるのは説明だけ

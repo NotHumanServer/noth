@@ -870,8 +870,8 @@ supplement_max_per_day       = 50   # 同じ起動の 1 日の上限回数(guild
 is_noise_or_meme   = 0.5  # ノイズは記録だけして Layer 3 には昇格させない。Noth への依頼(noth_request)なら応答を優先
 is_topic_shift     = 0.6
 needs_outside_work = 0.5  # noth_request でこれ以上なら Worker に回す。取りこぼさない側に倒す
-corrects_noth      = 0.5  # Noth の誤りの指摘とみなす(訂正)
-worth_supplement   = 0.5  # 黙って補足の Worker を起動する
+corrects_noth      = 0.7  # Noth の誤りの指摘とみなす(訂正)。無関係な発言でも 0.5 前後が出る
+worth_supplement   = 0.7  # 黙って補足の Worker を起動する。雑談でも 0.6 近くが出る
 min_confidence     = 0.15 # 合流判定の abort だけに使う
 
 # 問いの文言は [router.questions] で差し替えられる(省略時は評価で確定した既定値)。
@@ -1009,6 +1009,9 @@ fn d06() -> f32 {
 fn d05() -> f32 {
     0.5
 }
+fn d07() -> f32 {
+    0.7
+}
 fn d015() -> f32 {
     0.15
 }
@@ -1042,8 +1045,8 @@ impl Default for Thresholds {
             is_noise_or_meme: d05(),
             is_topic_shift: d06(),
             needs_outside_work: d05(),
-            corrects_noth: d05(),
-            worth_supplement: d05(),
+            corrects_noth: d07(),
+            worth_supplement: d07(),
             min_confidence: d015(),
         }
     }
@@ -1486,6 +1489,8 @@ api_key = "${{OTHER}}"
         assert_eq!(c.memory.dreaming_hour, 4);
         assert_eq!(c.memory.dream_input_max_chars, 60_000);
         assert_eq!(c.router.thresholds.needs_outside_work, 0.5);
+        assert_eq!(c.router.thresholds.corrects_noth, 0.7);
+        assert_eq!(c.router.thresholds.worth_supplement, 0.7);
         assert_eq!(c.router.supplement_min_interval_secs, 300);
         assert_eq!(c.router.supplement_max_per_day, 50);
         assert!(c.router.questions.addressee.noth_request.contains("合図"));
