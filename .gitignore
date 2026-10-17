@@ -16,3 +16,6 @@ target/
 .mcp.json
 .claude/settings.json
 .claude/settings.local.json
+
+# 秘密情報。雛形は .env.example
+.env

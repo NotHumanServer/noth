@@ -1,0 +1,17 @@
+[package]
+name = "noth-channel-discord"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+noth-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+jiff.workspace = true
+serenity.workspace = true
+reqwest.workspace = true
+reqwest012 = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls"] }
