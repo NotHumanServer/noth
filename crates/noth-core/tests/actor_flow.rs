@@ -1339,6 +1339,7 @@ async fn join_normal_report_appends_conclusion_and_posts() {
         "{instruction}"
     );
     assert!(instruction.contains("ほかのチャンネルや別の人の発言には、ここでは答えない"));
+    assert!(instruction.contains("「成果物」があれば、要約せずに全文を載せて"));
 }
 
 #[tokio::test]

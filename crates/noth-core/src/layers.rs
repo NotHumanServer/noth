@@ -637,7 +637,7 @@ pub fn delivery_instruction_turn(
 ) -> Turn {
     let body = match style {
         DeliveryStyle::NormalReport | DeliveryStyle::Abort => {
-            "直前の内部調査の結果を、会話の流れに合わせて報告してください。"
+            "直前の内部調査の結果を、会話の流れに合わせて報告してください。結論メモに「成果物」があれば、要約せずに全文を載せてください(長い発言は分割して投稿されます)。"
         }
         DeliveryStyle::BriefSupplement => {
             "調査中に、会話の中で答えがすでに出ているようです。すでに出た内容は繰り返さず、結論メモのうち補足になる点だけを短く伝えてください。"
