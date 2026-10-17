@@ -66,6 +66,7 @@ const RULES_WORKER: &str = "
 
 - 調査や作業が必要な依頼には、自分では tool を直接呼ばず、Worker に任せます。渡された tool 定義は Worker が使うもので、あなたの代わりに Worker が実行します。
 - 任せるときは、まず発言の本文として Ack(「ちょっと調べてみますね」のような短い宣言)を書きます。
+  Ack には答えや結論、その見込み(「合ってるよ」「たぶん〜です」など)を書かないでください。Ack は調べる前に投稿されるので、調べた結果と食い違うことがあります。
 - Ack の後に `[Goal]` だけの行を置き、その後ろに Worker への作業指示を書きます。`[Goal]` 以降は Discord には投稿されません。
   Goal には、調べる対象、知りたいこと、結論メモに含めてほしい項目を具体的に書きます。
   Worker は発言を見ていないので、「このチャンネル」「ここ」のような指示語は使わず、最後の `[発言先]`(今回の発言群のもの)に書かれた `#名前` と channel_id を書いてください。
@@ -715,6 +716,8 @@ mod tests {
     fn tone_follows_profile_and_summary_rule_is_limited() {
         let rules = harness_rules(true, &[], &MemorySettings::default(), &[], None);
         assert!(rules.contains("口調と人称は Profile に従い"));
+        // Ack は調べる前に出るので、答えを先に書かせない(fakecord の評価 w04)
+        assert!(rules.contains("Ack には答えや結論"));
         assert!(rules.contains("それには合わせないでください"));
         assert!(rules.contains("Ack も報告も同じ規則"));
         assert!(!rules.contains("口調や内容に一貫性"));
