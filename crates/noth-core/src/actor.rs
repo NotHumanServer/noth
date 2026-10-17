@@ -108,7 +108,28 @@ pub async fn run(
         CommandEnv::new(Arc::new(snapshot::JobQueue(jobs_tx.clone()))),
     )));
     let drain_limit = SHUTDOWN_GRACE + actor.worker_timeout();
+    // 人に頼まれて Ack を出したまま中断する run は、知らせないと待たせたままになる。
+    // 黙って始めた補足・訂正は人に知られていないので知らせない
+    let interrupted: Vec<_> = store
+        .active_runs(guild)
+        .await?
+        .into_iter()
+        .filter(|r| r.origin == Origin::Request)
+        .collect();
     let batches = restore::restore(&store, guild).await?;
+    for run in &interrupted {
+        // REST で送るので Gateway の接続前でも届く。失敗しても起動は続ける
+        if let Err(e) = channel
+            .send(
+                run.channel_id,
+                layers::INTERRUPTED_NOTICE,
+                run.trigger_message_id,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, run_id = %run.run_id, "中断の知らせを投稿できませんでした");
+        }
+    }
     // 展開を作れていないと、除外したカテゴリ配下の未判定の発言を Judge に回してしまう
     let restore_task = match channel.exclusions().filter(|ex| ex.expansion_pending()) {
         Some(ex) => {

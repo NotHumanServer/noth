@@ -1863,6 +1863,64 @@ async fn restore_aborts_queued_and_running_runs() {
 }
 
 #[tokio::test]
+async fn interrupted_requests_are_announced_on_startup() {
+    let store = Store::open_memory().await.unwrap();
+    for (id, origin, trigger) in [
+        ("req", Origin::Request, Some(77)),
+        ("sup", Origin::Supplement, Some(88)),
+    ] {
+        store
+            .insert_worker_run(
+                GUILD,
+                &NewWorkerRun {
+                    run_id: id.into(),
+                    goal: "g".into(),
+                    origin,
+                    channel_id: GENERAL,
+                    chunk_id: 1,
+                    trigger_message_id: trigger,
+                    fork_message_id: 0,
+                },
+            )
+            .await
+            .unwrap();
+        store.start_run(id).await.unwrap();
+    }
+    let channel = Arc::new(MockChannel::default());
+    let modules = Modules {
+        channel: channel.clone(),
+        router: Arc::new(MockRouter::default()),
+        provider: Arc::new(MockProvider::new()),
+        worker: None,
+        compactor: None,
+        tools: Vec::new(),
+        commands: Vec::new(),
+        meter: tokio::sync::mpsc::unbounded_channel().0,
+        meter_rx: tokio::sync::mpsc::unbounded_channel().1,
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(noth_core::actor::run(
+        config(80_000, toml::Table::new()),
+        modules,
+        store.clone(),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    wait_until(|| !channel.sent.lock().unwrap().is_empty()).await;
+    stop_tx.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+
+    // 頼まれた調べもの(Ack を出して待たせている)だけ、依頼へのリプライで知らせる。黙って始めた補足は知らせない
+    assert_eq!(
+        *channel.sent.lock().unwrap(),
+        vec![(GENERAL, noth_core::layers::INTERRUPTED_NOTICE.to_string())]
+    );
+    assert_eq!(*channel.reply_to.lock().unwrap(), vec![Some(77)]);
+    assert_eq!(runs(&store, RunStatus::Aborted).await.len(), 2);
+}
+
+#[tokio::test]
 async fn run_waits_for_worker_join_on_shutdown() {
     let store = Store::open_memory().await.unwrap();
     let channel = Arc::new(MockChannel::default());

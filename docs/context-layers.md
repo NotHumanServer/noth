@@ -463,7 +463,7 @@ Noth の話をしているが返事を求められていない発言に、絵文
 
 ### 6.1 再起動時の復元
 
-1. `worker_runs` で queued / running 状態の run を aborted にする。Ack は投稿済みだが報告はしない
+1. `worker_runs` で queued / running 状態の run を aborted にする。報告はしない。人に頼まれた run(`origin = request`)は Ack で待たせているので、依頼の発言へのリプライで「⚠️ 再起動したため、この調べものは中断しました。必要なら、もう一度頼んでください。」と知らせる(Layer 3 には入れない)。黙って始めた補足・訂正は人に知られていないので知らせない
 2. `active_log` から Layer 3 を復元し、`digests` の最新から Layer 2 を復元する
 3. `messages` のうち `promoted_turn_id` が NULL で `decision_id` があるものを未昇格バッファに戻す
 4. `decision_id` が NULL の発言(判定前に落ちたもの)はまとめて1つの `Judge` としてキューに積む。Bot の目印だけが残っているときは積まない

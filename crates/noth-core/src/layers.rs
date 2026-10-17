@@ -17,6 +17,10 @@ pub const GOAL_MARKER: &str = "[Goal]";
 pub const REACT_MARKER: &str = "[React]";
 /// main が tool を直接呼んだときに Core が代わりに投稿する Ack。Layer 0 の worker 節でも同じ文面を示す
 pub const FIXED_ACK: &str = "ちょっと調べてみますね。";
+/// 再起動で中断した依頼(パターン C)への知らせ。Layer 3 には入れない(失敗の通知と同じ扱い)
+pub const INTERRUPTED_NOTICE: &str =
+    "⚠️ 再起動したため、この調べものは中断しました。必要なら、もう一度頼んでください。";
+
 const RULES_BASE: &str = "\
 # Noth Harness Rules
 
