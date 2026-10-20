@@ -6,7 +6,7 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// `Disabled` は install 時の `launchctl load` で起動しないための印。service-manager の start が外してから load し直す
+/// `Disabled` は install 時の `launchctl load` で起動しないための印。start は `launchctl enable` で打ち消す
 pub(super) fn launchd_plist(spec: &UnitSpec) -> String {
     let args = std::iter::once(spec.program.to_string_lossy().into_owned())
         .chain(spec.args.iter().cloned())

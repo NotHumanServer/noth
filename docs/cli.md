@@ -97,6 +97,12 @@ noth service status
 
 `install` はサービスを開始しません(launchd の定義は `Disabled` で登録される)。開始は `start` です。release ビルドの配置から常駐の入れ替えまでは `scripts/install.sh` が行います([README](../README.md#インストール))。
 
+macOS では `status` / `start` / `stop` / `restart` を `launchctl`(`gui/<uid>/dev.noth.noth`)の直呼びで行い、`install` / `uninstall` だけ `service-manager` に任せます。
+
+- `start` は `launchctl enable` のあと、未ロードなら `bootstrap`、ロード済みなら `kickstart` します。
+- `stop` は `bootout` で launchd から外し、プロセスの終了を待ってから `launchctl disable` します。再ログインしても起動しません。
+- GUI セッションがない(SSH のみ)環境では `gui/<uid>` が無く、状態を正しく判定できません。
+
 ### `noth auth`
 
 ```text

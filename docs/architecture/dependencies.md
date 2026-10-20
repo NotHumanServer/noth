@@ -18,7 +18,7 @@
 | 日時 | `jiff` | 0.2 | |
 | Google 認証 | `gcp_auth` | 0.12 | `agent-platform` preset のみ。サービスアカウント JSON のファイルパスを渡す |
 | umask 設定 | `libc` | 0.2 | unix のみ。ログファイルを 0600 で作るため、`noth run` が `umask(0o077)` を呼ぶ |
-| OS サービス | `service-manager` | 0.11 | launchd / systemd(user level)を同一 API で扱う。実機確認が必要 |
+| OS サービス | `service-manager` | 0.11 | launchd / systemd(user level)を同一 API で扱う。実機確認が必要。macOS の status は[ドメインなしのラベルで print して常に未登録になり](https://github.com/chipsenkbeil/service-manager-rs/issues/41)、stop は `launchctl stop` が KeepAlive で再起動されるため、start / stop / status は使わず `launchctl` を直接呼ぶ |
 | 設定ファイルの編集 | `toml_edit` | 0.25 | `noth config set/unset`、`noth module enable/disable`。コメントと書式を保ったまま書き換えるため。読み込みは `toml` のまま |
 | 対話入力 | `inquire` | 0.9 | `noth init` の対話モード(パスワード入力・選択・複数選択) |
 

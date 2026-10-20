@@ -96,13 +96,16 @@ pub async fn run(cfg: Option<&Path>, cmd: ServiceCmd) -> Result<ExitCode> {
                 ServiceStatus::Running => stop_and_wait(&*m, cfg).await?,
                 ServiceStatus::Stopped(_) => {}
             }
+            if cfg!(target_os = "macos") {
+                launchd_stop(cfg).await?;
+            }
             m.uninstall(ServiceUninstallCtx { label: label()? })?;
             println!("サービスの登録を解除しました");
         }
         ServiceCmd::Start => {
             let m = manager()?;
             require_installed(&*m)?;
-            m.start(ServiceStartCtx { label: label()? })?;
+            start_service(&*m)?;
             println!("サービスを開始しました");
             print_timeout_notice(cfg);
         }
@@ -112,10 +115,14 @@ pub async fn run(cfg: Option<&Path>, cmd: ServiceCmd) -> Result<ExitCode> {
                 ServiceStatus::NotInstalled => println!("サービスは未登録です"),
                 ServiceStatus::Stopped(_) => println!("サービスは既に停止しています"),
                 ServiceStatus::Running => {
-                    m.stop(ServiceStopCtx { label: label()? })?;
-                    println!(
-                        "サービスの停止を要求しました(進行中の Worker を待ってから終了します)"
-                    );
+                    stop_service(&*m, cfg).await?;
+                    if cfg!(target_os = "macos") {
+                        println!("サービスを停止しました");
+                    } else {
+                        println!(
+                            "サービスの停止を要求しました(進行中の Worker を待ってから終了します)"
+                        );
+                    }
                 }
             }
         }
@@ -132,7 +139,142 @@ pub async fn run(cfg: Option<&Path>, cmd: ServiceCmd) -> Result<ExitCode> {
 }
 
 fn current_status(m: &dyn ServiceManager) -> Result<ServiceStatus> {
+    if cfg!(target_os = "macos") {
+        return Ok(launchd_status());
+    }
     Ok(m.status(ServiceStatusCtx { label: label()? })?)
+}
+
+// service-manager の launchd status はドメインなしのラベルで print するため判定できない。
+// https://github.com/chipsenkbeil/service-manager-rs/issues/41 が直れば crate の status に戻せる
+fn launchd_status() -> ServiceStatus {
+    if let Some(out) = launchctl_print() {
+        return parse_launchctl_print(&out);
+    }
+    if launchd_plist_path().is_some_and(|p| p.exists()) {
+        ServiceStatus::Stopped(None)
+    } else {
+        ServiceStatus::NotInstalled
+    }
+}
+
+fn launchd_plist_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(home).join(format!("Library/LaunchAgents/{LABEL}.plist")))
+}
+
+fn launchd_domain() -> String {
+    // SAFETY: getuid は常に成功し、副作用がない
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+fn launchd_target() -> String {
+    format!("{}/{LABEL}", launchd_domain())
+}
+
+fn launchctl(args: &[&str]) -> Result<std::process::Output> {
+    std::process::Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("launchctl を実行できません")
+}
+
+fn launchctl_ok(args: &[&str]) -> Result<()> {
+    let out = launchctl(args)?;
+    if !out.status.success() {
+        bail!(
+            "launchctl {} が失敗しました: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn launchctl_print() -> Option<String> {
+    let out = launchctl(&["print", &launchd_target()]).ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn launchd_start() -> Result<()> {
+    if launchctl_print().is_some() {
+        return launchctl_ok(&["kickstart", &launchd_target()]);
+    }
+    let plist = launchd_plist_path().context("HOME を取得できません")?;
+    // plist の Disabled=true のままだと bootstrap が I/O エラーになる
+    launchctl_ok(&["enable", &launchd_target()])?;
+    launchctl_ok(&["bootstrap", &launchd_domain(), &plist.to_string_lossy()])
+}
+
+// KeepAlive があるので `launchctl stop` は再起動されてしまう。bootout は終了を待たずに戻るため pid の消滅まで待つ。
+// disable は、上書き DB に enabled が残ると install の `launchctl load` で起動してしまうのを防ぐ
+async fn launchd_stop(cfg: Option<&Path>) -> Result<()> {
+    let target = launchd_target();
+    if let Some(printed) = launchctl_print() {
+        let pid = parse_launchctl_pid(&printed);
+        let out = launchctl(&["bootout", &target])?;
+        let already_gone = matches!(out.status.code(), Some(3 | 113));
+        if !out.status.success() && !already_gone {
+            bail!(
+                "launchctl bootout が失敗しました: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        if let Some(pid) = pid {
+            wait_pid_exit(pid, Duration::from_secs(stop_timeout_secs(cfg))).await?;
+        }
+    }
+    launchctl_ok(&["disable", &target])
+}
+
+async fn wait_pid_exit(pid: i32, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    // SAFETY: シグナル 0 は存在確認だけで、プロセスに影響しない
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "サービスが停止しませんでした(pid {pid})。`noth service status` を確認してください"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(())
+}
+
+fn parse_launchctl_pid(out: &str) -> Option<i32> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("\tpid = "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+// spawn scheduled は KeepAlive による再起動待ちで、止まったわけではない
+fn parse_launchctl_print(out: &str) -> ServiceStatus {
+    let running = out.lines().any(|l| {
+        l.trim()
+            .strip_prefix("state = ")
+            .is_some_and(|s| s == "running" || s == "spawn scheduled")
+    });
+    if running {
+        ServiceStatus::Running
+    } else {
+        ServiceStatus::Stopped(None)
+    }
+}
+
+fn start_service(m: &dyn ServiceManager) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return launchd_start();
+    }
+    Ok(m.start(ServiceStartCtx { label: label()? })?)
+}
+
+async fn stop_service(m: &dyn ServiceManager, cfg: Option<&Path>) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return launchd_stop(cfg).await;
+    }
+    Ok(m.stop(ServiceStopCtx { label: label()? })?)
 }
 
 fn require_installed(m: &dyn ServiceManager) -> Result<()> {
@@ -186,9 +328,9 @@ fn install(cfg: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// 停止要求のあと、実際に止まるまで待つ。launchd / systemd とも stop は要求を出して戻るため
+/// 停止要求のあと、実際に止まるまで待つ。systemd の stop は要求を出して戻る(macOS は `launchd_stop` が待つ)
 async fn stop_and_wait(m: &dyn ServiceManager, cfg: Option<&Path>) -> Result<()> {
-    m.stop(ServiceStopCtx { label: label()? })?;
+    stop_service(m, cfg).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(stop_timeout_secs(cfg));
     while matches!(current_status(m)?, ServiceStatus::Running) {
         if std::time::Instant::now() >= deadline {
@@ -205,7 +347,7 @@ pub async fn restart(cfg: Option<&Path>) -> Result<()> {
     if matches!(current_status(&*m)?, ServiceStatus::Running) {
         stop_and_wait(&*m, cfg).await?;
     }
-    m.start(ServiceStartCtx { label: label()? })?;
+    start_service(&*m)?;
     println!("サービスを再起動しました");
     print_timeout_notice(cfg);
     Ok(())
@@ -287,6 +429,37 @@ mod tests {
         assert_eq!(installed_stop_timeout(&systemd_unit(&spec())), Some(630));
         assert_eq!(installed_stop_timeout(&launchd_plist(&spec())), Some(630));
         assert_eq!(installed_stop_timeout("[Service]\n"), None);
+    }
+
+    #[test]
+    fn launchctl_print_state_is_parsed() {
+        let running = "dev.noth.noth = {\n\tactive count = 1\n\tstate = running\n\tpid = 123\n}";
+        assert!(matches!(
+            parse_launchctl_print(running),
+            ServiceStatus::Running
+        ));
+        let waiting = "dev.noth.noth = {\n\tstate = not running\n}";
+        assert!(matches!(
+            parse_launchctl_print(waiting),
+            ServiceStatus::Stopped(None)
+        ));
+        let respawn = "dev.noth.noth = {\n\tstate = spawn scheduled\n}";
+        assert!(matches!(
+            parse_launchctl_print(respawn),
+            ServiceStatus::Running
+        ));
+        assert!(matches!(
+            parse_launchctl_print(""),
+            ServiceStatus::Stopped(None)
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_pid_is_top_level_only() {
+        let out =
+            "dev.noth.noth = {\n\tstate = running\n\tpid = 123\n\tchild = {\n\t\tpid = 9\n\t}\n}";
+        assert_eq!(parse_launchctl_pid(out), Some(123));
+        assert_eq!(parse_launchctl_pid("\tstate = spawn scheduled\n"), None);
     }
 
     #[test]
