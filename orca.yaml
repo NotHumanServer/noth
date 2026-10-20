@@ -1,0 +1,6 @@
+worktree:
+  sharedDirectories:
+    - .env
+scripts:
+  setup: |
+    direnv allow .

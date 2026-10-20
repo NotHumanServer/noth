@@ -1,6 +1,6 @@
 # Noth アーキテクチャ: Core の公開 trait
 
-本書は、module が実装する trait として `noth-core` が公開するもの(`Channel` / `Router` / `Provider` / `Tool` / `Compactor`)を定義します。シグネチャは意図を示すための骨子で、実装時にエラー型の詳細を詰めます。どの module がどの trait を実装するかは [modules.md](modules.md)、Provider のキャッシュ戦略は [caching.md](caching.md)、Tool の承認ポリシーは [security.md](security.md) を参照してください。
+本書は、module が実装する trait として `noth-core` が公開するもの(`Channel` / `Router` / `Provider` / `Tool` / `Compactor` / `Command`)を定義します。シグネチャは意図を示すための骨子で、実装時にエラー型の詳細を詰めます。どの module がどの trait を実装するかは [modules.md](modules.md)、Provider のキャッシュ戦略は [caching.md](caching.md)、Tool の承認ポリシーは [security.md](security.md) を参照してください。
 
 trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`async-trait` を使わずに `async fn` を定義した trait は trait オブジェクト(`dyn Trait`)として扱えず、返される Future の `Send` も保証されないため、非同期メソッドは `async-trait` クレートで定義します。
 
@@ -9,26 +9,40 @@ trait の実装は `Box<dyn Trait>` で Module Registry に登録します。`as
 | 型 | 内容 |
 |---|---|
 | `Member` | `user_id`、表示名、ロール名の一覧 |
-| `IncomingMessage` | `channel_id`、`message_id`、`user_id`、本文(`content` のみ)、時刻、`is_self` |
-| `Turn` | Layer 3 / 4 の1ブロック。`role`(user / assistant)、本文、種別(バッファ / トリガー / 応答 / 結論メモ / 関連チャンク)、`chunk_id` |
-| `RouterState` | [context-layers.md §4.1](../context-layers.md#41-state-の組み立て) の JSON |
-| `CompletionParams` | `max_tokens`、effort などモデル依存の生成パラメータ |
-| `ToolContext` | `run_id`、`task_category`、作業ディレクトリ、承認ポリシーへの参照 |
+| `IncomingMessage` | `guild_id`、`channel_id`、チャンネル名、`message_id`、`user_id`、投稿者の表示名、本文(`content` のみ)、時刻、`is_self`、Noth 宛てのメンションか、Noth の発言へのリプライか、Noth 以外の Bot の目印(`bot_marker: Option<BotMarker>`。`BotMarker` は Bot の表示名、リプライ先の表示名、字数(embed を含む)を持ち、`content` は空。目印は判定を起動しない: `triggers_judge()`)。チャンネル名と表示名は router の state に入れるため、メンション・リプライの有無は `router-mention` が使うため |
+| `Turn` | Layer 3 / 4 の1ブロック。`role`(user / assistant)、本文、種別(バッファ / トリガー / 応答 / 結論メモ。関連チャンクの種別は旧データの読み出し用に残す)、`chunk_id` |
+| `RouterState` | [context-layers.md §4.1](../context-layers.md#41-state-の組み立て) の JSON。`recent` には Bot の目印も同じ並びで入る |
+| `CompletionParams` | `max_tokens`。effort のようにモデルに依存する生成パラメータは provider の設定(例: `[provider.anthropic] effort`)に置き、Core は関与しない |
+| `ToolContext` | `run_id`、`origin`(`request` / `supplement` / `correction`)、作業ディレクトリ、承認ポリシーへの参照 |
 
 ## 2. `Channel`
 
 ```rust
 #[async_trait]
 pub trait Channel: Send + Sync {
-    /// 接続し、受信した発言を Event Bus に流す。allowed_users 以外と Bot の発言はここで捨てる
+    /// 担当する guild。Core はこれで SQLite の行を分ける
+    fn guild_id(&self) -> GuildId;
+    /// 接続し、受信した発言を Event Bus に流す。allowed_users 以外の発言はここで捨てる。Noth 以外の Bot は本文を読まず目印だけを流す
     async fn run(&self, bus: BusHandle) -> Result<()>;
     /// 発言を投稿する。2,000 文字を超えれば分割し、最後の MessageId を返す。
     /// reply_to があれば元発言へのリプライとして投稿する。allowed_mentions は常に空
     async fn send(&self, channel_id: ChannelId, text: &str, reply_to: Option<MessageId>) -> Result<MessageId>;
     /// 生成中の typing インジケータ
     async fn typing(&self, channel_id: ChannelId) -> Result<()>;
+    /// 投稿済みの発言を書き換える。Worker の進捗を Ack に追記するのに使う。既定は未対応(Err)
+    async fn edit(&self, channel_id: ChannelId, message_id: MessageId, text: &str) -> Result<()>;
+    /// 管理コマンドを受け付ける Channel だけが実装する。`run` の前に 1 回呼ばれる。既定は何もしない
+    fn set_commands(&self, host: Arc<CommandHost>) {}
+    /// 除外するチャンネルを管理する Channel だけが返す。`noth run` が起動時に DB の保存分を読み込ませ、tool と共有する。既定は None
+    fn exclusions(&self) -> Option<ChannelExclusions> { None }
+    /// 除外の指定をチャンネルとスレッドの ID に展開して `exclusions()` に載せる。`noth run` が復元の前に呼ぶ。展開できなかったときは `ChannelExclusions::mark_expansion_pending` を呼び、展開できる（`set_expanded`）まで復元と昇格を止める。既定は何もしない
+    async fn load_exclusions(&self) {}
     /// Layer 1 に固定するメンバー情報。起動時に1回だけ呼ぶ
     async fn members(&self) -> Result<Vec<Member>>;
+    /// `noth doctor` の疎通確認。成功時は表示用の短い説明を返す
+    async fn health_check(&self) -> Result<String>;
+    /// 現在の接続状態(Connecting / Connected / Disconnected)。heartbeat が周期ごとに読んで保存する。既定は Connected
+    fn connection_state(&self) -> ConnectionState { ConnectionState::Connected }
 }
 ```
 
@@ -62,14 +76,15 @@ pub struct Decision {
 #[async_trait]
 pub trait Router: Send + Sync {
     async fn decide(&self, state: &RouterState, questions: &[(String, Question)]) -> Result<Decision>;
-    /// 1リクエストに載せられる質問数。候補チャンクの数を決めるのに使う(Clef は 64)
-    fn max_questions(&self) -> usize;
+    /// `decisions.model` に記録する識別子(例: `jev/<版を固定した名前>`)。モデルごとの判定傾向を比べるため
+    fn model_label(&self) -> String;
+    async fn health_check(&self) -> Result<String>;
 }
 ```
 
-確率を閾値で二値化するのは Core の責務です。`router-mention` は `decide` の中で API を呼ばずにルールで `Decision` を組み立て、確率は 0.0 / 1.0 の二値になります。
+確率を閾値で二値化し、`addressee` などの回答から動き方を決めるのは Core の責務です([context-layers.md §4.3](../context-layers.md#43-core-の決め方))。`choice` の同点は選択肢の先頭を採るため、Core は安全な側を先頭にして渡します。`router-mention` は `decide` の中で API を呼ばずにルールで `Decision` を組み立て、確率は 0.0 / 1.0 の二値になります。
 
-Core は **provider(LLM)に JSON を生成させる汎用 router を提供しません。** 文字列生成を伴うので遅くコストも高いうえ、判定のためだけに生ログを LLM に入れることになり、[設計原則2](../context-layers.md#1-目的と設計原則)(本線にノイズと生ログを入れない)に反するからです。
+Core は **provider(LLM)に JSON を生成させる汎用 router を提供しません。** 文字列生成を伴うので遅くコストも高いうえ、判定のためだけに生ログを LLM に入れることになり、[設計原則2](../context-layers.md#1-目的と設計原則)(main にノイズと生ログを入れない)に反するからです。
 
 ## 4. `Provider`(LLM)
 
@@ -82,12 +97,12 @@ pub struct LayeredPrompt {
     pub episodic_digest: String,      // Layer 2
     pub active_log: Vec<Turn>,        // Layer 3
     pub ephemeral_tail: Vec<Turn>,    // Layer 4
-    pub tools: Vec<ToolSpec>,         // worker が有効なら本線にも同じ定義を渡す(caching.md §2)
+    pub tools: Vec<ToolSpec>,         // worker が有効なら main にも同じ定義を渡す(caching.md §2)
 }
 
 pub struct Completion {
     pub text: Option<String>,
-    pub tool_calls: Vec<ToolCall>,    // 本線がこれを返したら Core が spawn_task として扱う
+    pub tool_calls: Vec<ToolCall>,    // main がこれを返したら Core が Worker に回す指示(Goal)として扱う
     pub usage: Usage,                 // input_tokens / cached_tokens / output_tokens。プロンプト全体の上限判定に使う
 }
 
@@ -96,24 +111,57 @@ pub trait Provider: Send + Sync {
     async fn complete(&self, prompt: &LayeredPrompt, params: &CompletionParams) -> Result<Completion>;
     /// Layer 0〜3 のキャッシュ期限を延ばす keep-alive。既定は何もしない。MVP では呼び出し処理も無効
     async fn keep_alive(&self, _prefix: &LayeredPrompt) -> Result<()> { Ok(()) }
+    async fn health_check(&self) -> Result<String>;
+    /// 利用者向けのエラー文に出す呼び出し先の名前(モデル名など)。既定は "AI"
+    fn label(&self) -> String { "AI".into() }
 }
 ```
 
-provider のエラー(429 / 5xx)は `retry_max` 回まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。本線は応答を投稿せずにそのターンを終了し、トリガー発言をバッファに戻します。
+provider のエラー(429 / 5xx・タイムアウト・止まったストリーム・本文の受信失敗)は `retry_max` 回(既定 2。初回と合わせて最大 3 回)まで指数バックオフで再試行し、それでも失敗したら Core に `Err` を返します。ストリーミング(Codex の SSE)は `idle_timeout_secs`(既定 45 秒)の間 SSE のバイトが何も届かなければその試行を捨てて再試行します。長い推論の間も流れるよう、Codex には `reasoning.summary = "auto"` を要求します(要約は本文に含めません)。`request_timeout_secs`(Codex 既定 300 秒、他は 120 秒)は試行全体の上限で、進んでいるが遅いストリームも切って再試行します。Codex の要求には `max_output_tokens` を付けられないので、出力が止まらない(`output_text.delta` だけが流れ続ける)ときに備え、受信量が `max_tokens` × 1KB(下限 4MB)を超えた試行も捨てて再試行します。ストリームの途中で試行を捨てたときは、受信バイト数、最後のイベントの type、コメント行の数を WARN に含めます。失敗の通知文は原因(通信・認証・利用上限・その他)で変わります。main と Join の報告はチャンネルに失敗を投稿してそのターンを終了し、トリガー発言をバッファに戻します(Layer 3 には入れません)。各 provider は完了ごとに INFO(provider・model・purpose・elapsed_ms・attempts)、再試行ごとに WARN を記録します。
 
 ## 5. `Tool`
 
 ```rust
-pub struct ToolSpec { pub name: String, pub description: String, pub input_schema: schemars::Schema }
+pub struct ToolSpec { pub name: String, pub description: String, pub input_schema: serde_json::Value }
 
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn call(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput>;
+    /// 除外したチャンネルを参照させない tool だけが実装する。`noth run` が起動時に 1 回呼ぶ。既定は何もしない
+    fn set_exclusions(&self, exclusions: ChannelExclusions) {}
 }
 ```
 
-tool の出力は Worker のコンテキストにだけ入り、本線には届きません。出力は `tool_output_max_chars` で切り詰めてから Worker に返します。
+tool の出力は Worker のコンテキストにだけ入り、main には届きません。出力は `tool_output_max_chars` で切り詰めてから Worker に返します。
+
+`ToolContext` は `audience: Audience { requesters: Vec<UserId>, channel_id: Option<ChannelId>, channel_name: Option<String> }` も持ちます。Worker を起動させた発言者とトリガーのチャンネルで、actor が `WorkerTask::audience` に詰め、Worker が `ToolContext` に写します。tool が「出力が届く先の全員に見えるものだけ」を返すための情報です。届く先は、依頼した人、トリガーのチャンネルを見られる `allowed_users` 全員、`@everyone` がそのチャンネルを見られるなら `@everyone`、の和集合です([security.md §2](security.md#2-discord-側の対策))。
+
+`ToolContext` は `run_id` / `origin` / `work_dir` / `meter` に加え、記録済みの発言を読み取り専用で引く `history: Option<Arc<dyn MessageHistory>>` を持ちます。tool crate が `noth-core` の trait だけで SQLite の `messages` を検索できるようにするためで、実体は Core の `Store` です(Worker が `WorkerTask::history` から渡す。None なら検索できない)。
+
+```rust
+pub struct HistoryQuery {
+    pub guild_id: GuildId,
+    pub channel_id: Option<ChannelId>,
+    /// `messages.channel_name` との完全一致(ASCII のみ大文字小文字を区別しない。非 ASCII は完全に同じ表記で一致する)
+    pub channel_name: Option<String>,
+    /// content の部分一致(ASCII のみ大文字小文字を区別しない。非 ASCII は完全に同じ表記で一致する)
+    pub text: Option<String>,
+    /// author_name の部分一致(ASCII のみ大文字小文字を区別しない。非 ASCII は完全に同じ表記で一致する)
+    pub author: Option<String>,
+    pub since: Option<Timestamp>,
+    pub until: Option<Timestamp>,
+    /// 除外したチャンネルの ID。除外を外す側(カテゴリ配下・スレッド)は Store から分からないので、tool が行ごとに確かめる
+    pub exclude_channels: Vec<ChannelId>,
+    pub limit: usize,
+}
+
+#[async_trait]
+pub trait MessageHistory: Send + Sync + Debug {
+    /// 新しい順。`allowed_users` と Noth の発言だけを返す(Bot の目印は対象外)ので、返る行に追加のマスクは要らない
+    async fn search(&self, q: &HistoryQuery) -> Result<Vec<MessageRow>>;
+}
+```
 
 Worker が tool を呼ぶ前に `ApprovalPolicy::check(&ToolSpec, &input, &ToolContext)` を通します。承認ポリシーの内容と `tool-shell` の作業ディレクトリは [security.md §3](security.md#3-web-側の対策と承認ポリシー) と [§4](security.md#4-tool-shell-の運用) で定義します。
 
@@ -127,4 +175,39 @@ pub trait Compactor: Send + Sync {
 }
 ```
 
-要約の生成には本線と同じ provider を使いますが、Layer 1(Profile)を入れず、Layer 0 の「要約は三人称の事実記述にする」規約だけを与えます。キャラクターの文体が要約に混ざるのを防ぐためです。
+要約の生成には main と同じ provider を使いますが、Layer 1(Profile)を入れず、Layer 0 の「要約は三人称の事実記述にする」規約だけを与えます。キャラクターの文体が要約に混ざるのを防ぐためです。
+
+## 7. `Command`
+
+運営者が Channel から呼ぶ管理コマンドです。何を調べて何を返すかだけを定め、スラッシュコマンドへの割り当て、実行できる人の判定、画面への描画は Channel が行います。そのため `Command` は Discord の型に依存しません。
+
+```rust
+#[async_trait]
+pub trait Command: Send + Sync {
+    /// Channel 側のコマンド名(`/noth <name>`)になる
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    async fn run(&self, env: &CommandEnv) -> Result<Report>;
+}
+
+/// 1 画面分の報告。Channel が自分の表示形式に当てはめる
+pub struct Report { pub title: String, pub sections: Vec<ReportSection> }
+pub struct ReportSection { pub heading: String, pub body: String /* Markdown */ }
+```
+
+`Channel` には、対応する実装だけが持つメソッド `fn set_commands(&self, host: Arc<CommandHost>)` があります(既定は何もしない)。Core が `run` の前に 1 回呼び、`CommandHost` が有効なコマンドの一覧と実行環境を渡します。
+
+`CommandEnv::context()` は `ContextSnapshot` を返します。actor の状態は actor だけが読めるので、問い合わせは actor の仕事のキュー(`Job::Snapshot`)に積まれ、いま処理中の仕事の後に答えます。読み取り専用で、Layer の状態は変えません。
+
+```rust
+pub struct ContextSnapshot {
+    pub model: String,
+    pub layers: Vec<LayerSize>,          // tools / Layer 0 / 1 / 1.5 / 2 / 3。文字数と推定トークン数。本文は持たない
+    pub last_request: Option<RequestUsage>, // 直近の main・Join のリクエストの input_tokens、キャッシュの読み込みと書き込み
+    pub hard_limit_tokens: u64,          // prompt_hard_limit_tokens
+    pub turns: usize, pub turn_channels: usize, pub episodes: usize,
+    pub workers_running: usize, pub workers_queued: usize,
+}
+```
+
+推定トークン数は ASCII 約 4 文字を 1、それ以外の 1 文字を 1 として数えた粗い値です(tokenizer は provider ごとに違う)。`input_tokens` はキャッシュの読み書きを含むプロンプト全体で、`prompt_hard_limit_tokens` の判定に使われる値と同じです。

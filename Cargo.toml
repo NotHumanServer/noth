@@ -3,4 +3,106 @@ name = "noth"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+noth-core = { path = "crates/noth-core" }
+noth-channel-discord = { path = "crates/noth-channel-discord" }
+noth-router-mention = { path = "crates/noth-router-mention" }
+noth-router-systemone = { path = "crates/noth-router-systemone" }
+noth-provider-anthropic = { path = "crates/noth-provider-anthropic" }
+noth-provider-openai = { path = "crates/noth-provider-openai" }
+noth-provider-google = { path = "crates/noth-provider-google" }
+noth-worker = { path = "crates/noth-worker" }
+noth-compactor = { path = "crates/noth-compactor" }
+noth-tool-shell = { path = "crates/noth-tool-shell" }
+noth-tool-web-search = { path = "crates/noth-tool-web-search" }
+noth-tool-web-fetch = { path = "crates/noth-tool-web-fetch" }
+noth-tool-web-agent = { path = "crates/noth-tool-web-agent" }
+noth-tool-discord = { path = "crates/noth-tool-discord" }
+noth-backend-tinyfish = { path = "crates/noth-backend-tinyfish" }
+noth-command-context = { path = "crates/noth-command-context" }
+gcp_auth = "0.12"
+tokio = { version = "1.53", features = ["full"] }
+serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "http", "cache", "rustls_backend"] }
+axum = { version = "0.8", features = ["ws"] }
+# serenity の rustls_backend が 0.13 に無い feature 名 `reqwest/rustls-tls` を参照するため、serenity は reqwest 0.12 に解決される。
+# 0.13 の "rustls" は aws-lc-sys(C の cmake ビルドで約50秒)を引き込み、ring を使うには provider の手動 install が要る。
+# serenity が 0.13 に上がったら 0.13 へ戻し、暗号プロバイダ(aws-lc-rs か ring の手動 install)を決め直す。
+# webpki-roots は serenity の rustls-tls が既に立てる。Mozilla バンドルと OS ストアの和集合で動くことを明示する
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+clap = { version = "4.6", features = ["derive"] }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "migrate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "2.0"
+anyhow = "1.0"
+async-trait = "0.1"
+jiff = { version = "0.2", features = ["serde"] }
+
+[features]
+default = [
+  "channel-discord", "router-systemone", "router-mention",
+  "provider-anthropic", "worker", "compactor",
+  "tool-web-search", "tool-web-fetch", "tool-shell", "tool-discord",
+  "command-context",
+]
+channel-discord = ["dep:noth-channel-discord"]
+router-systemone = ["dep:noth-router-systemone"]
+router-mention = ["dep:noth-router-mention"]
+provider-openai = ["dep:noth-provider-openai"]
+provider-anthropic = ["dep:noth-provider-anthropic"]
+provider-google = ["dep:noth-provider-google"]
+worker = ["dep:noth-worker"]
+compactor = ["dep:noth-compactor"]
+tool-web-search = ["dep:noth-tool-web-search"]
+tool-web-fetch = ["dep:noth-tool-web-fetch"]
+tool-web-agent = ["dep:noth-tool-web-agent"]
+tool-shell = ["dep:noth-tool-shell"]
+tool-discord = ["dep:noth-tool-discord"]
+command-context = ["dep:noth-command-context"]
+
 [dependencies]
+noth-core.workspace = true
+noth-channel-discord = { workspace = true, optional = true }
+noth-router-mention = { workspace = true, optional = true }
+noth-router-systemone = { workspace = true, optional = true }
+noth-provider-anthropic = { workspace = true, optional = true }
+noth-provider-openai = { workspace = true, optional = true }
+noth-provider-google = { workspace = true, optional = true }
+noth-worker = { workspace = true, optional = true }
+noth-compactor = { workspace = true, optional = true }
+noth-tool-shell = { workspace = true, optional = true }
+noth-tool-web-search = { workspace = true, optional = true }
+noth-tool-web-fetch = { workspace = true, optional = true }
+noth-tool-web-agent = { workspace = true, optional = true }
+noth-tool-discord = { workspace = true, optional = true }
+noth-command-context = { workspace = true, optional = true }
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+jiff.workspace = true
+toml_edit = "0.25.17"
+inquire = "0.9.4"
+service-manager = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+# 依存の debuginfo は自分たちのデバッグに使わないので、生成とリンクの時間を省く
+[profile.dev.package."*"]
+debug = false

@@ -40,7 +40,7 @@ flowchart LR
     Ctx --> Store
 ```
 
-Context Layer Manager は本線の状態を持つ唯一の writer(actor)で、`Judge` / `Join` / `Compact` の仕事を1本のキューから順に処理します。並行に動くのは Worker だけです([context-layers.md §2.1](../context-layers.md#21-本線-actor-と処理単位))。
+Context Layer Manager は main の状態を持つ唯一の writer(actor)で、`Judge` / `Join` / `Compact` の仕事を1本のキューから順に処理します。並行に動くのは Worker だけです([context-layers.md §2.1](../context-layers.md#21-main-actor-と処理単位))。
 
 ## 3. Core の責務
 
@@ -51,7 +51,7 @@ Core は必須で、feature 化しません。
 | Config Loader | `config.toml` と `.env` の読み込み、`${VAR}` の解決、検証。解決するのは有効な module のセクションだけ |
 | CLI | `noth` コマンド群。[cli.md](../cli.md) 参照 |
 | Event Bus | module 間のイベント配送。`MessageReceived`、`WorkerFinished`、`IdleDetected` |
-| Context Layer Manager | 本線 actor。Layer 0〜4 の構築と Append-only 保証、Fork/Join、未昇格バッファの管理、閾値による判定の二値化、Compactor による要約への置換。本線状態の唯一の writer |
+| Context Layer Manager | main actor。Layer 0〜4 の構築と Append-only 保証、Fork/Join、未昇格バッファの管理、閾値による判定の二値化と動き方の決定(router は発言の性質を答えるだけ)、Compactor による要約への置換。main 状態の唯一の writer |
 | SQLite Store | 生ログ、TopicChunk、エピソード要約、Worker 結論メモ、heartbeat の永続化。`guild_id` でキー付け |
 | Module Registry | feature で組み込まれた module の初期化順序と依存解決、設定で有効化された module のみ起動 |
 
