@@ -11,6 +11,8 @@
     pkgs.git
     pkgs.bacon
     pkgs.cargo-nextest
+    pkgs.gum
+    pkgs.jq
   ];
 
   languages.rust = {

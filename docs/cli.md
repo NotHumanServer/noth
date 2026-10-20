@@ -95,6 +95,8 @@ noth service status
 - 停止タイムアウトを `worker.timeout_secs` + 余裕に合わせる(systemd `TimeoutStopSec`、launchd `ExitTimeOut`)
 - Linux ではログアウト後も動かすために `loginctl enable-linger` が必要なことを `install` の出力で案内する
 
+`install` はサービスを開始しません(launchd の定義は `Disabled` で登録される)。開始は `start` です。release ビルドの配置から常駐の入れ替えまでは `scripts/install.sh` が行います([README](../README.md#インストール))。
+
 ### `noth auth`
 
 ```text
