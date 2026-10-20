@@ -58,8 +58,8 @@ fn build_http(config: &DiscordConfig) -> Http {
     let builder = HttpBuilder::new(&config.token);
     match &config.api_base {
         Some(api_base) => {
-            // serenity 0.12 が使う reqwest 0.12 の型で作る(workspace の 0.13 とは型が別)
-            let client = reqwest012::Client::builder()
+            // workspace の reqwest が serenity の解決する版とずれると、HttpBuilder::client に渡せずコンパイルできない
+            let client = reqwest::Client::builder()
                 .no_proxy()
                 .use_rustls_tls()
                 .build()

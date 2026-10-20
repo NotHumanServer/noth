@@ -31,7 +31,11 @@ gcp_auth = "0.12"
 tokio = { version = "1.53", features = ["full"] }
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "http", "cache", "rustls_backend"] }
 axum = { version = "0.8", features = ["ws"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# serenity の rustls_backend が 0.13 に無い feature 名 `reqwest/rustls-tls` を参照するため、serenity は reqwest 0.12 に解決される。
+# 0.13 の "rustls" は aws-lc-sys(C の cmake ビルドで約50秒)を引き込み、ring を使うには provider の手動 install が要る。
+# serenity が 0.13 に上がったら 0.13 へ戻し、暗号プロバイダ(aws-lc-rs か ring の手動 install)を決め直す。
+# webpki-roots は serenity の rustls-tls が既に立てる。Mozilla バンドルと OS ストアの和集合で動くことを明示する
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
@@ -98,3 +102,7 @@ service-manager = "0.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
+
+# 依存の debuginfo は自分たちのデバッグに使わないので、生成とリンクの時間を省く
+[profile.dev.package."*"]
+debug = false

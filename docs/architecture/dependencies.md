@@ -6,7 +6,7 @@
 |---|---|---|---|
 | 非同期ランタイム | `tokio` | 1.53 | イベントバスは `tokio::sync` の mpsc / broadcast、シェル実行は `tokio::process` |
 | Discord | `serenity` | 0.12.5 | `EventHandler` で受信、`broadcast_typing`、`reference_message` でリプライ。最終リリースが 2025年12月なので採用前に Issue の活動を確認する |
-| HTTP | `reqwest`(rustls) | 0.13 | LLM / System One / TinyFish の公式 API は、すべて `reqwest` で直接呼び出す。Anthropic の公式 Rust SDK は存在しない |
+| HTTP | `reqwest`(rustls + ring) | 0.12 | serenity 0.12 が解決する版に揃える(0.13 だと aws-lc-sys の C ビルドが増える)。証明書は webpki-roots と OS ストアの和集合。LLM / System One / TinyFish の公式 API は、すべて `reqwest` で直接呼び出す。Anthropic の公式 Rust SDK は存在しない |
 | シリアライズ | `serde` / `serde_json` / `toml` | 1.0 / 1.0 / 1.1 | |
 | `.env` | (自前のパーサ) | | `dotenvy` は値の中の `$VAR` をプロセス環境変数で展開するため使わない。`NOTH_HOME` 以外の環境変数を読まない原則([cli.md §4.1](../cli.md#41-シークレットの扱い))を守り、`$` を含むキーを壊さないため |
 | CLI | `clap`(derive) | 4.6 | |
